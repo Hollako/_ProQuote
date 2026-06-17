@@ -2214,16 +2214,11 @@ elif mode == "Settings":
 
     st.divider()
     st.markdown("##### Software updates")
-    ucol1, ucol2, ucol3 = st.columns([1.2, 1.2, 1])
-    gh_owner = ucol1.text_input("GitHub owner", repo.get_setting("github_owner") or "Hollako",
-                                key="settings_github_owner")
-    gh_repo = ucol2.text_input("GitHub repo", repo.get_setting("github_repo") or "_ProQuote",
-                               key="settings_github_repo")
-    ucol3.metric("Installed version", APP_VERSION)
+    gh_owner = repo.get_setting("github_owner") or "Hollako"
+    gh_repo = repo.get_setting("github_repo") or "_ProQuote"
+    st.metric("Installed version", APP_VERSION)
 
     if st.button("Check for updates", use_container_width=True):
-        repo.set_setting("github_owner", gh_owner.strip())
-        repo.set_setting("github_repo", gh_repo.strip())
         try:
             rel = updater.latest_release(gh_owner, gh_repo)
             st.session_state.latest_release = rel
