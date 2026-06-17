@@ -1,0 +1,22 @@
+# Databases (per-company data - never commit)
+*.db
+*.db-wal
+*.db-shm
+
+# Per-company data profiles (Model A: data/<company>/ holds its DB + assets)
+/data/
+
+# Branding assets are per-company data, not code
+assets/
+
+# Generated / temp files
+_last_*.pdf
+__pycache__/
+*.pyc
+streamlit.out.log
+streamlit.err.log
+
+# Secrets / OS cruft
+.streamlit/secrets.toml
+.DS_Store
+Thumbs.db
