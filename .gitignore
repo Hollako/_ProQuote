@@ -20,3 +20,9 @@ streamlit.err.log
 .streamlit/secrets.toml
 .DS_Store
 Thumbs.db
+
+# Installer build artifacts
+/installer/output/
+/installer/payload/
+/installer/iexpress_staging/
+

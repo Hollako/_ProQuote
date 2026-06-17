@@ -22,6 +22,7 @@ import repo
 import pdf_export
 import auth
 import db
+import ingest
 import updater
 from version import APP_VERSION
 
@@ -29,6 +30,22 @@ _LOGO = db.banner_path()                       # per-company banner (follows BOQ
 _COMPANY = repo.get_setting("company_name") or "SmartWay Systems"
 st.set_page_config(page_title=f"ProQuote - {_COMPANY}", layout="wide",
                    initial_sidebar_state="expanded")
+
+
+def _choose_local_folder(initial_dir: str = "") -> tuple[str, str]:
+    """Open a Windows folder picker on the machine running Streamlit."""
+    try:
+        import tkinter as tk
+        from tkinter import filedialog
+
+        root = tk.Tk()
+        root.withdraw()
+        root.attributes("-topmost", True)
+        selected = filedialog.askdirectory(initialdir=initial_dir or os.getcwd())
+        root.destroy()
+        return selected or "", ""
+    except Exception as exc:
+        return "", str(exc)
 
 # Larger button text + icons; tracking status cells are compact and centered.
 st.markdown("""<style>
@@ -2244,6 +2261,61 @@ elif mode == "Settings":
         else:
             st.success(f"You are up to date. Latest {rel.source}: {rel.tag or rel.name}")
 
+    st.divider()
+    st.markdown("##### Import Excel workbooks")
+    if "import_folder_path" not in st.session_state:
+        st.session_state.import_folder_path = repo.get_setting("last_import_folder") or ""
+
+    ipath_col, browse_col = st.columns([4, 1])
+    ipath_col.text_input(
+        "Folder containing Excel project folders",
+        key="import_folder_path",
+        placeholder=r"C:\Projects\Old BoQ Files",
+    )
+    if browse_col.button("Browse...", use_container_width=True):
+        picked, pick_error = _choose_local_folder(st.session_state.import_folder_path)
+        if picked:
+            st.session_state.import_folder_path = picked
+            st.rerun()
+        elif pick_error:
+            st.warning(f"Folder picker is unavailable on this machine: {pick_error}")
+
+    if st.button("Import workbooks", type="primary", use_container_width=True):
+        import_root = (st.session_state.import_folder_path or "").strip().strip('"')
+        if not import_root:
+            st.warning("Choose or enter a folder path first.")
+        elif not os.path.isdir(import_root):
+            st.error("Folder not found. Check the path and try again.")
+        else:
+            repo.set_setting("last_import_folder", import_root)
+            progress = st.progress(0, text="Scanning Excel workbooks...")
+
+            def _import_progress(done, total, path):
+                if total:
+                    progress.progress(min(done / total, 1.0),
+                                      text=f"Importing {done}/{total}: {os.path.basename(path)}")
+
+            try:
+                with st.spinner("Importing Excel workbooks..."):
+                    stats = ingest.ingest_folder(import_root, progress=_import_progress)
+                progress.empty()
+                st.success("Import completed.")
+                m1, m2, m3, m4 = st.columns(4)
+                m1.metric("Workbooks found", stats.get("workbooks_found", 0))
+                m2.metric("Files ingested", stats.get("files", 0))
+                m3.metric("BOQ sheets", stats.get("sheets", 0))
+                m4.metric("Catalogue items", stats.get("catalogue_items", 0))
+                d1, d2, d3 = st.columns(3)
+                d1.metric("Offer lines", stats.get("lines", 0))
+                d2.metric("Spare items", stats.get("spares", 0))
+                d3.metric("Skipped", stats.get("skipped_no_boq", 0))
+                if stats.get("errors"):
+                    with st.expander(f"Import warnings / errors ({len(stats['errors'])})"):
+                        for name, err in stats["errors"][:30]:
+                            st.write(f"- {name}: {err}")
+            except Exception as exc:
+                progress.empty()
+                st.error(f"Import failed: {exc}")
     st.divider()
     st.markdown("##### Offer-number preview")
     st.caption("Numbering is **per series** - each rendered template (type + year) keeps its own "

@@ -1,4 +1,4 @@
-"""
+﻿"""
 Folder-wide BoQ ingestion engine.
 
 Scans the assigned project directory, finds every `BOQ <System>` sheet (and its
@@ -451,23 +451,31 @@ def _s(v):
     return str(v).strip()
 
 
-def main(root):
-    conn = dbmod.init_db()
+def scan_workbooks(root):
     files = []
     for ext in ("*.xlsx", "*.xlsm"):
         files += glob.glob(os.path.join(root, "**", ext), recursive=True)
-    files = sorted(f for f in files if "~$" not in f)
+    return sorted(f for f in files if "~$" not in f)
 
-    stats = {"files": 0, "sheets": 0, "lines": 0, "spares": 0, "skipped_no_boq": 0,
-             "sheets_unparsed": 0, "errors": []}
-    print(f"Scanning {len(files)} workbook(s) under:\n  {root}\n")
+
+def ingest_folder(root, progress=None):
+    conn = dbmod.init_db()
+    files = scan_workbooks(root)
+    stats = {"workbooks_found": len(files), "files": 0, "sheets": 0, "lines": 0,
+             "spares": 0, "skipped_no_boq": 0, "sheets_unparsed": 0, "errors": []}
     for i, f in enumerate(files, 1):
         ingest_file(conn, f, stats)
         conn.commit()
-        if i % 10 == 0:
-            print(f"  ...{i}/{len(files)}")
+        if progress:
+            progress(i, len(files), f)
     conn.commit()
+    stats["catalogue_items"] = conn.execute("SELECT COUNT(*) FROM Items_Catalog").fetchone()[0]
+    conn.close()
+    return stats
 
+
+def print_summary(root, stats):
+    print(f"Scanning {stats['workbooks_found']} workbook(s) under:\n  {root}\n")
     print("\n=== INGEST SUMMARY ===")
     print(f"  Files ingested (had BOQ sheets) : {stats['files']}")
     print(f"  BOQ system-sheets parsed        : {stats['sheets']}")
@@ -475,13 +483,16 @@ def main(root):
     print(f"  Spare (parked) items tagged     : {stats['spares']}")
     print(f"  Files skipped (no BOQ sheet)     : {stats['skipped_no_boq']}")
     print(f"  Sheets with no canonical header  : {stats['sheets_unparsed']}")
-    cat = conn.execute("SELECT COUNT(*) FROM Items_Catalog").fetchone()[0]
-    print(f"  Distinct catalogue items         : {cat}")
+    print(f"  Distinct catalogue items         : {stats['catalogue_items']}")
     if stats["errors"]:
         print(f"  Errors ({len(stats['errors'])}):")
         for n, e in stats["errors"][:15]:
             print(f"    - {n}: {e}")
-    conn.close()
+
+
+def main(root):
+    stats = ingest_folder(root, progress=lambda i, total, _f: print(f"  ...{i}/{total}") if i % 10 == 0 else None)
+    print_summary(root, stats)
 
 
 if __name__ == "__main__":
