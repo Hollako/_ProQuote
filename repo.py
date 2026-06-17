@@ -1,4 +1,4 @@
-"""
+﻿"""
 Data-access layer: catalogue search + project load/save for the UI and PDF.
 """
 from __future__ import annotations
@@ -541,7 +541,7 @@ def load_project_grid(project_id: int, sheet_name: str | None = None) -> pd.Data
 # ---------------- Finance (per approved offer) ----------------
 
 def list_approved_offers() -> list[dict]:
-    """Approved, non-archived offers — the choices for the Finance tab."""
+    """Approved, non-archived offers â€” the choices for the Finance tab."""
     with _conn() as c:
         return [dict(r) for r in c.execute(
             "SELECT ProjectID,ProjectName,OfferNo,OptionLabel,RevisionNo,ApprovedAt "
@@ -550,7 +550,7 @@ def list_approved_offers() -> list[dict]:
 
 
 def offer_grand_total(project_id: int) -> float:
-    """Grand Total (SAR, incl. VAT & discount) of an offer — the finance baseline."""
+    """Grand Total (SAR, incl. VAT & discount) of an offer â€” the finance baseline."""
     meta = project_meta(project_id)
     grid = load_project_grid(project_id)
     s = calc.summarize(grid, meta.get("DiscountAmount") or 0)
@@ -760,7 +760,7 @@ def _write_sheet_and_lines(c, pid, system_suffix, discount_sar, factors, grid) -
 def update_offer(base_project_id: int, grid: pd.DataFrame, discount_sar=0.0,
                  factors=(None, None, None), system_suffix="LCS", terms=None,
                  project_sheet_info=None) -> int:
-    """Overwrite an existing revision/option IN PLACE — same ProjectID, Offer #,
+    """Overwrite an existing revision/option IN PLACE â€” same ProjectID, Offer #,
     revision, option, approval and people. Replaces its lines, discount and terms."""
     discount_sar = _discount_amount(discount_sar)
     terms_json = json.dumps({k: terms.get(k) for k in TERMS_KEYS}) if terms else None

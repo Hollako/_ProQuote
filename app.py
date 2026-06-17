@@ -1,5 +1,5 @@
-"""
-ProQuote — Streamlit interface.
+﻿"""
+ProQuote â€” Streamlit interface.
 
 Run:  streamlit run app.py   (from the _ProQuote folder)
 
@@ -25,7 +25,7 @@ import db
 
 _LOGO = db.banner_path()                       # per-company banner (follows BOQ_DATA_DIR)
 _COMPANY = repo.get_setting("company_name") or "SmartWay Systems"
-st.set_page_config(page_title=f"ProQuote — {_COMPANY}", layout="wide",
+st.set_page_config(page_title=f"ProQuote â€” {_COMPANY}", layout="wide",
                    initial_sidebar_state="expanded")
 
 # Larger button text + icons; tracking status cells are compact and centered.
@@ -143,18 +143,18 @@ st.markdown("""<style>
 BUILDER_COLS = ["Area", "System", "Description", "Brand", "Model", "Qty",
                 "Cur", "List Price $", "Ex Unit Cost $", "Shipping %", "Unit Cost $", "Total Cost $",
                 "Margin x", "U. Price $", "T. Price $", "U. Price SAR", "T. Price SAR"]
-# Pure outputs — locked in the editor (everything else is an input/driver).
+# Pure outputs â€” locked in the editor (everything else is an input/driver).
 COMPUTED = ["Total Cost $", "T. Price $", "U. Price SAR", "T. Price SAR"]
 MONEY_COLS = ["List Price $", "Ex Unit Cost $", "Unit Cost $", "Total Cost $",
               "U. Price $", "T. Price $", "U. Price SAR", "T. Price SAR"]
-# Numeric inputs that affect computed prices — a change triggers one auto-rerun
+# Numeric inputs that affect computed prices â€” a change triggers one auto-rerun
 # so the recomputed columns refresh immediately (no st.data_editor 1-step lag).
 NUM_DRIVERS = ["Qty", "Ex Unit Cost $", "Shipping %", "Unit Cost $", "Margin x", "U. Price $"]
-# Reviewing a loaded offer shows selling prices only — all cost columns hidden.
+# Reviewing a loaded offer shows selling prices only â€” all cost columns hidden.
 PRICE_VIEW_COLS = ["Area", "System", "Description", "Brand", "Model", "Qty",
                    "U. Price $", "T. Price $", "U. Price SAR", "T. Price SAR"]
 
-# Offer terms/notes — keys match repo.TERMS_KEYS; defaults from the historical Quotation sheets.
+# Offer terms/notes â€” keys match repo.TERMS_KEYS; defaults from the historical Quotation sheets.
 TERMS_KEYS = repo.TERMS_KEYS
 PROJECT_SHEET_KEYS = repo.PROJECT_SHEET_KEYS
 DEFAULT_TERMS = {
@@ -198,11 +198,11 @@ def _person_select(col, label, role, current, key):
     """Dropdown of active users holding `role`; keeps any legacy stored value selectable."""
     names = auth.users_in_role(role)
     cur = (current or "").strip()
-    opts = ["—"] + names
+    opts = ["â€”"] + names
     if cur and cur not in names:
-        opts = ["—", cur] + names           # preserve a name that isn't a current user
+        opts = ["â€”", cur] + names           # preserve a name that isn't a current user
     pick = col.selectbox(label, opts, index=opts.index(cur) if cur in opts else 0, key=key)
-    return "" if pick == "—" else pick
+    return "" if pick == "â€”" else pick
 
 
 def _empty_grid() -> pd.DataFrame:
@@ -341,8 +341,8 @@ def render_editable_grid(state_key: str, editor_key: str):
         "Shipping %", format="%.2f", min_value=0.0, step=5.0,
         help="Added to Ex Unit Cost. Unit Cost = Ex Unit Cost x (1 + Shipping % / 100), in USD.")
     colcfg["Margin x"] = st.column_config.NumberColumn(
-        "Margin ×", format="%.2f", min_value=0.0, step=0.05,
-        help="Multiplier on landed Unit Cost. U.Price $ = ⌈Unit Cost × Margin⌉. "
+        "Margin Ã-", format="%.2f", min_value=0.0, step=0.05,
+        help="Multiplier on landed Unit Cost. U.Price $ = âŒˆUnit Cost Ã- MarginâŒ‰. "
              "Set 0 to type U.Price $ manually.")
     edited = st.data_editor(
         grid[BUILDER_COLS] if not grid.empty else grid,
@@ -384,10 +384,10 @@ def _fx_hint(grid):
         ex = calc._num(r.get("Ex Unit Cost $"))
         if cur != "USD" and ex > 0:
             desc = (str(r.get("Description") or "").strip() or "item")[:28]
-            parts.append(f"{desc}: {ex:,.0f} {cur} → ${calc.to_usd(ex, cur):,.2f}")
+            parts.append(f"{desc}: {ex:,.0f} {cur} â†’ ${calc.to_usd(ex, cur):,.2f}")
     if parts:
-        st.caption("💱 Ex cost → USD (then ×(1+Shipping%) = Unit Cost):  "
-                   + "   ·   ".join(parts))
+        st.caption("ðŸ’± Ex cost â†’ USD (then Ã-(1+Shipping%) = Unit Cost):  "
+                   + "   Â·   ".join(parts))
 
 
 def catalogue_add(state_key: str, default_margin: float, kp: str, default_system: str = "",
@@ -395,36 +395,36 @@ def catalogue_add(state_key: str, default_margin: float, kp: str, default_system
     """Type-ahead catalogue search + add controls writing into st.session_state[state_key]."""
     st.markdown("##### Add item from catalogue")
     term = st.text_input("Search Model / Description / Brand", key=f"{kp}_term",
-                         placeholder="e.g. PDEG, keypad, Dynalite…")
+                         placeholder="e.g. PDEG, keypad, Dynaliteâ€¦")
     results = repo.search_catalog(term, limit=20)
     if not results.empty:
         results = results.assign(_label=results.apply(
-            lambda r: f"{r['Model']} — {str(r['Description'])[:48]} ({r['Brand']})  ·x{r['TimesQuoted']}", axis=1))
+            lambda r: f"{r['Model']} â€” {str(r['Description'])[:48]} ({r['Brand']})  Â·x{r['TimesQuoted']}", axis=1))
         a1, a2, a3, a4, a5 = st.columns([4, 1, 1.4, 1.4, 1.3], vertical_alignment="bottom")
         pick = a1.selectbox("Match", results["_label"].tolist(), key=f"{kp}_pick")
         chosen = results[results["_label"] == pick].iloc[0].to_dict()
         qty = a2.number_input("Qty", min_value=1, value=1, step=1, key=f"{kp}_qty")
         area = a3.text_input("Area", value=default_system, key=f"{kp}_area")
         system = a4.text_input("System", value=default_system, key=f"{kp}_system")
-        if a5.button("➕ Add", use_container_width=True, key=f"{kp}_add"):
+        if a5.button("âž• Add", use_container_width=True, key=f"{kp}_add"):
             _add_row_to(state_key, repo.item_to_grid_row(
                 chosen, area=area, system=system, qty=int(qty), default_margin=default_margin))
             st.rerun()
     elif term:
-        st.info("No catalogue match — add a blank row below and type freely.")
+        st.info("No catalogue match â€” add a blank row below and type freely.")
     bc1, bc2, _ = st.columns([1, 1, 4])
-    if bc1.button("➕ Blank row", key=f"{kp}_blank", use_container_width=True):
+    if bc1.button("âž• Blank row", key=f"{kp}_blank", use_container_width=True):
         _add_row_to(state_key, {**calc.blank_row(system=default_system),
                                 "Margin x": default_margin, "LineType": "item", "_ItemID": None})
         st.rerun()
-    if show_clear and bc2.button("🧹 Clear grid", key=f"{kp}_clear", use_container_width=True):
+    if show_clear and bc2.button("ðŸ§¹ Clear grid", key=f"{kp}_clear", use_container_width=True):
         st.session_state[state_key] = _empty_grid()
         st.rerun()
 
 
 def terms_form(store: dict, kp: str):
     """Editable Quotation terms/notes (subject, greeting, scope, payment, ...)."""
-    with st.expander("📋 Terms, scope & notes (appear on the quotation)", expanded=False):
+    with st.expander("ðŸ“‹ Terms, scope & notes (appear on the quotation)", expanded=False):
         store["subject"] = st.text_input("Subject (offer title)", store.get("subject", ""),
             key=f"{kp}_subject", placeholder="e.g. Low Current Systems Offer")
         store["greeting"] = st.text_area("Greeting", store.get("greeting", ""),
@@ -545,7 +545,7 @@ def _make_pdf_download(h, grid, summary, options=None):
     with open(tmp, "rb") as f:
         st.session_state.pdf_bytes = f.read()
     n = len(options) if options else 1
-    st.toast(f"PDF ready ({n} option{'s' if n > 1 else ''}) — use the download button.", icon="📄")
+    st.toast(f"PDF ready ({n} option{'s' if n > 1 else ''}) â€” use the download button.", icon="ðŸ“„")
 
 
 def _project_sheet_bytes(h: dict, s: dict) -> bytes:
@@ -700,7 +700,7 @@ def _project_sheet_bytes(h: dict, s: dict) -> bytes:
 
 def _make_project_sheet_download(h: dict, summary: dict):
     st.session_state.project_sheet_bytes = _project_sheet_bytes(h, summary)
-    st.toast("Project Sheet ready - use the download button.", icon="📊")
+    st.toast("Project Sheet ready - use the download button.", icon="ðŸ“Š")
 
 
 def _safe_filename(value, fallback="Project"):
@@ -743,7 +743,7 @@ def _profit_banner(s: dict):
     factor = s.get("markup_factor")
     cost_sar = s.get("cost_sar", 0) or 0.0
     cost_usd = s.get("total_cost_usd", 0) or 0.0
-    markup_txt = f"Markup ×{factor:.2f}" if factor else "Markup —"
+    markup_txt = f"Markup Ã-{factor:.2f}" if factor else "Markup â€”"
     if profit >= 0:
         bg, fg, sub_fg = "rgba(33,195,84,0.12)", "#0b6b34", "#3f7d59"
     else:
@@ -762,11 +762,11 @@ def _profit_banner(s: dict):
     html = (
         f"<div style='background:{bg};border-radius:8px;padding:14px 24px;margin:2px 0 10px;"
         f"display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap'>"
-        + _block("🧾 Cost", cost_sar, cost_usd, "left")
+        + _block("ðŸ§¾ Cost", cost_sar, cost_usd, "left")
         + f"<div style='flex:1;min-width:120px;text-align:center'>"
           f"<div style='{mid}'>{markup_txt}</div>"
           f"<div style='{mid}'>Margin {margin_pct:.1f}%</div></div>"
-        + _block("💰 Gross Profit", profit, profit_usd, "right")
+        + _block("ðŸ’° Gross Profit", profit, profit_usd, "right")
         + "</div>"
     )
     st.markdown(html, unsafe_allow_html=True)
@@ -1096,7 +1096,7 @@ def _tracking_status_cell(col, lid: int, key_name: str, current: bool, stamp_val
         if max_qty > 0 and 0 < tracked_qty < max_qty:
             btn_state = "partial"
     btn_key = f"trkbtn_{btn_state}_{key_name}_{lid}"
-    label = "✓" if checked else " "
+    label = "âœ“" if checked else " "
     col.button(label, key=btn_key, disabled=not can("tracking"), use_container_width=True,
                on_click=_handle_tracking_status_click,
                args=(value_key, stamp_key,
@@ -1135,8 +1135,8 @@ def _tracking_qty_cell(col, lid: int, key_name: str, current_qty, line_qty: floa
 def _render_finance_tab(project_id: int, grand_total: float):
     """Two side-by-side tables for an offer: client payments/invoices and purchases/costs."""
     if not can("finance"):
-        st.info("🔒 Your role doesn't have Finance access. "
-                "An owner can grant it in Settings → Roles & permissions.")
+        st.info("ðŸ”’ Your role doesn't have Finance access. "
+                "An owner can grant it in Settings â†’ Roles & permissions.")
         return
 
     gt = float(grand_total or 0.0)
@@ -1157,7 +1157,7 @@ def _render_finance_tab(project_id: int, grand_total: float):
 
     col_pay, col_pur = st.columns(2)
     with col_pay:
-        st.markdown("#### 💵 Payments / Invoices")
+        st.markdown("#### ðŸ’µ Payments / Invoices")
         pay_cfg = {
             "Description": st.column_config.TextColumn("Payment Description", width="medium"),
             "Amount (SAR)": st.column_config.NumberColumn("Amount (SAR)", format="%.2f", min_value=0.0),
@@ -1175,7 +1175,7 @@ def _render_finance_tab(project_id: int, grand_total: float):
                     positive=remaining >= 0)
 
     with col_pur:
-        st.markdown("#### 🧾 Purchases / Costs")
+        st.markdown("#### ðŸ§¾ Purchases / Costs")
         pur_cfg = {
             "Description": st.column_config.TextColumn("Dispense Description", width="medium"),
             "Cost (SAR)": st.column_config.NumberColumn("Cost (SAR)", format="%.2f", min_value=0.0),
@@ -1189,11 +1189,11 @@ def _render_finance_tab(project_id: int, grand_total: float):
         net_profit = gt - cost_total - vat
         markup = (gt / cost_total) if cost_total > 0 else None
         margin_pct = (net_profit / gt * 100) if gt else 0.0
-        markup_txt = f"Markup ×{markup:.2f}" if markup else "Markup —"
-        _fin_bubble("🧾 Cost (POs)", f"SAR {cost_total:,.2f}",
+        markup_txt = f"Markup Ã-{markup:.2f}" if markup else "Markup â€”"
+        _fin_bubble("ðŸ§¾ Cost (POs)", f"SAR {cost_total:,.2f}",
                     [markup_txt, f"Margin {margin_pct:.1f}%",
                      f"VAT ({calc.VAT_RATE * 100:g}%) SAR {vat:,.0f}"],
-                    "💰 Net Profit", f"SAR {net_profit:,.2f}",
+                    "ðŸ’° Net Profit", f"SAR {net_profit:,.2f}",
                     positive=net_profit >= 0)
 
     # Auto-save on any change (no Save button).
@@ -1204,7 +1204,7 @@ def _render_finance_tab(project_id: int, grand_total: float):
     elif st.session_state[sig_key] != sig:
         repo.save_finance(project_id, pay_edit.to_dict("records"), pur_edit.to_dict("records"))
         st.session_state[sig_key] = sig
-        st.toast("Finance saved", icon="💾")
+        st.toast("Finance saved", icon="ðŸ’¾")
 
 
 def _render_tracking_tab(project_id: int, sheet_name: str | None):
@@ -1283,9 +1283,9 @@ def _render_tracking_tab(project_id: int, sheet_name: str | None):
         elif st.session_state[sig_key] != sig:
             repo.update_tracking(collected)
             st.session_state[sig_key] = sig
-            st.toast("Tracking saved", icon="💾")
+            st.toast("Tracking saved", icon="ðŸ’¾")
     else:
-        st.caption("🔒 Your role can view tracking but not change it.")
+        st.caption("ðŸ”’ Your role can view tracking but not change it.")
 
 
 def _render_login():
@@ -1294,7 +1294,7 @@ def _render_login():
         c.image(_LOGO, use_container_width=True)
     c.subheader("Sign in")
     if auth.user_count() == 0:
-        c.info("First run — create the **owner** account (full access).")
+        c.info("First run â€” create the **owner** account (full access).")
         with c.form("create_owner"):
             u = st.text_input("Username")
             dn = st.text_input("Display name")
@@ -1346,8 +1346,8 @@ if os.path.exists(db.logo_path()):
 elif os.path.exists(_LOGO):
     st.sidebar.image(_LOGO, use_container_width=True)
 st.sidebar.title(_COMPANY)
-st.sidebar.caption(f"👤 **{USER.get('DisplayName') or USER.get('Username')}** · _{ROLE}_")
-if st.sidebar.button("🔒 Log out", use_container_width=True):
+st.sidebar.caption(f"ðŸ‘¤ **{USER.get('DisplayName') or USER.get('Username')}** Â· _{ROLE}_")
+if st.sidebar.button("ðŸ”’ Log out", use_container_width=True):
     st.session_state.pop("auth_user", None)
     st.rerun()
 
@@ -1355,7 +1355,7 @@ _SECTIONS = [("New Project", "new_offer"), ("Load Project", "load"),
              ("Catalogue", "catalogue"), ("Settings", "settings"), ("Users", "users")]
 _allowed = [name for name, p in _SECTIONS if can(p)]
 if not _allowed:
-    st.error("Your account has no accessible sections — contact the owner.")
+    st.error("Your account has no accessible sections â€” contact the owner.")
     st.stop()
 _nav_mode = st.session_state.pop("_nav_mode", None)
 if _nav_mode in _allowed:
@@ -1402,7 +1402,7 @@ if mode == "New Project":
     st.subheader("New Project")
     h = st.session_state.header
 
-    # Live offer reference (from the System Offer + override below) — shown as a top bar.
+    # Live offer reference (from the System Offer + override below) â€” shown as a top bar.
     # Once the first option is saved, the offer # is "locked" so further options share it.
     _sel = st.session_state.get("no_offer_type", "(none)")
     _otype = "" if _sel == "(none)" else _sel
@@ -1412,11 +1412,11 @@ if mode == "New Project":
     _locked = st.session_state.get("no_offer_lock")
     h["offer"] = _locked or _ov or repo.make_offer_no(_otype)
     _saved = st.session_state.get("no_saved_options", [])
-    _extra = (f"<span style='font-size:.8rem;opacity:.85'> &nbsp;·&nbsp; options saved: "
+    _extra = (f"<span style='font-size:.8rem;opacity:.85'> &nbsp;Â·&nbsp; options saved: "
               f"{', '.join(_saved)}</span>") if _saved else ""
     st.markdown(
         f"<div style='background:#002060;color:#fff;padding:10px 16px;border-radius:8px;"
-        f"font-size:1.2rem;margin:2px 0 12px'>🧾&nbsp;&nbsp;Offer #:&nbsp; <b>{h['offer']}</b>{_extra}</div>",
+        f"font-size:1.2rem;margin:2px 0 12px'>ðŸ§¾&nbsp;&nbsp;Offer #:&nbsp; <b>{h['offer']}</b>{_extra}</div>",
         unsafe_allow_html=True)
 
     with st.expander("Offer header", expanded=True):
@@ -1434,7 +1434,7 @@ if mode == "New Project":
                                  h.get("pm", ""), "no_pm")
         # "System Offer" drives BOTH the offer-ref type segment and the BOQ system suffix.
         c3.selectbox("System Offer", ["(none)"] + repo.offer_types(), key="no_offer_type",
-                     help="The system being quoted (AV, LCS, …). Used in the offer reference "
+                     help="The system being quoted (AV, LCS, â€¦). Used in the offer reference "
                           "and as the BOQ system. Manage the list in Settings.")
         c3.text_input("Offer # (blank = auto)", key="no_offer_ov",
                       help="Leave blank to auto-number; type a value to override.")
@@ -1450,7 +1450,7 @@ if mode == "New Project":
     catalogue_add("grid", _dm, "no", st.session_state.header["system"], show_clear=True)
 
     # ---- Editable grid (builder always shows costs) ----
-    st.caption("Edit **Qty · Ex Unit Cost · Shipping % · Margin ×** → prices recalc automatically. "
+    st.caption("Edit **Qty Â· Ex Unit Cost Â· Shipping % Â· Margin Ã-** â†’ prices recalc automatically. "
                "Locked columns are computed.")
     grid = render_editable_grid("grid", "editor")
 
@@ -1476,12 +1476,12 @@ if mode == "New Project":
     # ---- Actions ----
     st.divider()
     if st.session_state.get("no_offer_lock"):
-        st.caption(f"Adding options to **{h['offer']}** — build this option, name it, then "
-                   "**Save option**. Use **➕ Add another option** to start the next one, or "
-                   "**🆕 New offer** to begin a fresh offer.")
+        st.caption(f"Adding options to **{h['offer']}** â€” build this option, name it, then "
+                   "**Save option**. Use **âž• Add another option** to start the next one, or "
+                   "**ðŸ†• New offer** to begin a fresh offer.")
     ac1, ac2, ac3, ac4, ac5 = st.columns(5)
     _optname = (h.get("option") or "").strip()
-    if ac1.button("💾 Save option" if st.session_state.get("no_offer_lock") else "💾 Save offer",
+    if ac1.button("ðŸ’¾ Save option" if st.session_state.get("no_offer_lock") else "ðŸ’¾ Save offer",
                   type="primary", use_container_width=True):
         _locked_now = st.session_state.get("no_offer_lock")
         _done = st.session_state.get("no_saved_options", [])
@@ -1507,13 +1507,13 @@ if mode == "New Project":
             st.session_state.setdefault("no_saved_options", []).append(_optname or "Main")
             st.success(f"Saved {('option ' + _optname) if _optname else 'offer'} (ProjectID {pid}).")
 
-    if ac2.button("➕ Add another option", use_container_width=True,
+    if ac2.button("âž• Add another option", use_container_width=True,
                   disabled=not st.session_state.get("no_offer_lock")):
         st.session_state.grid = _empty_grid()
         st.session_state["_no_reset_option"] = True   # clear option label on next run
         st.rerun()
 
-    if ac3.button("🆕 New offer", use_container_width=True):
+    if ac3.button("ðŸ†• New offer", use_container_width=True):
         st.session_state.grid = _empty_grid()
         st.session_state.no_offer_lock = None
         st.session_state.no_saved_options = []
@@ -1522,19 +1522,19 @@ if mode == "New Project":
         st.session_state.pop("project_sheet_bytes", None)
         st.rerun()
 
-    if ac4.button("📄 Generate Offer PDF", use_container_width=True):
+    if ac4.button("ðŸ“„ Generate Offer PDF", use_container_width=True):
         _make_pdf_download(h, st.session_state.grid, s)
 
-    if ac5.button("📊 Generate Project Sheet", use_container_width=True):
+    if ac5.button("ðŸ“Š Generate Project Sheet", use_container_width=True):
         _make_project_sheet_download(h, s)
 
     dl1, dl2 = st.columns(2)
     if "pdf_bytes" in st.session_state:
-        dl1.download_button("⬇️ Download Offer PDF", st.session_state.pdf_bytes,
+        dl1.download_button("â¬‡ï¸ Download Offer PDF", st.session_state.pdf_bytes,
                             file_name=f"Quotation_{h['offer']}{(' '+_optname) if _optname else ''}.pdf",
                             mime="application/pdf", use_container_width=True)
     if "project_sheet_bytes" in st.session_state:
-        dl2.download_button("⬇️ Download Project Sheet", st.session_state.project_sheet_bytes,
+        dl2.download_button("â¬‡ï¸ Download Project Sheet", st.session_state.project_sheet_bytes,
                             file_name=f"Project_Sheet_{_safe_filename(h.get('offer') or h.get('project'))}.xlsx",
                             mime=("application/vnd.openxmlformats-officedocument."
                                   "spreadsheetml.sheet"),
@@ -1578,7 +1578,7 @@ elif mode == "Load Project":
             if f["offer_nos"]:
                 parts.append(", ".join(f["offer_nos"][:3]))
             parts.append(f"{f['n_rev']} rev. - {f['n_opt']} opt.")
-            return ("✅ " if f["approved"] else "") + " · ".join(parts)
+            return ("âœ… " if f["approved"] else "") + " Â· ".join(parts)
 
         sc1, sc2 = st.columns([2, 1])
         q_name = _text(sc1.text_input("Search by name", key="load_search_name")).lower()
@@ -1624,13 +1624,13 @@ elif mode == "Load Project":
         for idx, f in enumerate(matches):
             selected = f["fam"] == current_fam
             rc = st.columns(widths, vertical_alignment="center")
-            rc[0].write(("▶ " if selected else "") + _text(f["base"], "Offer"))
+            rc[0].write(("â–¶ " if selected else "") + _text(f["base"], "Offer"))
             rc[1].write(_text(f["client"], "-"))
             rc[2].write(", ".join(f["offer_nos"][:3]) if f["offer_nos"] else "-")
             rc[3].write(_text(f["date"])[:10])
             rc[4].write(str(f["n_rev"]))
             rc[5].write(str(f["n_opt"]))
-            rc[6].write("✅" if f["approved"] else "")
+            rc[6].write("âœ…" if f["approved"] else "")
             if rc[7].button("View", key=f"match_view_{idx}_{f['fam']}",
                             disabled=selected, use_container_width=True):
                 st.session_state.load_fam = f["fam"]
@@ -1670,19 +1670,19 @@ elif mode == "Load Project":
         st.markdown("**Revisions & options**")
         widths = [1.0, 1.2, 1.8, 1.0, 0.5, 1.0, 0.9]
         hc = st.columns(widths)
-        for col, t in zip(hc, ["Revision", "Option", "Offer #", "Date", "✓", "Status", ""]):
+        for col, t in zip(hc, ["Revision", "Option", "Offer #", "Date", "âœ“", "Status", ""]):
             col.caption(t)
         for _, row in shown.iterrows():
             rid = int(row["ProjectID"])
             rn = int(row["RevisionNo"]) if pd.notna(row["RevisionNo"]) else 0
             sel = (rid == int(st.session_state.view_pid))
             rc = st.columns(widths)
-            rc[0].write(("▶ " if sel else "") + (repo.revision_token(rn) if rn > 0 else "Original"))
+            rc[0].write(("â–¶ " if sel else "") + (repo.revision_token(rn) if rn > 0 else "Original"))
             rc[1].write(_text(row["OptionLabel"], "-"))
             rc[2].write(_text(row["OfferNo"]))
             rc[3].write(_text(row["CreationDate"])[:10])
-            rc[4].write("✅" if row["Approved"] else "")
-            rc[5].write("📦 Archived" if row["Archived"] else "Active")
+            rc[4].write("âœ…" if row["Approved"] else "")
+            rc[5].write("ðŸ“¦ Archived" if row["Archived"] else "Active")
             if rc[6].button("View", key=f"view_{rid}", disabled=sel, use_container_width=True):
                 st.session_state.view_pid = rid
                 st.session_state.pop("pdf_bytes", None)
@@ -1709,13 +1709,13 @@ elif mode == "Load Project":
             rev = meta.get("RevisionNo") or 0
             _subj = repo.load_terms(meta).get("subject")
             if _subj:
-                st.markdown(f"#### 📄 {_subj}")
+                st.markdown(f"#### ðŸ“„ {_subj}")
             _opt = meta.get("OptionLabel") or ""
-            _ttl = (repo.revision_token(rev) if rev else "original") + (f" · Option: {_opt}" if _opt else "")
+            _ttl = (repo.revision_token(rev) if rev else "original") + (f" Â· Option: {_opt}" if _opt else "")
             if meta.get("Approved"):
-                st.caption(f"✅ Approved · {_ttl}")
+                st.caption(f"âœ… Approved Â· {_ttl}")
             else:
-                st.caption(f"Active · {_ttl} — click **Edit** to make a new revision or option.")
+                st.caption(f"Active Â· {_ttl} â€” click **Edit** to make a new revision or option.")
 
             active_tab = _offer_tab_selector(pid, bool(meta.get("Approved")))
             if active_tab == "BoQ":
@@ -1724,37 +1724,37 @@ elif mode == "Load Project":
                 # Approval + archive controls (BoQ tab only).
                 apc1, apc2, apc3 = st.columns([2.2, 1, 1], vertical_alignment="center")
                 if meta.get("Archived"):
-                    apc1.warning("📦 **Archived**" + (" · was ✅ approved" if meta.get("Approved") else ""))
+                    apc1.warning("ðŸ“¦ **Archived**" + (" Â· was âœ… approved" if meta.get("Approved") else ""))
                 elif meta.get("Approved"):
                     at = (meta.get("ApprovedAt") or "")[:16].replace("T", " ")
-                    apc1.success(f"✅ **Approved**{(' · ' + at) if at else ''}")
+                    apc1.success(f"âœ… **Approved**{(' Â· ' + at) if at else ''}")
                 else:
-                    apc1.info("Active · not approved")
+                    apc1.info("Active Â· not approved")
                 if meta.get("Approved"):
-                    if can("approve") and apc2.button("↩️ Unapprove", use_container_width=True):
+                    if can("approve") and apc2.button("â†©ï¸ Unapprove", use_container_width=True):
                         r = repo.unapprove_offer(pid)
                         st.toast(f"Unapproved. {r} auto-archived entr{'y' if r == 1 else 'ies'} restored."
-                                 if r else "Unapproved.", icon="↩️")
+                                 if r else "Unapproved.", icon="â†©ï¸")
                         st.rerun()
                 elif can("approve"):
-                    if apc2.button("✅ Approve", type="primary", use_container_width=True):
+                    if apc2.button("âœ… Approve", type="primary", use_container_width=True):
                         n = repo.approve_offer(pid)
                         st.toast(f"Approved. {n} other entr{'y' if n == 1 else 'ies'} archived."
-                                 if n else "Approved.", icon="✅")
+                                 if n else "Approved.", icon="âœ…")
                         st.rerun()
                 if can("archive"):
                     if meta.get("Archived"):
-                        if apc3.button("♻️ Restore", use_container_width=True):
+                        if apc3.button("â™»ï¸ Restore", use_container_width=True):
                             repo.unarchive_project(pid)
                             st.rerun()
-                    elif apc3.button("📦 Archive", use_container_width=True):
+                    elif apc3.button("ðŸ“¦ Archive", use_container_width=True):
                         repo.archive_project(pid)
                         st.rerun()
                 if meta.get("SalesPerson") or meta.get("PresalesEngineer") or meta.get("ProjectManager"):
-                    st.caption(f"👤 Sales: {meta.get('SalesPerson') or '—'}  ·  "
-                               f"Pre-sales Eng.: {meta.get('PresalesEngineer') or '—'}  ·  "
-                               f"Project Mgr: {meta.get('ProjectManager') or '—'}")
-                if admin:                   # gross-profit line (internal cost view) — BoQ tab only
+                    st.caption(f"ðŸ‘¤ Sales: {meta.get('SalesPerson') or 'â€”'}  Â·  "
+                               f"Pre-sales Eng.: {meta.get('PresalesEngineer') or 'â€”'}  Â·  "
+                               f"Project Mgr: {meta.get('ProjectManager') or 'â€”'}")
+                if admin:                   # gross-profit line (internal cost view) â€” BoQ tab only
                     _profit_banner(s)
                 cfg = {c: st.column_config.NumberColumn(c, format="%.0f") for c in MONEY_COLS}
                 cfg["Qty"] = st.column_config.NumberColumn("Qty", format="%d")
@@ -1767,7 +1767,7 @@ elif mode == "Load Project":
                 _render_finance_tab(pid, s["grand_total_sar"])
 
             b1, b2, b3, b4 = st.columns(4)
-            if can("edit") and b1.button("✏️ Edit / new revision or option", type="primary",
+            if can("edit") and b1.button("âœï¸ Edit / new revision or option", type="primary",
                                          use_container_width=True):
                 eg = repo.load_project_grid(pid, sheet).copy()
                 eg["Margin x"] = 0.0   # keep loaded prices; set a margin per line to re-price
@@ -1802,7 +1802,7 @@ elif mode == "Load Project":
                 st.session_state.pop("project_sheet_bytes", None)
                 st.session_state.pop("saved_rev", None)
                 st.rerun()
-            if can("new_offer") and b2.button("📋 Duplicate", use_container_width=True):
+            if can("new_offer") and b2.button("ðŸ“‹ Duplicate", use_container_width=True):
                 dg = repo.load_project_grid(pid, sheet).copy()
                 if dg.empty:
                     st.warning("This offer has no lines to duplicate.")
@@ -1840,32 +1840,32 @@ elif mode == "Load Project":
                               "pm": meta.get("ProjectManager"),
                               "offer": meta.get("OfferNo"), "date": meta.get("CreationDate"),
                               "project_sheet": repo.load_project_sheet_info(meta)}
-            if b3.button(f"📄 Generate Offer PDF{f' ({len(opts)} options)' if _multi else ''}",
+            if b3.button(f"ðŸ“„ Generate Offer PDF{f' ({len(opts)} options)' if _multi else ''}",
                          use_container_width=True):
                 _make_pdf_download(_export_header, disp, s, options=opts if _multi else None)
-            if b4.button("📊 Generate Project Sheet", use_container_width=True):
+            if b4.button("ðŸ“Š Generate Project Sheet", use_container_width=True):
                 _make_project_sheet_download(_export_header, s)
             dl1, dl2 = st.columns(2)
             if "pdf_bytes" in st.session_state and not st.session_state.get("saved_rev"):
                 dl1.download_button(
-                    "⬇️ Download Offer PDF", st.session_state.pdf_bytes,
+                    "â¬‡ï¸ Download Offer PDF", st.session_state.pdf_bytes,
                     file_name=f"Quotation_{meta.get('OfferNo') or meta.get('ProjectName')}.pdf",
                     mime="application/pdf", use_container_width=True)
             if "project_sheet_bytes" in st.session_state and not st.session_state.get("saved_rev"):
                 dl2.download_button(
-                    "⬇️ Download Project Sheet", st.session_state.project_sheet_bytes,
+                    "â¬‡ï¸ Download Project Sheet", st.session_state.project_sheet_bytes,
                     file_name=f"Project_Sheet_{_safe_filename(meta.get('OfferNo') or meta.get('ProjectName'))}.xlsx",
                     mime=("application/vnd.openxmlformats-officedocument."
                           "spreadsheetml.sheet"),
                     use_container_width=True)
 
             if can("delete"):
-              with st.expander("🗑️ Delete…"):
+              with st.expander("ðŸ-‘ï¸ Deleteâ€¦"):
                 _rn = int(meta.get("RevisionNo") or 0)
                 _rlbl = repo.revision_token(_rn) if _rn > 0 else "Original"
-                _opt = meta.get("OptionLabel") or "—"
+                _opt = meta.get("OptionLabel") or "â€”"
                 scopes = {
-                    f"This option only  ({_rlbl} · option {_opt})": "option",
+                    f"This option only  ({_rlbl} Â· option {_opt})": "option",
                     f"This revision  ({_rlbl} and all its options)": "revision",
                     "This entire offer  (all revisions & options)": "offer",
                 }
@@ -1875,7 +1875,7 @@ elif mode == "Load Project":
                            f"{'y' if len(ids) == 1 else 'ies'} (and their line items). "
                            "This cannot be undone.")
                 ok = st.checkbox("Yes, permanently delete", key="del_confirm")
-                if st.button("🗑️ Delete now", type="primary", disabled=not ok):
+                if st.button("ðŸ-‘ï¸ Delete now", type="primary", disabled=not ok):
                     n = repo.delete_projects(ids)
                     st.session_state.pop("view_pid", None)
                     st.session_state["_del_reset"] = True
@@ -1886,10 +1886,10 @@ elif mode == "Load Project":
             base = meta.get("BaseName") or repo.base_name(meta.get("ProjectName") or "Offer")
             src_rev = int(meta.get("RevisionNo") or 0)
             nextrev = repo.next_revision(base)
-            st.info(f"✏️ Editing **{meta.get('ProjectName')}**. Save as a **new revision** "
-                    f"(→ {repo.revision_token(nextrev)}) — a changed version — or as **another option** of the "
-                    f"current revision ({repo.revision_token(src_rev) if src_rev else 'Original'}) — an "
-                    "alternative like Dynalite vs KNX. Loaded lines have Margin × = 0 (prices kept); "
+            st.info(f"âœï¸ Editing **{meta.get('ProjectName')}**. Save as a **new revision** "
+                    f"(â†’ {repo.revision_token(nextrev)}) â€” a changed version â€” or as **another option** of the "
+                    f"current revision ({repo.revision_token(src_rev) if src_rev else 'Original'}) â€” an "
+                    "alternative like Dynalite vs KNX. Loaded lines have Margin Ã- = 0 (prices kept); "
                     "set a margin to re-price a line.")
             if "edit_terms" not in st.session_state:
                 st.session_state.edit_terms = {**DEFAULT_TERMS, **repo.load_terms(meta)}
@@ -1946,8 +1946,8 @@ elif mode == "Load Project":
             st.divider()
             _cur_rev = int(meta.get("RevisionNo") or 0)
             e1, e2, e3, e4 = st.columns(4)
-            if e1.button("💾 Save on this revision", type="primary", use_container_width=True,
-                         help="Overwrite the current revision/option in place — keeps the same "
+            if e1.button("ðŸ’¾ Save on this revision", type="primary", use_container_width=True,
+                         help="Overwrite the current revision/option in place â€” keeps the same "
                               "offer #, revision, option and approval."):
                 repo.update_offer(
                     st.session_state.edit_pid, calc.recompute(st.session_state.edit_grid),
@@ -1957,7 +1957,7 @@ elif mode == "Load Project":
                     project_sheet_info=edit_project_sheet)
                 _post_save(st.session_state.edit_pid, meta.get("ProjectName"), _cur_rev)
                 st.success(f"Updated **{meta.get('ProjectName')}** in place.")
-            if e2.button("💾 Save as new revision", use_container_width=True):
+            if e2.button("ðŸ’¾ Save as new revision", use_container_width=True):
                 npid, nname, nrev = repo.save_revision(
                     st.session_state.edit_pid, calc.recompute(st.session_state.edit_grid),
                     discount_sar=edit_discount,
@@ -1967,7 +1967,7 @@ elif mode == "Load Project":
                     project_sheet_info=edit_project_sheet)
                 _post_save(npid, nname, nrev)
                 st.success(f"Saved **{nname}** as ProjectID {npid}.")
-            if e3.button("💾 Save as new option", use_container_width=True):
+            if e3.button("ðŸ’¾ Save as new option", use_container_width=True):
                 if not opt_label.strip():
                     st.warning("Enter an Option label first (e.g. Dynalite / KNX).")
                 else:
@@ -1980,7 +1980,7 @@ elif mode == "Load Project":
                         project_sheet_info=edit_project_sheet)
                     _post_save(npid, nname, nrev)
                     st.success(f"Saved option **{nname}** as ProjectID {npid}.")
-            if e4.button("✖ Cancel edit", use_container_width=True):
+            if e4.button("âœ– Cancel edit", use_container_width=True):
                 st.session_state.edit_mode = False
                 for k in ("pdf_bytes", "project_sheet_bytes", "edit_terms", "edit_project_sheet", "ed_option",
                           "ed_discount_percent", "ed_discount_driver", "ed_discount_subtotal"):
@@ -1988,7 +1988,7 @@ elif mode == "Load Project":
                 st.rerun()
             if "pdf_bytes" in st.session_state and st.session_state.get("saved_rev"):
                 fn = f"Quotation_{st.session_state.saved_rev[1]}.pdf".replace(" ", "")
-                st.download_button("⬇️ Download Offer PDF", st.session_state.pdf_bytes,
+                st.download_button("â¬‡ï¸ Download Offer PDF", st.session_state.pdf_bytes,
                                    file_name=fn, mime="application/pdf")
 
 
@@ -1999,7 +1999,7 @@ elif mode == "Catalogue":
 
     # ---- Add a new item ----
     if _cat_edit:
-      with st.expander("➕ Add new item"):
+      with st.expander("âž• Add new item"):
         with st.form("add_cat_item", clear_on_submit=True):
             ac1, ac2, ac3 = st.columns(3)
             a_brand = ac1.text_input("Brand")
@@ -2016,7 +2016,7 @@ elif mode == "Catalogue":
                                      help="If Ex Unit Cost is entered, this is calculated (in USD) from Shipping %.")
             a_up = f5.number_input("Default U.Price $", min_value=0.0, value=0.0, step=1.0)
             a_ups = f6.number_input("Default U.Price SAR", min_value=0.0, value=0.0, step=10.0)
-            if st.form_submit_button("➕ Add item", type="primary"):
+            if st.form_submit_button("âž• Add item", type="primary"):
                 if not (a_model.strip() or a_desc.strip()):
                     st.warning("Enter at least a Model or a Description.")
                 else:
@@ -2031,7 +2031,7 @@ elif mode == "Catalogue":
                         st.warning("An item with the same Brand + Model + Description already exists.")
 
     st.caption("Prices shown **rounded up**. Edit cost / default-price cells inline, or tick "
-               "**Del** to remove items. Brand / Model / Description are read-only here — "
+               "**Del** to remove items. Brand / Model / Description are read-only here â€” "
                "use **Add new item** above to create one.")
     term = st.text_input("Search", placeholder="Model / Description / Brand")
     res = repo.search_catalog(term, limit=300).reset_index(drop=True)
@@ -2075,7 +2075,7 @@ elif mode == "Catalogue":
             del_ids = [int(res.iloc[i]["ItemID"]) for i in range(len(edited))
                        if bool(edited.iloc[i]["Del"])]
             b1, b2 = st.columns(2)
-            if b1.button("💾 Save price changes", type="primary", use_container_width=True):
+            if b1.button("ðŸ’¾ Save price changes", type="primary", use_container_width=True):
                 n = 0
                 for i in range(len(edited)):
                     changes = {}
@@ -2093,7 +2093,7 @@ elif mode == "Catalogue":
                         n += 1
                 st.success(f"Updated {n} catalogue item(s).")
                 st.rerun()
-            if b2.button(f"🗑️ Delete {len(del_ids)} checked item(s)", use_container_width=True,
+            if b2.button(f"ðŸ-‘ï¸ Delete {len(del_ids)} checked item(s)", use_container_width=True,
                          disabled=not del_ids):
                 n = repo.delete_catalog_items(del_ids)
                 st.success(f"Deleted {n} item(s).")
@@ -2107,9 +2107,9 @@ elif mode == "Settings":
 
     with st.form("settings_form"):
         template = st.text_input("Offer # template", repo.get_setting("offer_template"),
-                                 help="Variables: *TYPE* = System Offer (AV, LCS…), *YY* = 2-digit "
+                                 help="Variables: *TYPE* = System Offer (AV, LCSâ€¦), *YY* = 2-digit "
                                       "year, *YYYY* = 4-digit year, and a run of x's = the auto-number "
-                                      "(its length is the zero-padding). e.g. LG-*TYPE*-*YY*/xxxx → "
+                                      "(its length is the zero-padding). e.g. LG-*TYPE*-*YY*/xxxx â†’ "
                                       "LG-AV-26/0053. Omit *TYPE* for a fixed prefix (e.g. SWS-*YY*-xxxx).")
         c1, c2, c3 = st.columns(3)
         pad = c1.number_input("Fallback digits (no x-run)", min_value=1, max_value=8,
@@ -2118,7 +2118,7 @@ elif mode == "Settings":
         types = c2.text_input("System Offer types (comma-separated)", repo.get_setting("offer_types"),
                               help="Shown as the 'System Offer' dropdown on a new offer. "
                                    "Pick '(none)' there to skip the *TYPE* segment.")
-        dmargin = c3.number_input("Default margin ×", min_value=0.0, step=0.05,
+        dmargin = c3.number_input("Default margin Ã-", min_value=0.0, step=0.05,
                                   value=float(repo.get_setting("default_margin") or 1.6),
                                   help="Applied to new blank rows and catalogue items with no "
                                        "historical price, in New Project and Edit.")
@@ -2127,12 +2127,12 @@ elif mode == "Settings":
         rcol1, rcol2 = st.columns(2)
         rev_fmt = rcol1.text_input("Revision format", repo.get_setting("revision_format"),
                                    help="A run of x's = the revision number (length = padding). "
-                                        "e.g. Rev.x → Rev.1 / Rev.10 ;  Rxx → R01 / R10.")
-        sep_opts = {"Dash   (…0053-Rev.1)": "-", "Space   (…0053 Rev.1)": " ",
-                    "Underscore   (…0053_Rev.1)": "_"}
+                                        "e.g. Rev.x â†’ Rev.1 / Rev.10 ;  Rxx â†’ R01 / R10.")
+        sep_opts = {"Dash   (â€¦0053-Rev.1)": "-", "Space   (â€¦0053 Rev.1)": " ",
+                    "Underscore   (â€¦0053_Rev.1)": "_"}
         _cur_sep = repo.get_setting("revision_separator")
         _cur_lbl = next((k for k, v in sep_opts.items() if v == _cur_sep), list(sep_opts)[0])
-        rev_sep_lbl = rcol2.selectbox("Separator (offer # → revision)", list(sep_opts.keys()),
+        rev_sep_lbl = rcol2.selectbox("Separator (offer # â†’ revision)", list(sep_opts.keys()),
                                       index=list(sep_opts.keys()).index(_cur_lbl))
 
         st.markdown("**Tax**")
@@ -2141,7 +2141,7 @@ elif mode == "Settings":
                                      value=float(repo.get_setting("vat_percent") or 15),
                                      help="VAT rate applied across offers, quotations and the Finance tab. "
                                           "KSA = 15%; change it for other countries.")
-        vcol2.caption("Applies everywhere VAT is shown — new offers, loaded offers, the client PDF "
+        vcol2.caption("Applies everywhere VAT is shown â€” new offers, loaded offers, the client PDF "
                       "and the Finance tab. Changing it re-computes VAT on all offers.")
 
         st.markdown("**Currencies / exchange rates**")
@@ -2150,8 +2150,8 @@ elif mode == "Settings":
                                       value=float(repo.get_setting("eur_to_usd") or 1.08),
                                       help="Converts EUR buy prices to USD when computing the Unit Cost.")
         ecol2.caption(f"Pegged (fixed, not editable): 1 USD = {calc.SAR_PER_USD:g} SAR "
-                      f"(1 SAR ≈ {1 / calc.SAR_PER_USD:.4f} USD)  ·  "
-                      f"1 USD = {calc.AED_PER_USD:g} AED (1 AED ≈ {1 / calc.AED_PER_USD:.4f} USD).")
+                      f"(1 SAR â‰ˆ {1 / calc.SAR_PER_USD:.4f} USD)  Â·  "
+                      f"1 USD = {calc.AED_PER_USD:g} AED (1 AED â‰ˆ {1 / calc.AED_PER_USD:.4f} USD).")
 
         st.markdown("**Company / Branding**")
         gc1, gc2 = st.columns([3, 1])
@@ -2163,7 +2163,7 @@ elif mode == "Settings":
         company_contact = st.text_input("Contact line (city / country)",
                                         repo.get_setting("company_contact") or "")
 
-        saved = st.form_submit_button("💾 Save settings", type="primary")
+        saved = st.form_submit_button("ðŸ’¾ Save settings", type="primary")
         if saved:
             repo.set_setting("offer_template", template.strip())
             repo.set_setting("offer_number_pad", int(pad))
@@ -2184,35 +2184,35 @@ elif mode == "Settings":
     st.markdown("##### Branding images")
     bcol, lcol = st.columns([2, 1])
     with bcol:
-        st.markdown("**Banner** — full-width header (app, PDF, project sheet)")
+        st.markdown("**Banner** â€” full-width header (app, PDF, project sheet)")
         if os.path.exists(db.banner_path()):
             st.image(db.banner_path(), use_container_width=True)
         else:
             st.info("No banner yet.")
         up_b = st.file_uploader("Upload / replace banner (PNG)", type=["png"], key="banner_up")
-        if up_b is not None and st.button("💾 Save banner", key="save_banner"):
+        if up_b is not None and st.button("ðŸ’¾ Save banner", key="save_banner"):
             with open(db.banner_path(), "wb") as f:
                 f.write(up_b.getbuffer())
             st.success("Banner updated. (Reload to see it in the header/sidebar.)")
             st.rerun()
     with lcol:
-        st.markdown("**Logo** — standalone mark")
+        st.markdown("**Logo** â€” standalone mark")
         if os.path.exists(db.logo_path()):
             st.image(db.logo_path(), width=160)
         else:
             st.info("No logo yet.")
         up_l = st.file_uploader("Upload / replace logo (PNG)", type=["png"], key="logo_up")
-        if up_l is not None and st.button("💾 Save logo", key="save_logo"):
+        if up_l is not None and st.button("ðŸ’¾ Save logo", key="save_logo"):
             with open(db.logo_path(), "wb") as f:
                 f.write(up_l.getbuffer())
             st.success("Logo updated.")
             st.rerun()
-    st.caption("Banner ≈ 1400×155 px. Logo: a square / transparent PNG works best.")
+    st.caption("Banner â‰ˆ 1400Ã-155 px. Logo: a square / transparent PNG works best.")
 
     st.divider()
     st.markdown("##### Offer-number preview")
-    st.caption("Numbering is **per series** — each rendered template (type + year) keeps its own "
-               "counter, so LG-AV-26/… and LG-LC-26/… don't conflict.")
+    st.caption("Numbering is **per series** â€” each rendered template (type + year) keeps its own "
+               "counter, so LG-AV-26/â€¦ and LG-LC-26/â€¦ don't conflict.")
     ex_type = (repo.offer_types() or ["AV"])[0]
     _ex = repo.make_offer_no(ex_type)
     st.write("Next offer # examples:")
@@ -2225,36 +2225,36 @@ elif mode == "Settings":
     st.markdown("##### Reset / force a starting number")
     st.caption("Force a series to begin at a chosen number; numbering then continues "
                "incrementing from there. (Numbers at or below the current next have no effect "
-               "— it never reuses an existing number.)")
+               "â€” it never reuses an existing number.)")
     rc1, rc2, rc3 = st.columns([2, 1, 1])
     rsel = rc1.selectbox("Series (System Offer)", ["(none)"] + repo.offer_types(), key="reset_series")
     r_otype = "" if rsel == "(none)" else rsel
     r_next = repo.next_offer_number(r_otype)
     r_floor = repo.get_series_start(repo.series_key(r_otype))
     rc1.caption(f"Next: `{repo.make_offer_no(r_otype)}`"
-                + (f" · forced start: {r_floor}" if r_floor else ""))
+                + (f" Â· forced start: {r_floor}" if r_floor else ""))
     start_at = rc2.number_input("Start at", min_value=1, value=max(int(r_next), 1), step=1,
                                 key="reset_start_val")
-    if rc3.button("✅ Apply", use_container_width=True):
+    if rc3.button("âœ… Apply", use_container_width=True):
         repo.set_series_start(r_otype, int(start_at))
         st.success(f"This series will start at {int(start_at)}, then continue incrementing.")
         st.rerun()
-    if r_floor and rc3.button("↩️ Clear", use_container_width=True):
+    if r_floor and rc3.button("â†©ï¸ Clear", use_container_width=True):
         repo.clear_series_start(r_otype)
-        st.success("Forced start cleared — back to automatic numbering.")
+        st.success("Forced start cleared â€” back to automatic numbering.")
         st.rerun()
 
 
 # ============================ USERS (owner) ============================
 elif mode == "Users":
     st.subheader("Users & access")
-    tab_users, tab_roles = st.tabs(["👤 Users", "🛡️ Roles & permissions"])
+    tab_users, tab_roles = st.tabs(["ðŸ‘¤ Users", "ðŸ›¡ï¸ Roles & permissions"])
 
     # ---------------------------- USERS TAB ----------------------------
     with tab_users:
         roles = auth.list_roles()
         _default_role = "viewer" if "viewer" in roles else roles[-1]
-        with st.expander("➕ Add user", expanded=False):
+        with st.expander("âž• Add user", expanded=False):
             with st.form("add_user", clear_on_submit=True):
                 uc1, uc2 = st.columns(2)
                 nu = uc1.text_input("Username")
@@ -2263,7 +2263,7 @@ elif mode == "Users":
                 np1 = uc3.text_input("Password", type="password")
                 np2 = uc4.text_input("Confirm", type="password")
                 nrole = uc5.selectbox("Role", roles, index=roles.index(_default_role))
-                if st.form_submit_button("➕ Create user", type="primary"):
+                if st.form_submit_button("âž• Create user", type="primary"):
                     if not nu.strip() or not np1:
                         st.warning("Username and password are required.")
                     elif np1 != np2:
@@ -2283,7 +2283,7 @@ elif mode == "Users":
             last_owner = (u["Role"] == auth.PROTECTED_ROLE and owners <= 1)
             with st.container(border=True):
                 cc = st.columns([2, 2, 1.5, 1, 1.2], vertical_alignment="center")
-                cc[0].markdown(f"**{u['Username']}**" + (" · _(you)_" if is_self else ""))
+                cc[0].markdown(f"**{u['Username']}**" + (" Â· _(you)_" if is_self else ""))
                 cc[1].write(u.get("DisplayName") or "")
                 r_idx = roles.index(u["Role"]) if u["Role"] in roles else 0
                 new_role = cc[2].selectbox("Role", roles, key=f"role_{uid}",
@@ -2291,7 +2291,7 @@ elif mode == "Users":
                 active = cc[3].toggle("On", value=bool(u["Active"]), key=f"act_{uid}",
                                       label_visibility="collapsed")
                 if (new_role != u["Role"] or active != bool(u["Active"])):
-                    if cc[4].button("💾 Save", key=f"saveu_{uid}", use_container_width=True):
+                    if cc[4].button("ðŸ’¾ Save", key=f"saveu_{uid}", use_container_width=True):
                         if last_owner and (new_role != auth.PROTECTED_ROLE or not active):
                             st.warning("Can't remove the last active owner.")
                         else:
@@ -2302,12 +2302,12 @@ elif mode == "Users":
                 newpw = pc[0].text_input("pw", type="password", key=f"pw_{uid}",
                                          label_visibility="collapsed",
                                          placeholder="New password (blank = keep)")
-                if pc[1].button("🔑 Set password", key=f"setpw_{uid}", use_container_width=True,
+                if pc[1].button("ðŸ”‘ Set password", key=f"setpw_{uid}", use_container_width=True,
                                 disabled=not newpw):
                     auth.set_password(uid, newpw)
                     st.toast(f"Password updated for {u['Username']}.")
                     st.rerun()
-                if pc[2].button("🗑️ Delete", key=f"delu_{uid}", use_container_width=True,
+                if pc[2].button("ðŸ-‘ï¸ Delete", key=f"delu_{uid}", use_container_width=True,
                                 disabled=is_self or last_owner):
                     auth.delete_user(uid)
                     st.toast(f"Deleted {u['Username']}.")
@@ -2334,7 +2334,7 @@ elif mode == "Users":
                                 num_rows="fixed", use_container_width=True,
                                 disabled=["Role"], key="role_matrix")
 
-        if st.button("💾 Save role permissions", type="primary"):
+        if st.button("ðŸ’¾ Save role permissions", type="primary"):
             for _, r in edited.iterrows():
                 role = r["Role"]
                 if role == auth.PROTECTED_ROLE:
@@ -2352,7 +2352,7 @@ elif mode == "Users":
             new_role_name = arc1.text_input("New role name", key="new_role_name",
                                             label_visibility="collapsed",
                                             placeholder="e.g. Estimator")
-            if arc2.button("➕ Add", use_container_width=True):
+            if arc2.button("âž• Add", use_container_width=True):
                 if auth.add_role(new_role_name):
                     st.toast(f"Added role '{new_role_name.strip()}'.")
                     st.rerun()
@@ -2364,10 +2364,10 @@ elif mode == "Users":
             drc1, drc2 = st.columns([3, 1.4], vertical_alignment="bottom")
             drole = drc1.selectbox("Role to delete", deletable, key="del_role",
                                    label_visibility="collapsed") if deletable else None
-            if drc2.button("🗑️ Delete", use_container_width=True, disabled=not deletable):
+            if drc2.button("ðŸ-‘ï¸ Delete", use_container_width=True, disabled=not deletable):
                 in_use = auth.role_user_count(drole)
                 if in_use:
-                    st.warning(f"{in_use} user(s) still have the '{drole}' role — "
+                    st.warning(f"{in_use} user(s) still have the '{drole}' role â€” "
                                "reassign them first.")
                 elif auth.delete_role(drole):
                     st.toast(f"Deleted role '{drole}'.")

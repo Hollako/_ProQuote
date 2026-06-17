@@ -1,5 +1,5 @@
-"""
-Pricing calculation engine — the single source of truth for every grid formula.
+﻿"""
+Pricing calculation engine â€” the single source of truth for every grid formula.
 
 Mirrors the Excel sheet exactly (validated against the historical workbooks):
     Unit Cost  = Ex Unit Cost x (1 + Shipping % / 100)  (manual if no Ex cost)
@@ -69,7 +69,7 @@ def _blank(x) -> bool:
 
 
 def roundup(x, decimals=0):
-    """Excel ROUNDUP(x, decimals) — always rounds away from zero (ceiling for +)."""
+    """Excel ROUNDUP(x, decimals) â€” always rounds away from zero (ceiling for +)."""
     x = _num(x)
     if x == 0:
         return 0.0

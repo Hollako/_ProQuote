@@ -1,5 +1,5 @@
-"""
-ProQuote System — SQLite schema & connection layer.
+﻿"""
+ProQuote System â€” SQLite schema & connection layer.
 
 Single-file relational database for the centralized Bill of Quantities engine.
 All money is stored exactly as found in the source sheets (no rounding on ingest).
@@ -190,7 +190,7 @@ def connect(db_path: str = DB_PATH) -> sqlite3.Connection:
     return conn
 
 
-# Columns added after the first release — applied to pre-existing databases.
+# Columns added after the first release â€” applied to pre-existing databases.
 MIGRATIONS = {
     "Projects_Master": {
         "SalesPerson": "TEXT",

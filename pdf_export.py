@@ -1,5 +1,5 @@
-"""
-Client-facing PDF generator (Workflow 3) — replicates the `Quotation` sheet.
+﻿"""
+Client-facing PDF generator (Workflow 3) â€” replicates the `Quotation` sheet.
 
 Layout mirrors the Excel Quotation tab: corporate header block, grouped
 System/Description/Brand/Model/Qty/Unit Price (SAR)/Total Price (SAR) table,
@@ -28,7 +28,7 @@ import db
 
 # Corporate palette. BRAND is the primary colour and is overridden per company
 # (from Settings) at render time; the rest are neutral accents.
-BRAND = colors.HexColor("#002060")      # primary (default navy) — set per company
+BRAND = colors.HexColor("#002060")      # primary (default navy) â€” set per company
 BRAND_LIGHT = colors.HexColor("#E6ECF5")
 ACCENT = colors.HexColor("#62B22F")     # green accent rule
 GREY = colors.HexColor("#6B7280")
@@ -260,7 +260,7 @@ def generate_options_pdf(out_path, header: dict, options: list,
                          notes: dict | None = None, company: dict | None = None,
                          show_costs: bool = False) -> str:
     """Render one quotation document. `options` is a list of
-    {'label', 'grid', 'summary'} — each becomes its own section (table + totals).
+    {'label', 'grid', 'summary'} â€” each becomes its own section (table + totals).
     A single option renders as a normal quotation."""
     global BRAND, BRAND_LIGHT
     company = company or {"name": "SmartWay Systems",
@@ -318,7 +318,7 @@ def generate_options_pdf(out_path, header: dict, options: list,
         canvas.line(17 * mm, 12 * mm, 193 * mm, 12 * mm)
         canvas.setFont("Helvetica", 7)
         canvas.setFillColor(GREY)
-        canvas.drawString(17 * mm, 8 * mm, f"{company['name']} — {header.get('project','')}")
+        canvas.drawString(17 * mm, 8 * mm, f"{company['name']} â€” {header.get('project','')}")
         canvas.drawRightString(193 * mm, 8 * mm, f"Page {d.page}")
         canvas.restoreState()
 
