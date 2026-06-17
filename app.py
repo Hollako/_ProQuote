@@ -2236,9 +2236,9 @@ elif mode == "Settings":
     rel = st.session_state.get("latest_release")
     if rel:
         if st.session_state.get("update_available"):
-            st.warning(f"New release available: **{rel.tag}** ({rel.name})")
+            st.warning(f"New {rel.source} available: **{rel.tag}** ({rel.name})")
             if rel.url:
-                st.link_button("Open release notes", rel.url, use_container_width=True)
+                st.link_button("Open GitHub page", rel.url, use_container_width=True)
             if st.button("Update this instance", type="primary", use_container_width=True):
                 ok, output = updater.run_git_update(db.APP_DIR)
                 if ok:
@@ -2247,7 +2247,7 @@ elif mode == "Settings":
                     st.error("Update failed. Details below.")
                 st.code(output or "No output", language="text")
         else:
-            st.success(f"You are up to date. Latest release: {rel.tag or rel.name}")
+            st.success(f"You are up to date. Latest {rel.source}: {rel.tag or rel.name}")
 
     st.divider()
     st.markdown("##### Offer-number preview")

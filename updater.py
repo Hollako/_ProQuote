@@ -1,4 +1,4 @@
-"""GitHub release checking and local git update helpers."""
+﻿"""GitHub release checking and local git update helpers."""
 from __future__ import annotations
 
 import json
@@ -20,6 +20,7 @@ class ReleaseInfo:
     url: str
     published_at: str
     body: str
+    source: str = "release"
 
 
 def _version_tuple(value: str) -> tuple[int, ...]:
@@ -38,13 +39,7 @@ def is_newer(latest: str, current: str) -> bool:
     return latest_tuple > current_tuple
 
 
-def latest_release(owner: str, repo: str, timeout: int = 10) -> ReleaseInfo:
-    owner = (owner or "").strip()
-    repo = (repo or "").strip()
-    if not owner or not repo:
-        raise ValueError("GitHub owner and repository are required.")
-
-    url = f"https://api.github.com/repos/{owner}/{repo}/releases/latest"
+def _github_json(url: str, timeout: int):
     req = urllib.request.Request(
         url,
         headers={
@@ -52,12 +47,43 @@ def latest_release(owner: str, repo: str, timeout: int = 10) -> ReleaseInfo:
             "User-Agent": "ProQuote-Updater",
         },
     )
+    with urllib.request.urlopen(req, timeout=timeout) as response:
+        return json.loads(response.read().decode("utf-8"))
+
+
+def latest_tag(owner: str, repo: str, timeout: int = 10) -> ReleaseInfo:
+    url = f"https://api.github.com/repos/{owner}/{repo}/tags?per_page=1"
+    data = _github_json(url, timeout)
+    if not data:
+        raise RuntimeError("No GitHub release or tag was found for this repository.")
+    tag = str(data[0].get("name") or "")
+    return ReleaseInfo(
+        tag=tag,
+        name=f"Latest tag {tag}",
+        url=f"https://github.com/{owner}/{repo}/tree/{tag}",
+        published_at="",
+        body="",
+        source="tag",
+    )
+
+
+def latest_release(owner: str, repo: str, timeout: int = 10) -> ReleaseInfo:
+    owner = (owner or "").strip()
+    repo = (repo or "").strip()
+    if not owner or not repo:
+        raise ValueError("GitHub owner and repository are required.")
+
+    url = f"https://api.github.com/repos/{owner}/{repo}/releases/latest"
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as response:
-            data = json.loads(response.read().decode("utf-8"))
+        data = _github_json(url, timeout)
     except urllib.error.HTTPError as exc:
         if exc.code == 404:
-            raise RuntimeError("No GitHub release was found for this repository.") from exc
+            try:
+                return latest_tag(owner, repo, timeout)
+            except urllib.error.URLError as tag_exc:
+                raise RuntimeError(f"Could not connect to GitHub: {tag_exc.reason}") from tag_exc
+            except urllib.error.HTTPError as tag_exc:
+                raise RuntimeError(f"GitHub returned HTTP {tag_exc.code} while checking tags.") from tag_exc
         raise RuntimeError(f"GitHub returned HTTP {exc.code}.") from exc
     except urllib.error.URLError as exc:
         raise RuntimeError(f"Could not connect to GitHub: {exc.reason}") from exc
@@ -68,6 +94,7 @@ def latest_release(owner: str, repo: str, timeout: int = 10) -> ReleaseInfo:
         url=str(data.get("html_url") or ""),
         published_at=str(data.get("published_at") or ""),
         body=str(data.get("body") or ""),
+        source="release",
     )
 
 
