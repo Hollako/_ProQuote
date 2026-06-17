@@ -108,6 +108,9 @@ DEFAULT_SETTINGS = {
     "company_tagline": "Smart & Low-Current Systems",
     "company_contact": "Riyadh, Kingdom of Saudi Arabia",
     "company_brand_color": "#002060",
+    # Software updates.
+    "github_owner": "Hollako",
+    "github_repo": "_ProQuote",
 }
 
 

@@ -1,4 +1,4 @@
-"""
+﻿"""
 ProQuote - Streamlit interface.
 
 Run:  streamlit run app.py   (from the _ProQuote folder)
@@ -22,6 +22,8 @@ import repo
 import pdf_export
 import auth
 import db
+import updater
+from version import APP_VERSION
 
 _LOGO = db.banner_path()                       # per-company banner (follows BOQ_DATA_DIR)
 _COMPANY = repo.get_setting("company_name") or "SmartWay Systems"
@@ -2208,6 +2210,44 @@ elif mode == "Settings":
             st.success("Logo updated.")
             st.rerun()
     st.caption("Banner ≈ 1400x155 px. Logo: a square / transparent PNG works best.")
+
+
+    st.divider()
+    st.markdown("##### Software updates")
+    ucol1, ucol2, ucol3 = st.columns([1.2, 1.2, 1])
+    gh_owner = ucol1.text_input("GitHub owner", repo.get_setting("github_owner") or "Hollako",
+                                key="settings_github_owner")
+    gh_repo = ucol2.text_input("GitHub repo", repo.get_setting("github_repo") or "_ProQuote",
+                               key="settings_github_repo")
+    ucol3.metric("Installed version", APP_VERSION)
+
+    if st.button("Check for updates", use_container_width=True):
+        repo.set_setting("github_owner", gh_owner.strip())
+        repo.set_setting("github_repo", gh_repo.strip())
+        try:
+            rel = updater.latest_release(gh_owner, gh_repo)
+            st.session_state.latest_release = rel
+            st.session_state.update_available = updater.is_newer(rel.tag, APP_VERSION)
+        except Exception as exc:
+            st.session_state.latest_release = None
+            st.session_state.update_available = False
+            st.error(str(exc))
+
+    rel = st.session_state.get("latest_release")
+    if rel:
+        if st.session_state.get("update_available"):
+            st.warning(f"New release available: **{rel.tag}** ({rel.name})")
+            if rel.url:
+                st.link_button("Open release notes", rel.url, use_container_width=True)
+            if st.button("Update this instance", type="primary", use_container_width=True):
+                ok, output = updater.run_git_update(db.APP_DIR)
+                if ok:
+                    st.success("Update downloaded. Restart this Streamlit instance to load the new code.")
+                else:
+                    st.error("Update failed. Details below.")
+                st.code(output or "No output", language="text")
+        else:
+            st.success(f"You are up to date. Latest release: {rel.tag or rel.name}")
 
     st.divider()
     st.markdown("##### Offer-number preview")
