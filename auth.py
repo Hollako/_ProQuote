@@ -1,6 +1,6 @@
-﻿"""User accounts + role-based access control (login, roles, user management).
+"""User accounts + role-based access control (login, roles, user management).
 
-Passwords are hashed with PBKDF2-HMAC-SHA256 (salted) â€” no external deps.
+Passwords are hashed with PBKDF2-HMAC-SHA256 (salted) - no external deps.
 """
 from __future__ import annotations
 import hashlib
@@ -127,7 +127,7 @@ def role_user_count(role: str) -> int:
 
 
 def users_in_role(role: str) -> list[str]:
-    """Display names of active users holding `role` â€” used for offer people-pickers."""
+    """Display names of active users holding `role` - used for offer people-pickers."""
     with dbmod.connect() as c:
         rows = c.execute(
             "SELECT DisplayName, Username FROM Users WHERE Role=? AND Active=1 "
