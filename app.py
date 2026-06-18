@@ -22,6 +22,7 @@ import repo
 import pdf_export
 import auth
 import db
+import db_backup
 import ingest
 import updater
 from version import APP_VERSION
@@ -2316,6 +2317,64 @@ elif mode == "Settings":
             except Exception as exc:
                 progress.empty()
                 st.error(f"Import failed: {exc}")
+    st.divider()
+    st.markdown("##### Backup and restore database")
+    st.caption("Backups include this company profile database only. Branding images are not included.")
+
+    b1, b2, b3 = st.columns([1, 1, 2])
+    if b1.button("Create backup", use_container_width=True):
+        try:
+            backup_path = db_backup.create_backup("manual")
+            st.session_state.latest_db_backup = backup_path
+            st.success(f"Backup created: {os.path.basename(backup_path)}")
+        except Exception as exc:
+            st.error(f"Backup failed: {exc}")
+
+    latest_backup = st.session_state.get("latest_db_backup")
+    if latest_backup and os.path.exists(latest_backup):
+        with open(latest_backup, "rb") as f:
+            b2.download_button(
+                "Download backup",
+                data=f.read(),
+                file_name=os.path.basename(latest_backup),
+                mime="application/octet-stream",
+                use_container_width=True,
+            )
+    else:
+        b2.button("Download backup", disabled=True, use_container_width=True)
+
+    backups = db_backup.list_backups(limit=5)
+    if backups:
+        names = [f"{b['name']} ({b['size'] / 1024 / 1024:.1f} MB)" for b in backups]
+        pick = b3.selectbox("Recent backups", names, label_visibility="collapsed")
+        picked_backup = backups[names.index(pick)]
+        with open(picked_backup["path"], "rb") as f:
+            b3.download_button(
+                "Download selected recent backup",
+                data=f.read(),
+                file_name=picked_backup["name"],
+                mime="application/octet-stream",
+                use_container_width=True,
+            )
+    else:
+        b3.info("No local backups yet.")
+
+    restore_file = st.file_uploader("Restore database from backup (.db)", type=["db"], key="restore_db_upload")
+    restore_ok = st.checkbox(
+        "I understand restore replaces the current database. A safety backup will be created first.",
+        key="restore_db_confirm",
+    )
+    if st.button("Restore database", type="primary", disabled=not (restore_file and restore_ok), use_container_width=True):
+        try:
+            restored_path, safety_backup = db_backup.restore_from_bytes(restore_file.getvalue())
+            st.success("Database restored. The app will reload now.")
+            if safety_backup:
+                st.info(f"Safety backup created: {os.path.basename(safety_backup)}")
+            st.cache_data.clear()
+            st.cache_resource.clear()
+            st.rerun()
+        except Exception as exc:
+            st.error(f"Restore failed: {exc}")
     st.divider()
     st.markdown("##### Offer-number preview")
     st.caption("Numbering is **per series** - each rendered template (type + year) keeps its own "
