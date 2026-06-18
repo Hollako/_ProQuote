@@ -104,10 +104,20 @@ DEFAULT_SETTINGS = {
     "eur_to_usd": "1.08",           # USD value of 1 EUR (SAR uses the 3.75 peg)
     "vat_percent": "15",            # VAT rate (%) applied to offers & finance
     # Per-company branding (banner image lives in the data dir's assets/).
-    "company_name": "SmartWay Systems",
+    "company_name": "Company Name",
     "company_tagline": "Smart & Low-Current Systems",
     "company_contact": "Riyadh, Kingdom of Saudi Arabia",
     "company_brand_color": "#002060",
+    # PDF header. The full-width banner image overrides these section settings.
+    # Placeholders: {company}, {project}, {offer}, {page}.
+    "header_left_text": "{company}",
+    "header_middle_text": "",
+    "header_right_text": "{offer}",
+    # PDF footer. Placeholders: {company}, {project}, {offer}, {page}.
+    "footer_left_text": "{company} - {project}",
+    "footer_middle_text": "",
+    "footer_right_text": "Page {page}",
+    "pdf_body_template": "template1",
     # Software updates.
     "github_owner": "Hollako",
     "github_repo": "_ProQuote",

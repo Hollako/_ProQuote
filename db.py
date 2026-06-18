@@ -28,6 +28,41 @@ def logo_path() -> str:
     """Path to this company's standalone logo mark (PNG)."""
     return os.path.join(ASSETS_DIR, "logo.png")
 
+
+def header_left_path() -> str:
+    """Path to this company's left header section image (PNG)."""
+    return os.path.join(ASSETS_DIR, "header_left.png")
+
+
+def header_middle_path() -> str:
+    """Path to this company's middle header section image (PNG)."""
+    return os.path.join(ASSETS_DIR, "header_middle.png")
+
+
+def header_right_path() -> str:
+    """Path to this company's right header section image (PNG)."""
+    return os.path.join(ASSETS_DIR, "header_right.png")
+
+
+def footer_full_path() -> str:
+    """Path to this company's full-width footer image (PNG)."""
+    return os.path.join(ASSETS_DIR, "footer_full.png")
+
+
+def footer_left_path() -> str:
+    """Path to this company's left footer section image (PNG)."""
+    return os.path.join(ASSETS_DIR, "footer_left.png")
+
+
+def footer_middle_path() -> str:
+    """Path to this company's middle footer section image (PNG)."""
+    return os.path.join(ASSETS_DIR, "footer_middle.png")
+
+
+def footer_right_path() -> str:
+    """Path to this company's right footer section image (PNG)."""
+    return os.path.join(ASSETS_DIR, "footer_right.png")
+
 SCHEMA = r"""
 PRAGMA foreign_keys = ON;
 

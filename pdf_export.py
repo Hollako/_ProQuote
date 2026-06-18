@@ -99,6 +99,77 @@ def _pct(x):
         return ""
 
 
+def _sar2(x):
+    try:
+        if x is None or x == "":
+            return ""
+        return f"{float(x):,.2f}"
+    except (TypeError, ValueError):
+        return ""
+
+
+def _display_date(value) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    for fmt in ("%Y-%m-%d", "%d/%m/%Y", "%m/%d/%Y"):
+        try:
+            d = dt.datetime.strptime(text, fmt).date()
+            return d.strftime("%B ") + str(d.day) + d.strftime(",%Y")
+        except ValueError:
+            pass
+    return text
+
+
+def _slot_text(template: str, company: dict, header: dict, page: int) -> str:
+    values = {
+        "company": company.get("name") or "",
+        "project": header.get("project") or "",
+        "offer": header.get("offer") or "",
+        "page": page,
+    }
+    try:
+        return str(template or "").format(**values)
+    except (KeyError, ValueError):
+        return str(template or "")
+
+
+def _fit_size(path: str, max_w: float, max_h: float) -> tuple[float, float]:
+    iw, ih = ImageReader(path).getSize()
+    scale = min(max_w / iw, max_h / ih)
+    return iw * scale, ih * scale
+
+
+def _asset_path(filename: str) -> str:
+    base = getattr(db, "ASSETS_DIR", "")
+    if not base:
+        data_dir = getattr(db, "DATA_DIR", getattr(db, "APP_DIR", os.path.dirname(os.path.abspath(__file__))))
+        base = os.path.join(data_dir, "assets")
+    return os.path.join(base, filename)
+
+
+def _db_asset_path(helper_name: str, filename: str) -> str:
+    helper = getattr(db, helper_name, None)
+    if callable(helper):
+        return helper()
+    return _asset_path(filename)
+
+
+def _draw_fit_image(canvas, path: str, x: float, y: float, max_w: float, max_h: float,
+                    align: str = "center") -> None:
+    if not os.path.exists(path):
+        return
+    w, h = _fit_size(path, max_w, max_h)
+    if align == "right":
+        ix = x + max_w - w
+    elif align == "left":
+        ix = x
+    else:
+        ix = x + (max_w - w) / 2
+    iy = y + (max_h - h) / 2
+    canvas.drawImage(path, ix, iy, width=w, height=h, preserveAspectRatio=True, mask="auto")
+
+
 def _header(story, ss, h, company):
     # The brand banner is drawn full-bleed on the page canvas (see generate_*);
     # the flowing content starts here, just below it, with the title + offer meta.
@@ -256,70 +327,413 @@ def _notes(ss, notes: dict):
     return flow
 
 
+def _template2_styles(ss):
+    ss.add(ParagraphStyle("T2MetaL", fontName="Helvetica-Bold", fontSize=9.5,
+                          textColor=colors.black, leading=12))
+    ss.add(ParagraphStyle("T2MetaR", fontName="Helvetica", fontSize=9.5,
+                          textColor=colors.black, leading=12, alignment=TA_RIGHT))
+    ss.add(ParagraphStyle("T2Subject", fontName="Helvetica-Bold", fontSize=9.5,
+                          textColor=colors.black, leading=12))
+    ss.add(ParagraphStyle("T2Body", fontName="Helvetica", fontSize=9.5,
+                          textColor=colors.black, leading=13))
+    ss.add(ParagraphStyle("T2TermH", fontName="Helvetica-Bold", fontSize=9.5,
+                          textColor=colors.black, leading=11))
+    ss.add(ParagraphStyle("T2TableH", fontName="Helvetica", fontSize=8.5,
+                          textColor=colors.white, leading=11))
+    ss.add(ParagraphStyle("T2Cell", fontName="Helvetica", fontSize=8.5,
+                          textColor=colors.black, leading=11))
+    ss.add(ParagraphStyle("T2CellC", fontName="Helvetica", fontSize=8.5,
+                          textColor=colors.black, leading=11, alignment=TA_CENTER))
+    ss.add(ParagraphStyle("T2CellR", fontName="Helvetica", fontSize=8.5,
+                          textColor=colors.black, leading=11, alignment=TA_RIGHT))
+    ss.add(ParagraphStyle("T2Group", fontName="Helvetica", fontSize=9.5,
+                          textColor=colors.black, leading=12))
+    ss.add(ParagraphStyle("T2Total", fontName="Helvetica", fontSize=8.5,
+                          textColor=colors.white, leading=10))
+    ss.add(ParagraphStyle("T2TotalR", fontName="Helvetica-Bold", fontSize=8.5,
+                          textColor=colors.white, leading=10, alignment=TA_RIGHT))
+    ss.add(ParagraphStyle("T2TotalDark", fontName="Helvetica", fontSize=8.5,
+                          textColor=colors.black, leading=10))
+    ss.add(ParagraphStyle("T2TotalDarkR", fontName="Helvetica", fontSize=8.5,
+                          textColor=colors.black, leading=10, alignment=TA_RIGHT))
+
+
+def _template2_add_text(flow, text: str, style, blank_space: float = 5) -> None:
+    lines = str(text or "").replace("\r\n", "\n").split("\n")
+    for line in lines:
+        if line.strip():
+            flow.append(Paragraph(_rt(line), style))
+        else:
+            flow.append(Spacer(1, blank_space))
+
+
+def _template2_intro(story, ss, h, notes: dict, company: dict) -> None:
+    content_w = 176 * mm
+    left = [
+        Paragraph(f"Project:{_rt(h.get('project') or '')}", ss["T2MetaL"]),
+        Spacer(1, 19),
+        Paragraph(f"M/S {_rt(h.get('client') or '')}", ss["T2MetaL"]),
+    ]
+    right_lines = []
+    if h.get("sales"):
+        right_lines.append(f"From: {h.get('sales')}")
+    if h.get("phone"):
+        right_lines.append(f"Phone: {h.get('phone')}")
+    if h.get("offer"):
+        right_lines.append(f"Reference: {h.get('offer')}")
+    if h.get("date"):
+        right_lines.append(f"Date:{_display_date(h.get('date'))}")
+    right = [Paragraph(_rt(line), ss["T2MetaR"]) for line in right_lines]
+    meta = Table([[left, right]], colWidths=[content_w * 0.58, content_w * 0.42])
+    meta.setStyle(TableStyle([
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ("LEFTPADDING", (0, 0), (-1, -1), 0),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 0),
+        ("TOPPADDING", (0, 0), (-1, -1), 0),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 0),
+    ]))
+    story.append(meta)
+    story.append(Spacer(1, 28))
+
+    title = h.get("title") or "Quotation"
+    story.append(Paragraph(f"<u>Subject: {_rt(title)}</u>", ss["T2Subject"]))
+    story.append(Spacer(1, 22))
+
+    greeting = h.get("greeting") or ""
+    if greeting:
+        _template2_add_text(story, greeting, ss["T2Body"], blank_space=10)
+        story.append(Spacer(1, 10))
+
+    free_notes = str(notes.get("Notes") or "").strip()
+    if free_notes:
+        story.append(Paragraph("Below are some notes to be taken into consideration:", ss["T2Body"]))
+        story.append(Spacer(1, 12))
+        _template2_add_text(story, free_notes, ss["T2Body"], blank_space=3)
+        story.append(Spacer(1, 14))
+
+    intro_text = f"{greeting}\n{free_notes}".lower()
+    if "we look forward" not in intro_text:
+        story.append(Paragraph(
+            "We look forward for your favorable reply, meanwhile we remain at your disposal "
+            "for any further information that you may need.",
+            ss["T2Body"],
+        ))
+        story.append(Spacer(1, 18))
+    else:
+        story.append(Spacer(1, 8))
+
+    term_order = [
+        ("Scope", notes.get("Scope")),
+        ("System", notes.get("System")),
+        ("Exclusions", notes.get("Exclusions")),
+        ("Pre-requirements", notes.get("Pre-requirements")),
+        ("Payment Terms", notes.get("Payment Terms")),
+        ("Validity", notes.get("Validity")),
+        ("Delivery", notes.get("Delivery")),
+    ]
+    for label, value in term_order:
+        if not str(value or "").strip():
+            continue
+        story.append(Paragraph(f"<u>{_rt(label)}</u>", ss["T2TermH"]))
+        _template2_add_text(story, value, ss["T2Body"], blank_space=2)
+        story.append(Spacer(1, 6))
+
+
+def _template2_price_cells(row, included: bool):
+    if included:
+        return "", "Included"
+    return _sar(row.get("U. Price SAR")), _sar(row.get("T. Price SAR"))
+
+
+def _template2_items_table(ss, grid: pd.DataFrame, summary: dict, show_costs: bool):
+    dark = colors.HexColor("#37689B")
+    group_fill = colors.HexColor("#92D0DC")
+    system_fill = colors.HexColor("#96B3D3")
+    body_fill = colors.HexColor("#C5D9F1")
+    headers = ["System", "Description", "Brand", "Model", "Qty", "U. Price<br/>SAR", "T. Price SAR"]
+    widths = [18, 69, 17, 22, 12, 19, 19]
+    widths = [w * mm for w in widths]
+    data = [[Paragraph(c, ss["T2TableH"]) for c in headers]]
+    style = [
+        ("BACKGROUND", (0, 0), (-1, 0), dark),
+        ("LINEABOVE", (0, 0), (-1, 0), 0.7, colors.black),
+        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ("TOPPADDING", (0, 0), (-1, 0), 4),
+        ("BOTTOMPADDING", (0, 0), (-1, 0), 4),
+        ("LEFTPADDING", (0, 0), (-1, -1), 3),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 3),
+    ]
+
+    last_area_key = None
+    last_system = None
+    for _, row in grid.iterrows():
+        if str(row.get("LineType", "item")) == "discount":
+            continue
+        area = str(row.get("Area") or "").strip()
+        system = str(row.get("System") or "").strip()
+        group_label = area or system
+        group_key = group_label.casefold()
+        if group_label and group_key != last_area_key:
+            data.append([Paragraph(_rt(group_label), ss["T2Group"])] + [""] * 6)
+            rr = len(data) - 1
+            style += [
+                ("SPAN", (0, rr), (-1, rr)),
+                ("BACKGROUND", (0, rr), (-1, rr), group_fill),
+                ("TOPPADDING", (0, rr), (-1, rr), 2),
+                ("BOTTOMPADDING", (0, rr), (-1, rr), 2),
+            ]
+            last_area_key = group_key
+            last_system = None
+
+        show_system = system if system and system != last_system else ""
+        if system:
+            last_system = system
+        included = str(row.get("LineType", "item")).lower() in {"service", "included"}
+        unit_price, total_price = _template2_price_cells(row, included)
+        data.append([
+            Paragraph(_rt(show_system), ss["T2Cell"]),
+            Paragraph(_rt(row.get("Description") or ""), ss["T2Cell"]),
+            Paragraph(_rt(row.get("Brand") or ""), ss["T2Cell"]),
+            Paragraph(_rt(row.get("Model") or ""), ss["T2Cell"]),
+            Paragraph(_sar(row.get("Qty")), ss["T2CellC"]),
+            Paragraph(unit_price, ss["T2CellR"]),
+            Paragraph(total_price, ss["T2CellR"]),
+        ])
+        rr = len(data) - 1
+        style += [
+            ("BACKGROUND", (0, rr), (0, rr), system_fill),
+            ("BACKGROUND", (1, rr), (1, rr), body_fill),
+            ("BACKGROUND", (3, rr), (3, rr), body_fill),
+            ("TOPPADDING", (0, rr), (-1, rr), 2),
+            ("BOTTOMPADDING", (0, rr), (-1, rr), 2),
+        ]
+
+    total_rows = [
+        ("Grand Total", summary.get("subtotal_sar"), True),
+    ]
+    if summary.get("discount_sar"):
+        total_rows.append((f"Discount ({summary.get('discount_percent', 0):.2f}%)",
+                           summary.get("discount_sar"), False))
+        total_rows.append(("Total After Discount", summary.get("discounted_subtotal_sar"), True))
+    total_rows += [
+        (f"VAT {int(summary.get('vat_rate', 0) * 100)}%", summary.get("vat_amount_sar"), False),
+        ("Net Total", summary.get("grand_total_sar"), True),
+    ]
+
+    for label, value, filled in total_rows:
+        if filled:
+            row = [
+                Paragraph(_rt(label), ss["T2Total"]), "", "", "", "",
+                Paragraph("SAR", ss["T2TotalR"]),
+                Paragraph(_sar2(value), ss["T2TotalR"]),
+            ]
+        else:
+            row = [
+                Paragraph(_rt(label), ss["T2TotalDark"]), "", "", "", "",
+                Paragraph("SAR", ss["T2TotalDarkR"]),
+                Paragraph(_sar2(value), ss["T2TotalDarkR"]),
+            ]
+        data.append(row)
+        rr = len(data) - 1
+        style += [
+            ("SPAN", (0, rr), (4, rr)),
+            ("BACKGROUND", (0, rr), (-1, rr), dark if filled else colors.white),
+            ("TOPPADDING", (0, rr), (-1, rr), 2),
+            ("BOTTOMPADDING", (0, rr), (-1, rr), 2),
+        ]
+
+    t = Table(data, colWidths=widths, repeatRows=1)
+    t.setStyle(TableStyle(style))
+    return t
+
+
+def _template2_boq_section(story, ss, opt: dict, option_label: str = "") -> None:
+    title = "BOQ:" if not option_label else f"BOQ: {option_label}"
+    story.append(Paragraph(_rt(title), ss["T2MetaL"]))
+    story.append(Spacer(1, 14))
+    story.append(_template2_items_table(ss, opt["grid"], opt["summary"], show_costs=False))
+    story.append(Spacer(1, 34))
+
+
+def _template2_signature(story, ss, h, company):
+    story.append(Paragraph("Yours sincerely,", ss["T2Body"]))
+    story.append(Spacer(1, 22))
+    if h.get("sales"):
+        story.append(Paragraph(_rt(h.get("sales")), ss["T2Body"]))
+    story.append(Paragraph(_rt(company.get("name") or ""), ss["T2Body"]))
+
+
 def generate_options_pdf(out_path, header: dict, options: list,
                          notes: dict | None = None, company: dict | None = None,
-                         show_costs: bool = False) -> str:
+                         show_costs: bool = False, template: str = "template1") -> str:
     """Render one quotation document. `options` is a list of
     {'label', 'grid', 'summary'} - each becomes its own section (table + totals).
     A single option renders as a normal quotation."""
     global BRAND, BRAND_LIGHT
-    company = company or {"name": "SmartWay Systems",
+    company = company or {"name": "Company Name",
                           "tagline": "Smart &amp; Low-Current Systems",
-                          "contact": "Riyadh, Kingdom of Saudi Arabia"}
+                          "contact": "Riyadh, Kingdom of Saudi Arabia",
+                          "header_left": "{company}",
+                          "header_middle": "",
+                          "header_right": "{offer}",
+                          "footer_left": "{company} - {project}",
+                          "footer_middle": "",
+                          "footer_right": "Page {page}"}
     _bc = company.get("color") or "#002060"          # per-company brand colour
     BRAND = colors.HexColor(_bc)
     BRAND_LIGHT = _tint(_bc, 0.90)
     ss = _styles()
+    template_key = str(template or "template1").strip().lower().replace(" ", "")
+    is_template2 = template_key in {"2", "template2", "template-2"}
+    if is_template2:
+        _template2_styles(ss)
     notes = notes or {}
     options = options or []
     page_w, page_h = A4
 
     # Full-bleed brand banner: spans the whole paper width, flush to the top edge.
-    banner = db.banner_path()
+    # If no banner is present, the three-section PDF header is drawn instead.
+    banner = _db_asset_path("banner_path", "header_banner.png")
     if os.path.exists(banner):
         iw, ih = ImageReader(banner).getSize()
         banner_h = page_w * ih / iw
     else:
         banner_h = 0
-    top_margin = (banner_h + 5 * mm) if banner_h else 12 * mm
+    section_header_h = 22 * mm
+    header_image_paths = [
+        _db_asset_path("header_left_path", "header_left.png"),
+        _db_asset_path("header_middle_path", "header_middle.png"),
+        _db_asset_path("header_right_path", "header_right.png"),
+    ]
+    header_text_templates = [
+        company.get("header_left", ""),
+        company.get("header_middle", ""),
+        company.get("header_right", ""),
+    ]
+    has_section_header = (not banner_h) and (
+        any(os.path.exists(path) for path in header_image_paths) or
+        any(str(text or "").strip() for text in header_text_templates)
+    )
+    top_margin = (banner_h + 5 * mm) if banner_h else (
+        (section_header_h + 5 * mm) if has_section_header else 12 * mm
+    )
+
+    full_footer = _db_asset_path("footer_full_path", "footer_full.png")
+    if os.path.exists(full_footer):
+        fiw, fih = ImageReader(full_footer).getSize()
+        footer_h = page_w * fih / fiw
+    else:
+        footer_h = 22 * mm
+    bottom_margin = max(13 * mm, footer_h + 7 * mm)
 
     doc = SimpleDocTemplate(out_path, pagesize=A4,
                             leftMargin=17 * mm, rightMargin=17 * mm,
-                            topMargin=top_margin, bottomMargin=13 * mm,
+                            topMargin=top_margin, bottomMargin=bottom_margin,
                             title=f"Quotation {header.get('offer','')}")
     story = []
-    _header(story, ss, header, company)
-    multi = len(options) > 1
-    for i, opt in enumerate(options):
-        if i > 0:
+    if is_template2:
+        _template2_intro(story, ss, header, notes, company)
+        multi = len(options) > 1
+        for i, opt in enumerate(options):
             story.append(PageBreak())
-        if multi:
             label = opt.get("label") or f"Option {i + 1}"
-            story.append(Paragraph(f"Option {i + 1}: {_rt(label)}", ss["DocTitle2"]))
-            story.append(Spacer(1, 2))
-            story.append(HRFlowable(width="100%", thickness=1.5, color=ACCENT))
-            story.append(Spacer(1, 5))
-        story.append(_items_table(ss, opt["grid"], show_costs))
-        story.append(Spacer(1, 6))
-        story.append(_totals(ss, opt["summary"]))
-        story.append(Spacer(1, 7))
-    for f in _notes(ss, notes):
-        story.append(f)
-    story.append(Spacer(1, 4))
-    story.append(Paragraph("Yours sincerely,", ss["Note"]))
-    story.append(Paragraph(f"<b>{_rt(company['name'])}</b>", ss["NoteH"]))
+            _template2_boq_section(story, ss, opt, label if multi else "")
+            if i == len(options) - 1:
+                _template2_signature(story, ss, header, company)
+    else:
+        _header(story, ss, header, company)
+        multi = len(options) > 1
+        for i, opt in enumerate(options):
+            if i > 0:
+                story.append(PageBreak())
+            if multi:
+                label = opt.get("label") or f"Option {i + 1}"
+                story.append(Paragraph(f"Option {i + 1}: {_rt(label)}", ss["DocTitle2"]))
+                story.append(Spacer(1, 2))
+                story.append(HRFlowable(width="100%", thickness=1.5, color=ACCENT))
+                story.append(Spacer(1, 5))
+            story.append(_items_table(ss, opt["grid"], show_costs))
+            story.append(Spacer(1, 6))
+            story.append(_totals(ss, opt["summary"]))
+            story.append(Spacer(1, 7))
+        for f in _notes(ss, notes):
+            story.append(f)
+        story.append(Spacer(1, 4))
+        story.append(Paragraph("Yours sincerely,", ss["Note"]))
+        story.append(Paragraph(f"<b>{_rt(company['name'])}</b>", ss["NoteH"]))
 
     def _decorate(canvas, d):
+        canvas.saveState()
         if banner_h:
             canvas.drawImage(banner, 0, page_h - banner_h, width=page_w, height=banner_h,
-                             preserveAspectRatio=False, mask='auto')
-        canvas.saveState()
-        canvas.setStrokeColor(LINE)
-        canvas.line(17 * mm, 12 * mm, 193 * mm, 12 * mm)
-        canvas.setFont("Helvetica", 7)
-        canvas.setFillColor(GREY)
-        canvas.drawString(17 * mm, 8 * mm, f"{company['name']} - {header.get('project','')}")
-        canvas.drawRightString(193 * mm, 8 * mm, f"Page {d.page}")
+                             preserveAspectRatio=False, mask="auto")
+        elif has_section_header:
+            left_x = 17 * mm
+            right_x = 193 * mm
+            bottom_y = page_h - section_header_h
+            canvas.setStrokeColor(LINE)
+            canvas.line(left_x, bottom_y, right_x, bottom_y)
+            col_gap = 5 * mm
+            col_w = (right_x - left_x - 2 * col_gap) / 3
+            cols = [
+                (left_x, "left", _db_asset_path("header_left_path", "header_left.png"), company.get("header_left", "")),
+                (left_x + col_w + col_gap, "center", _db_asset_path("header_middle_path", "header_middle.png"), company.get("header_middle", "")),
+                (left_x + 2 * (col_w + col_gap), "right", _db_asset_path("header_right_path", "header_right.png"), company.get("header_right", "")),
+            ]
+            align_map = {"left": TA_LEFT, "center": TA_CENTER, "right": TA_RIGHT}
+            for x, align, image_path, text_template in cols:
+                has_image = os.path.exists(image_path)
+                text = _slot_text(text_template, company, header, d.page)
+                if has_image:
+                    _draw_fit_image(canvas, image_path, x, page_h - 13 * mm, col_w, 8 * mm, align=align)
+                if text:
+                    style = ParagraphStyle(
+                        f"header_{align}",
+                        fontName="Helvetica",
+                        fontSize=8,
+                        leading=9,
+                        textColor=BRAND,
+                        alignment=align_map[align],
+                    )
+                    p = Paragraph(_rt(text), style)
+                    _, used_h = p.wrap(col_w, 10 * mm)
+                    p.drawOn(canvas, x, bottom_y + 5 * mm + max(0, (8 * mm - used_h) / 2))
+
+        if os.path.exists(full_footer):
+            canvas.drawImage(full_footer, 0, 0, width=page_w, height=footer_h,
+                             preserveAspectRatio=False, mask="auto")
+        else:
+            left_x = 17 * mm
+            right_x = 193 * mm
+            top_y = 24 * mm
+            canvas.setStrokeColor(LINE)
+            canvas.line(left_x, top_y, right_x, top_y)
+            col_gap = 5 * mm
+            col_w = (right_x - left_x - 2 * col_gap) / 3
+            cols = [
+                (left_x, "left", _db_asset_path("footer_left_path", "footer_left.png"), company.get("footer_left", "")),
+                (left_x + col_w + col_gap, "center", _db_asset_path("footer_middle_path", "footer_middle.png"), company.get("footer_middle", "")),
+                (left_x + 2 * (col_w + col_gap), "right", _db_asset_path("footer_right_path", "footer_right.png"), company.get("footer_right", "")),
+            ]
+            align_map = {"left": TA_LEFT, "center": TA_CENTER, "right": TA_RIGHT}
+            for x, align, image_path, text_template in cols:
+                has_image = os.path.exists(image_path)
+                text = _slot_text(text_template, company, header, d.page)
+                if has_image:
+                    _draw_fit_image(canvas, image_path, x, 13 * mm, col_w, 8 * mm, align=align)
+                if text:
+                    style = ParagraphStyle(
+                        f"footer_{align}",
+                        fontName="Helvetica",
+                        fontSize=7,
+                        leading=8,
+                        textColor=GREY,
+                        alignment=align_map[align],
+                    )
+                    p = Paragraph(_rt(text), style)
+                    _, used_h = p.wrap(col_w, 10 * mm)
+                    p.drawOn(canvas, x, 5 * mm + max(0, (8 * mm - used_h) / 2))
         canvas.restoreState()
 
     doc.build(story, onFirstPage=_decorate, onLaterPages=_decorate)
@@ -328,11 +742,12 @@ def generate_options_pdf(out_path, header: dict, options: list,
 
 def generate_quotation_pdf(out_path, header: dict, grid: pd.DataFrame, summary: dict,
                            notes: dict | None = None, company: dict | None = None,
-                           show_costs: bool = False) -> str:
+                           show_costs: bool = False, template: str = "template1") -> str:
     """Single-option quotation (delegates to generate_options_pdf)."""
     return generate_options_pdf(out_path, header,
                                 [{"label": "", "grid": grid, "summary": summary}],
-                                notes=notes, company=company, show_costs=show_costs)
+                                notes=notes, company=company, show_costs=show_costs,
+                                template=template)
 
 
 if __name__ == "__main__":

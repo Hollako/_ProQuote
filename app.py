@@ -1,4 +1,4 @@
-﻿"""
+"""
 ProQuote - Streamlit interface.
 
 Run:  streamlit run app.py   (from the _ProQuote folder)
@@ -12,6 +12,8 @@ from __future__ import annotations
 import os
 import io
 import html
+import importlib
+import inspect
 import datetime as dt
 
 import pandas as pd
@@ -24,11 +26,12 @@ import auth
 import db
 import db_backup
 import ingest
+import runtime_env
 import updater
 from version import APP_VERSION
 
 _LOGO = db.banner_path()                       # per-company banner (follows BOQ_DATA_DIR)
-_COMPANY = repo.get_setting("company_name") or "SmartWay Systems"
+_COMPANY = repo.get_setting("company_name") or "Company Name"
 st.set_page_config(page_title=f"ProQuote - {_COMPANY}", layout="wide",
                    initial_sidebar_state="expanded")
 
@@ -537,6 +540,11 @@ def project_sheet_info_form(store: dict, kp: str):
 
 
 def _make_pdf_download(h, grid, summary, options=None):
+    global db, pdf_export
+    if "header_left_path" not in dir(db):
+        db = importlib.reload(db)
+    if "template" not in inspect.signature(pdf_export.generate_quotation_pdf).parameters:
+        pdf_export = importlib.reload(pdf_export)
     notes = {
         "System": h.get("system_note"), "Scope": h.get("scope"),
         "Exclusions": h.get("exclusions"), "Pre-requirements": h.get("prerequisites"),
@@ -550,18 +558,27 @@ def _make_pdf_download(h, grid, summary, options=None):
               "offer": h.get("offer"), "date": h.get("date"),
               "greeting": h.get("greeting") or DEFAULT_TERMS["greeting"]}
     company = {
-        "name": repo.get_setting("company_name") or "SmartWay Systems",
+        "name": repo.get_setting("company_name") or "Company Name",
         "tagline": repo.get_setting("company_tagline") or "",
         "contact": repo.get_setting("company_contact") or "",
         "color": repo.get_setting("company_brand_color") or "#002060",
+        "header_left": repo.get_setting("header_left_text") or "",
+        "header_middle": repo.get_setting("header_middle_text") or "",
+        "header_right": repo.get_setting("header_right_text") or "",
+        "footer_left": repo.get_setting("footer_left_text") or "",
+        "footer_middle": repo.get_setting("footer_middle_text") or "",
+        "footer_right": repo.get_setting("footer_right_text") or "",
     }
+    pdf_body_template = repo.get_setting("pdf_body_template") or "template1"
     tmp = os.path.join(db.DATA_DIR, "_last_quotation.pdf")
     if options:                       # one document, a section per option
         pdf_export.generate_options_pdf(tmp, header, options, notes=notes,
-                                        company=company, show_costs=False)
+                                        company=company, show_costs=False,
+                                        template=pdf_body_template)
     else:
         pdf_export.generate_quotation_pdf(tmp, header, grid, summary, notes=notes,
-                                          company=company, show_costs=False)
+                                          company=company, show_costs=False,
+                                          template=pdf_body_template)
     with open(tmp, "rb") as f:
         st.session_state.pdf_bytes = f.read()
     n = len(options) if options else 1
@@ -617,7 +634,7 @@ def _project_sheet_bytes(h: dict, s: dict) -> bytes:
         banner.height = 77
         ws.add_image(banner, "A1")
     else:
-        ws["A1"] = repo.get_setting("company_name") or "SmartWay Systems"
+        ws["A1"] = repo.get_setting("company_name") or "Company Name"
         ws["A1"].font = Font(name="Calibri", size=18, bold=True, color="FFFFFF")
         ws["A1"].alignment = Alignment(horizontal="center", vertical="center")
 
@@ -1384,6 +1401,7 @@ if st.session_state.get("workspace_mode") not in _allowed:
     st.session_state["workspace_mode"] = _allowed[0]
 mode = st.sidebar.radio("Workspace", _allowed, key="workspace_mode")
 admin = can("view_costs")          # on-screen internal cost metrics (client PDF never shows costs)
+owner = ROLE == auth.PROTECTED_ROLE
 
 # Refresh per-currency -> USD rates from Settings (EUR configurable; SAR pegged).
 try:
@@ -2183,6 +2201,43 @@ elif mode == "Settings":
         company_contact = st.text_input("Contact line (city / country)",
                                         repo.get_setting("company_contact") or "")
 
+        st.markdown("**PDF body template**")
+        pdf_body_options = {
+            "Template 1 - current ProQuote layout": "template1",
+            "Template 2 - proposal page + BOQ table": "template2",
+        }
+        current_pdf_body_template = repo.get_setting("pdf_body_template") or "template1"
+        current_pdf_body_label = next(
+            (label for label, value in pdf_body_options.items() if value == current_pdf_body_template),
+            list(pdf_body_options)[0],
+        )
+        pdf_body_template_label = st.selectbox(
+            "Client PDF body",
+            list(pdf_body_options.keys()),
+            index=list(pdf_body_options.keys()).index(current_pdf_body_label),
+            help="Template 1 keeps the current PDF body. Template 2 follows the attached proposal/BOQ body style.",
+        )
+
+        st.markdown("**PDF header text**")
+        st.caption("Used when no full-width banner is uploaded. Optional placeholders: `{company}`, `{project}`, `{offer}`, `{page}`.")
+        htxt1, htxt2, htxt3 = st.columns(3)
+        header_left_text = htxt1.text_area("Left header", repo.get_setting("header_left_text") or "",
+                                           height=90)
+        header_middle_text = htxt2.text_area("Middle header", repo.get_setting("header_middle_text") or "",
+                                             height=90)
+        header_right_text = htxt3.text_area("Right header", repo.get_setting("header_right_text") or "",
+                                            height=90)
+
+        st.markdown("**PDF footer text**")
+        st.caption("Optional placeholders: `{company}`, `{project}`, `{offer}`, `{page}`.")
+        ftxt1, ftxt2, ftxt3 = st.columns(3)
+        footer_left_text = ftxt1.text_area("Left footer", repo.get_setting("footer_left_text") or "",
+                                           height=90)
+        footer_middle_text = ftxt2.text_area("Middle footer", repo.get_setting("footer_middle_text") or "",
+                                             height=90)
+        footer_right_text = ftxt3.text_area("Right footer", repo.get_setting("footer_right_text") or "",
+                                            height=90)
+
         saved = st.form_submit_button("💾 Save settings", type="primary")
         if saved:
             repo.set_setting("offer_template", template.strip())
@@ -2193,10 +2248,17 @@ elif mode == "Settings":
             repo.set_setting("revision_separator", sep_opts[rev_sep_lbl])
             repo.set_setting("eur_to_usd", float(eur_rate))
             repo.set_setting("vat_percent", float(vat_pct))
-            repo.set_setting("company_name", company_name.strip() or "Company")
+            repo.set_setting("company_name", company_name.strip() or "Company Name")
             repo.set_setting("company_tagline", company_tagline.strip())
             repo.set_setting("company_contact", company_contact.strip())
             repo.set_setting("company_brand_color", brand_color)
+            repo.set_setting("pdf_body_template", pdf_body_options[pdf_body_template_label])
+            repo.set_setting("header_left_text", header_left_text.strip())
+            repo.set_setting("header_middle_text", header_middle_text.strip())
+            repo.set_setting("header_right_text", header_right_text.strip())
+            repo.set_setting("footer_left_text", footer_left_text.strip())
+            repo.set_setting("footer_middle_text", footer_middle_text.strip())
+            repo.set_setting("footer_right_text", footer_right_text.strip())
             st.success("Settings saved. (Page title updates on next reload.)")
 
     # ---- Branding images (per company; outside the form for file upload) ----
@@ -2210,10 +2272,15 @@ elif mode == "Settings":
         else:
             st.info("No banner yet.")
         up_b = st.file_uploader("Upload / replace banner (PNG)", type=["png"], key="banner_up")
-        if up_b is not None and st.button("💾 Save banner", key="save_banner"):
+        bb1, bb2 = st.columns(2)
+        if up_b is not None and bb1.button("Save banner", key="save_banner"):
             with open(db.banner_path(), "wb") as f:
                 f.write(up_b.getbuffer())
             st.success("Banner updated. (Reload to see it in the header/sidebar.)")
+            st.rerun()
+        if os.path.exists(db.banner_path()) and bb2.button("Remove banner", key="remove_banner"):
+            os.remove(db.banner_path())
+            st.success("Banner removed. PDF header sections will be used if configured.")
             st.rerun()
     with lcol:
         st.markdown("**Logo** - standalone mark")
@@ -2227,7 +2294,85 @@ elif mode == "Settings":
                 f.write(up_l.getbuffer())
             st.success("Logo updated.")
             st.rerun()
-    st.caption("Banner ≈ 1400x155 px. Logo: a square / transparent PNG works best.")
+    st.caption("Banner: wide and shallow PNG, about 1400x155 px. Logo: square transparent PNG works best.")
+
+    st.divider()
+    st.markdown("##### PDF header images")
+    st.caption("The banner is the full-width PDF header. If no banner is uploaded, the left/middle/right header images and text are used. Section images work best as wide, shallow PNGs with transparent or white backgrounds.")
+    if os.path.exists(db.banner_path()):
+        st.info("A banner is currently uploaded, so header section images and text are saved but not used in the PDF until the banner is removed.")
+    head_specs = [
+        ("Left", db.header_left_path(), "header_left_up", "save_header_left", "remove_header_left"),
+        ("Middle", db.header_middle_path(), "header_middle_up", "save_header_middle", "remove_header_middle"),
+        ("Right", db.header_right_path(), "header_right_up", "save_header_right", "remove_header_right"),
+    ]
+    head_cols = st.columns(3)
+    for col, (label, path, upload_key, save_key, remove_key) in zip(head_cols, head_specs):
+        with col:
+            st.markdown(f"**{label} section image**")
+            if os.path.exists(path):
+                st.image(path, use_container_width=True)
+            else:
+                st.info("No image yet.")
+            up = st.file_uploader(f"Upload / replace {label.lower()} image (PNG)", type=["png"], key=upload_key)
+            if up is not None and st.button(f"Save {label.lower()} image", key=save_key):
+                with open(path, "wb") as f:
+                    f.write(up.getbuffer())
+                st.success(f"{label} header image updated.")
+                st.rerun()
+            if os.path.exists(path) and st.button(f"Remove {label.lower()} image", key=remove_key):
+                os.remove(path)
+                st.success(f"{label} header image removed.")
+                st.rerun()
+
+
+    st.divider()
+    st.markdown("##### PDF footer images")
+    st.caption("A full-width footer image overrides the three-section footer. If no full footer image is uploaded, the left/middle/right images and text are used. Keep footer images wide and shallow so they do not crowd quotation content.")
+    full_col, preview_col = st.columns([2, 1])
+    with full_col:
+        st.markdown("**Full footer image** - full-width footer section")
+        if os.path.exists(db.footer_full_path()):
+            st.image(db.footer_full_path(), use_container_width=True)
+        else:
+            st.info("No full footer image yet.")
+        up_footer_full = st.file_uploader("Upload / replace full footer (PNG)", type=["png"], key="footer_full_up")
+        ffu1, ffu2 = st.columns(2)
+        if up_footer_full is not None and ffu1.button("Save full footer", key="save_footer_full"):
+            with open(db.footer_full_path(), "wb") as f:
+                f.write(up_footer_full.getbuffer())
+            st.success("Full footer image updated.")
+            st.rerun()
+        if os.path.exists(db.footer_full_path()) and ffu2.button("Remove full footer", key="remove_footer_full"):
+            os.remove(db.footer_full_path())
+            st.success("Full footer image removed.")
+            st.rerun()
+    with preview_col:
+        st.info("Suggested full footer ratio: wide and shallow, similar to the header banner.")
+
+    foot_specs = [
+        ("Left", db.footer_left_path(), "footer_left_up", "save_footer_left", "remove_footer_left"),
+        ("Middle", db.footer_middle_path(), "footer_middle_up", "save_footer_middle", "remove_footer_middle"),
+        ("Right", db.footer_right_path(), "footer_right_up", "save_footer_right", "remove_footer_right"),
+    ]
+    foot_cols = st.columns(3)
+    for col, (label, path, upload_key, save_key, remove_key) in zip(foot_cols, foot_specs):
+        with col:
+            st.markdown(f"**{label} section image**")
+            if os.path.exists(path):
+                st.image(path, use_container_width=True)
+            else:
+                st.info("No image yet.")
+            up = st.file_uploader(f"Upload / replace {label.lower()} image (PNG)", type=["png"], key=upload_key)
+            if up is not None and st.button(f"Save {label.lower()} image", key=save_key):
+                with open(path, "wb") as f:
+                    f.write(up.getbuffer())
+                st.success(f"{label} footer image updated.")
+                st.rerun()
+            if os.path.exists(path) and st.button(f"Remove {label.lower()} image", key=remove_key):
+                os.remove(path)
+                st.success(f"{label} footer image removed.")
+                st.rerun()
 
 
     st.divider()
@@ -2235,6 +2380,9 @@ elif mode == "Settings":
     gh_owner = repo.get_setting("github_owner") or "Hollako"
     gh_repo = repo.get_setting("github_repo") or "_ProQuote"
     st.metric("Installed version", APP_VERSION)
+    git_update_ok, git_update_message = runtime_env.git_update_available(db.APP_DIR)
+    if git_update_message:
+        st.caption(git_update_message)
 
     if st.button("Check for updates", use_container_width=True):
         try:
@@ -2252,18 +2400,25 @@ elif mode == "Settings":
             st.warning(f"New {rel.source} available: **{rel.tag}** ({rel.name})")
             if rel.url:
                 st.link_button("Open GitHub page", rel.url, use_container_width=True)
-            if st.button("Update this instance", type="primary", use_container_width=True):
-                ok, output = updater.run_git_update(db.APP_DIR)
-                if ok:
-                    st.success("Update downloaded. Restart this Streamlit instance to load the new code.")
-                else:
-                    st.error("Update failed. Details below.")
-                st.code(output or "No output", language="text")
+            if git_update_ok:
+                if st.button("Update this instance", type="primary", use_container_width=True):
+                    ok, output = updater.run_git_update(db.APP_DIR)
+                    if ok:
+                        st.success("Update downloaded. Restart this Streamlit instance to load the new code.")
+                    else:
+                        st.error("Update failed. Details below.")
+                    st.code(output or "No output", language="text")
+            else:
+                st.info(git_update_message or "Use your deployment platform or a newer installer to update this instance.")
         else:
             st.success(f"You are up to date. Latest {rel.source}: {rel.tag or rel.name}")
 
     st.divider()
     st.markdown("##### Import Excel workbooks")
+    if runtime_env.is_streamlit_cloud():
+        st.info("Folder import only works for folders visible to the server. On cloud, restore a database backup or use a future ZIP import flow.")
+    else:
+        st.caption("A safety backup is created automatically before importing.")
     if "import_folder_path" not in st.session_state:
         st.session_state.import_folder_path = repo.get_setting("last_import_folder") or ""
 
@@ -2289,6 +2444,8 @@ elif mode == "Settings":
             st.error("Folder not found. Check the path and try again.")
         else:
             repo.set_setting("last_import_folder", import_root)
+            safety_backup = db_backup.create_backup("before-import")
+            st.info(f"Safety backup created before import: {os.path.basename(safety_backup)}")
             progress = st.progress(0, text="Scanning Excel workbooks...")
 
             def _import_progress(done, total, path):
@@ -2317,64 +2474,134 @@ elif mode == "Settings":
             except Exception as exc:
                 progress.empty()
                 st.error(f"Import failed: {exc}")
+
     st.divider()
-    st.markdown("##### Backup and restore database")
-    st.caption("Backups include this company profile database only. Branding images are not included.")
+    st.markdown("##### Backup and restore")
+    st.caption("Database backups are small `.db` files. Full profile backups are `.zip` files that include the database and branding images from `assets/`.")
 
-    b1, b2, b3 = st.columns([1, 1, 2])
-    if b1.button("Create backup", use_container_width=True):
-        try:
-            backup_path = db_backup.create_backup("manual")
-            st.session_state.latest_db_backup = backup_path
-            st.success(f"Backup created: {os.path.basename(backup_path)}")
-        except Exception as exc:
-            st.error(f"Backup failed: {exc}")
-
-    latest_backup = st.session_state.get("latest_db_backup")
-    if latest_backup and os.path.exists(latest_backup):
-        with open(latest_backup, "rb") as f:
-            b2.download_button(
-                "Download backup",
-                data=f.read(),
-                file_name=os.path.basename(latest_backup),
-                mime="application/octet-stream",
-                use_container_width=True,
-            )
+    if not owner:
+        st.info("Only the owner role can create, download, or restore database backups.")
     else:
-        b2.button("Download backup", disabled=True, use_container_width=True)
+        b1, b2, b3 = st.columns([1, 1, 2])
+        if b1.button("Create backup", use_container_width=True):
+            try:
+                backup_path = db_backup.create_backup("manual")
+                st.session_state.latest_db_backup = backup_path
+                st.success(f"Backup created: {os.path.basename(backup_path)}")
+            except Exception as exc:
+                st.error(f"Backup failed: {exc}")
 
-    backups = db_backup.list_backups(limit=5)
-    if backups:
-        names = [f"{b['name']} ({b['size'] / 1024 / 1024:.1f} MB)" for b in backups]
-        pick = b3.selectbox("Recent backups", names, label_visibility="collapsed")
-        picked_backup = backups[names.index(pick)]
-        with open(picked_backup["path"], "rb") as f:
-            b3.download_button(
-                "Download selected recent backup",
-                data=f.read(),
-                file_name=picked_backup["name"],
-                mime="application/octet-stream",
-                use_container_width=True,
-            )
-    else:
-        b3.info("No local backups yet.")
+        latest_backup = st.session_state.get("latest_db_backup")
+        if latest_backup and os.path.exists(latest_backup):
+            with open(latest_backup, "rb") as f:
+                b2.download_button(
+                    "Download backup",
+                    data=f.read(),
+                    file_name=os.path.basename(latest_backup),
+                    mime="application/octet-stream",
+                    use_container_width=True,
+                )
+        else:
+            b2.button("Download backup", disabled=True, use_container_width=True)
 
-    restore_file = st.file_uploader("Restore database from backup (.db)", type=["db"], key="restore_db_upload")
-    restore_ok = st.checkbox(
-        "I understand restore replaces the current database. A safety backup will be created first.",
-        key="restore_db_confirm",
-    )
-    if st.button("Restore database", type="primary", disabled=not (restore_file and restore_ok), use_container_width=True):
-        try:
-            restored_path, safety_backup = db_backup.restore_from_bytes(restore_file.getvalue())
-            st.success("Database restored. The app will reload now.")
-            if safety_backup:
-                st.info(f"Safety backup created: {os.path.basename(safety_backup)}")
-            st.cache_data.clear()
-            st.cache_resource.clear()
-            st.rerun()
-        except Exception as exc:
-            st.error(f"Restore failed: {exc}")
+        backups = db_backup.list_backups(limit=5)
+        if backups:
+            names = [f"{b['name']} ({b['size'] / 1024 / 1024:.1f} MB)" for b in backups]
+            pick = b3.selectbox("Recent backups", names, label_visibility="collapsed")
+            picked_backup = backups[names.index(pick)]
+            with open(picked_backup["path"], "rb") as f:
+                b3.download_button(
+                    "Download selected recent backup",
+                    data=f.read(),
+                    file_name=picked_backup["name"],
+                    mime="application/octet-stream",
+                    use_container_width=True,
+                )
+        else:
+            b3.info("No local backups yet.")
+
+        restore_file = st.file_uploader("Restore database from backup (.db)", type=["db"], key="restore_db_upload")
+        restore_ok = st.checkbox(
+            "I understand restore replaces the current database. A safety backup will be created first.",
+            key="restore_db_confirm",
+        )
+        if st.button("Restore database", type="primary", disabled=not (restore_file and restore_ok), use_container_width=True):
+            try:
+                restored_path, safety_backup = db_backup.restore_from_bytes(restore_file.getvalue())
+                st.success("Database restored. The app will reload now.")
+                if safety_backup:
+                    st.info(f"Safety backup created: {os.path.basename(safety_backup)}")
+                st.cache_data.clear()
+                st.cache_resource.clear()
+                st.rerun()
+            except Exception as exc:
+                st.error(f"Restore failed: {exc}")
+
+        st.markdown("**Full profile backup (database + branding images)**")
+        p1, p2, p3 = st.columns([1, 1, 2])
+        if p1.button("Create full backup", use_container_width=True):
+            try:
+                backup_path = db_backup.create_profile_backup("manual")
+                st.session_state.latest_profile_backup = backup_path
+                st.success(f"Full backup created: {os.path.basename(backup_path)}")
+            except Exception as exc:
+                st.error(f"Full backup failed: {exc}")
+
+        latest_profile_backup = st.session_state.get("latest_profile_backup")
+        if latest_profile_backup and os.path.exists(latest_profile_backup):
+            with open(latest_profile_backup, "rb") as f:
+                p2.download_button(
+                    "Download full backup",
+                    data=f.read(),
+                    file_name=os.path.basename(latest_profile_backup),
+                    mime="application/zip",
+                    use_container_width=True,
+                )
+        else:
+            p2.button("Download full backup", disabled=True, use_container_width=True)
+
+        profile_backups = db_backup.list_profile_backups(limit=5)
+        if profile_backups:
+            profile_names = [f"{b['name']} ({b['size'] / 1024 / 1024:.1f} MB)" for b in profile_backups]
+            profile_pick = p3.selectbox("Recent full backups", profile_names, label_visibility="collapsed")
+            picked_profile_backup = profile_backups[profile_names.index(profile_pick)]
+            with open(picked_profile_backup["path"], "rb") as f:
+                p3.download_button(
+                    "Download selected full backup",
+                    data=f.read(),
+                    file_name=picked_profile_backup["name"],
+                    mime="application/zip",
+                    use_container_width=True,
+                )
+        else:
+            p3.info("No local full backups yet.")
+
+        profile_restore_file = st.file_uploader(
+            "Restore full profile backup (.zip)",
+            type=["zip"],
+            key="restore_profile_upload",
+        )
+        profile_restore_ok = st.checkbox(
+            "I understand full restore replaces the current database and branding images. A full safety backup will be created first.",
+            key="restore_profile_confirm",
+        )
+        if st.button(
+            "Restore full profile",
+            type="primary",
+            disabled=not (profile_restore_file and profile_restore_ok),
+            use_container_width=True,
+        ):
+            try:
+                restored_path, safety_backup = db_backup.restore_profile_from_bytes(profile_restore_file.getvalue())
+                st.success("Full profile restored. The app will reload now.")
+                if safety_backup:
+                    st.info(f"Full safety backup created: {os.path.basename(safety_backup)}")
+                st.cache_data.clear()
+                st.cache_resource.clear()
+                st.rerun()
+            except Exception as exc:
+                st.error(f"Full restore failed: {exc}")
+
     st.divider()
     st.markdown("##### Offer-number preview")
     st.caption("Numbering is **per series** - each rendered template (type + year) keeps its own "
