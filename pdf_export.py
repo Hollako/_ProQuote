@@ -21,6 +21,7 @@ from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.enums import TA_RIGHT, TA_LEFT, TA_CENTER
 from reportlab.platypus import (
     SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer, HRFlowable, Image, PageBreak,
+    LongTable,
 )
 
 import calc
@@ -127,6 +128,10 @@ def _slot_text(template: str, company: dict, header: dict, page: int) -> str:
         "project": header.get("project") or "",
         "offer": header.get("offer") or "",
         "page": page,
+        "vat": company.get("vat_number") or "",
+        "vat_number": company.get("vat_number") or "",
+        "cr": company.get("cr_number") or "",
+        "cr_number": company.get("cr_number") or "",
     }
     try:
         return str(template or "").format(**values)
@@ -748,6 +753,121 @@ def generate_quotation_pdf(out_path, header: dict, grid: pd.DataFrame, summary: 
                                 [{"label": "", "grid": grid, "summary": summary}],
                                 notes=notes, company=company, show_costs=show_costs,
                                 template=template)
+
+
+# ============================ REPORTS PDF ============================
+
+def _fmt_cell(col, val):
+    if isinstance(val, bool):
+        return "Yes" if val else "No"
+    if isinstance(val, (int, float)):
+        return f"{val:.1f}" if "%" in str(col) else f"{val:,.0f}"
+    return str(val if val is not None else "")
+
+
+def _report_table(ss, df, totals):
+    cols = list(df.columns)
+    numeric = {c for c in cols if pd.api.types.is_numeric_dtype(df[c])}
+    head = ParagraphStyle("rh", parent=ss["Cell"], textColor=colors.white,
+                          fontName="Helvetica-Bold", fontSize=7.5, leading=9)
+    cell = ParagraphStyle("rc", parent=ss["Cell"], fontSize=7.5, leading=9)
+    cellR = ParagraphStyle("rcr", parent=ss["CellR"], fontSize=7.5, leading=9)
+    data = [[Paragraph(_rt(c), head) for c in cols]]
+    for _, row in df.iterrows():
+        data.append([Paragraph(_rt(_fmt_cell(c, row[c])), cellR if c in numeric else cell)
+                     for c in cols])
+    if totals:
+        tcell = ParagraphStyle("tt", parent=cell, textColor=colors.white, fontName="Helvetica-Bold")
+        tcellR = ParagraphStyle("ttr", parent=cellR, textColor=colors.white, fontName="Helvetica-Bold")
+        trow = []
+        for i, c in enumerate(cols):
+            if i == 0:
+                trow.append(Paragraph("TOTAL", tcell))
+            elif c in totals:
+                trow.append(Paragraph(f"{totals[c]:,.0f}", tcellR))
+            else:
+                trow.append("")
+        data.append(trow)
+    n = len(cols)
+    avail = 182 * mm
+    t = LongTable(data, colWidths=[avail / n] * n, repeatRows=1)
+    style = [
+        ("BACKGROUND", (0, 0), (-1, 0), BRAND),
+        ("ROWBACKGROUNDS", (0, 1), (-1, -2 if totals else -1),
+         [colors.white, colors.HexColor("#F4F7FB")]),
+        ("LINEBELOW", (0, 0), (-1, -1), 0.25, LINE),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("TOPPADDING", (0, 0), (-1, -1), 2), ("BOTTOMPADDING", (0, 0), (-1, -1), 2),
+        ("LEFTPADDING", (0, 0), (-1, -1), 3), ("RIGHTPADDING", (0, 0), (-1, -1), 3),
+    ]
+    if totals:
+        style.append(("BACKGROUND", (0, -1), (-1, -1), BRAND))
+    t.setStyle(TableStyle(style))
+    return t
+
+
+def _report_decorate(canvas, d, banner, banner_h, company, title):
+    page_w, page_h = A4
+    canvas.saveState()
+    if banner_h:
+        canvas.drawImage(banner, 0, page_h - banner_h, width=page_w, height=banner_h,
+                         preserveAspectRatio=False, mask="auto")
+    else:
+        canvas.setFillColor(BRAND)
+        canvas.rect(0, page_h - 16 * mm, page_w, 16 * mm, fill=1, stroke=0)
+        canvas.setFillColor(colors.white)
+        canvas.setFont("Helvetica-Bold", 13)
+        canvas.drawString(14 * mm, page_h - 11 * mm, company.get("name") or "")
+    canvas.setStrokeColor(LINE)
+    canvas.line(14 * mm, 12 * mm, 196 * mm, 12 * mm)
+    canvas.setFont("Helvetica", 7)
+    canvas.setFillColor(GREY)
+    canvas.drawString(14 * mm, 8 * mm, f"{company.get('name','')} — {title}")
+    canvas.drawRightString(196 * mm, 8 * mm, f"Page {d.page}")
+    canvas.restoreState()
+
+
+def generate_report_pdf(out_path, title: str, subtitle_lines, table_df=None, totals=None,
+                        company: dict | None = None, chart_paths=None) -> str:
+    """Branded internal report: title, filter summary, optional charts, and a (multi-page) table."""
+    global BRAND, BRAND_LIGHT
+    company = company or {"name": "Company"}
+    _bc = company.get("color") or "#002060"
+    BRAND = colors.HexColor(_bc)
+    BRAND_LIGHT = _tint(_bc, 0.90)
+    ss = _styles()
+    page_w, page_h = A4
+    banner = db.banner_path()
+    if os.path.exists(banner):
+        iw, ih = ImageReader(banner).getSize()
+        banner_h = page_w * ih / iw
+    else:
+        banner_h = 0
+    top_margin = (banner_h + 6 * mm) if banner_h else 20 * mm
+
+    doc = SimpleDocTemplate(out_path, pagesize=A4, leftMargin=14 * mm, rightMargin=14 * mm,
+                            topMargin=top_margin, bottomMargin=15 * mm, title=title)
+    story = [Paragraph(_rt(title), ss["DocTitle2"]), Spacer(1, 2),
+             HRFlowable(width="100%", thickness=2, color=ACCENT), Spacer(1, 6)]
+    for line in (subtitle_lines or []):
+        if line:
+            story.append(Paragraph(_rt(line), ss["Note"]))
+    if subtitle_lines:
+        story.append(Spacer(1, 8))
+    for cp in (chart_paths or []):
+        if cp and os.path.exists(cp):
+            iw, ih = ImageReader(cp).getSize()
+            w = 182 * mm
+            story.append(Image(cp, width=w, height=w * ih / iw))
+            story.append(Spacer(1, 10))
+    if table_df is not None and not table_df.empty:
+        story.append(_report_table(ss, table_df, totals))
+
+    def _dec(canvas, d):
+        _report_decorate(canvas, d, banner, banner_h, company, title)
+
+    doc.build(story, onFirstPage=_dec, onLaterPages=_dec)
+    return out_path
 
 
 if __name__ == "__main__":

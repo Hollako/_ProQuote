@@ -26,6 +26,7 @@ import auth
 import db
 import db_backup
 import ingest
+import reports
 import runtime_env
 import updater
 from version import APP_VERSION
@@ -50,6 +51,39 @@ def _choose_local_folder(initial_dir: str = "") -> tuple[str, str]:
         return selected or "", ""
     except Exception as exc:
         return "", str(exc)
+
+
+def _run_excel_import(import_root: str):
+    """Safety-backup, ingest every workbook under import_root, and show the stats."""
+    safety_backup = db_backup.create_profile_backup("before-import")
+    st.info(f"Safety backup created before import: {os.path.basename(safety_backup)}")
+    progress = st.progress(0, text="Scanning Excel workbooks...")
+
+    def _p(done, total, path):
+        if total:
+            progress.progress(min(done / total, 1.0),
+                              text=f"Importing {done}/{total}: {os.path.basename(path)}")
+    try:
+        with st.spinner("Importing Excel workbooks..."):
+            stats = ingest.ingest_folder(import_root, progress=_p)
+        progress.empty()
+        st.success("Import completed.")
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Workbooks found", stats.get("workbooks_found", 0))
+        m2.metric("Files ingested", stats.get("files", 0))
+        m3.metric("BOQ sheets", stats.get("sheets", 0))
+        m4.metric("Catalogue items", stats.get("catalogue_items", 0))
+        d1, d2, d3 = st.columns(3)
+        d1.metric("Offer lines", stats.get("lines", 0))
+        d2.metric("Spare items", stats.get("spares", 0))
+        d3.metric("Skipped", stats.get("skipped_no_boq", 0))
+        if stats.get("errors"):
+            with st.expander(f"Import warnings / errors ({len(stats['errors'])})"):
+                for name, err in stats["errors"][:30]:
+                    st.write(f"- {name}: {err}")
+    except Exception as exc:
+        progress.empty()
+        st.error(f"Import failed: {exc}")
 
 # Larger button text + icons; tracking status cells are compact and centered.
 st.markdown("""<style>
@@ -347,6 +381,22 @@ def _text(value, default: str = "") -> str:
     return text if text else default
 
 
+def _fmt_date(value, default: str = "-") -> str:
+    """Show a stored ISO date (YYYY-MM-DD...) as DD-MM-YYYY."""
+    s = _text(value)[:10]
+    parts = s.split("-")
+    if len(parts) == 3 and len(parts[0]) == 4:
+        return f"{parts[2]}-{parts[1]}-{parts[0]}"
+    return s or default
+
+
+def _ctr(col, text, header: bool = False):
+    """Write center-aligned text into a column (header = small grey caption style)."""
+    style = ("text-align:center;font-size:0.8rem;color:#808495" if header
+             else "text-align:center")
+    col.markdown(f"<div style='{style}'>{text}</div>", unsafe_allow_html=True)
+
+
 def render_editable_grid(state_key: str, editor_key: str):
     """Full editable grid (all columns) with live recompute + one auto-rerun on change."""
     grid = calc.recompute(st.session_state[state_key])
@@ -370,7 +420,7 @@ def render_editable_grid(state_key: str, editor_key: str):
     edited = st.data_editor(
         grid[BUILDER_COLS] if not grid.empty else grid,
         column_config=colcfg, disabled=[c for c in COMPUTED if c in BUILDER_COLS],
-        num_rows="dynamic", use_container_width=True, key=editor_key, hide_index=True,
+        num_rows="dynamic", width="stretch", key=editor_key, hide_index=True,
     ).reset_index(drop=True)
 
     base = st.session_state[state_key].reset_index(drop=True)
@@ -429,18 +479,18 @@ def catalogue_add(state_key: str, default_margin: float, kp: str, default_system
         qty = a2.number_input("Qty", min_value=1, value=1, step=1, key=f"{kp}_qty")
         area = a3.text_input("Area", value=default_system, key=f"{kp}_area")
         system = a4.text_input("System", value=default_system, key=f"{kp}_system")
-        if a5.button("➕ Add", use_container_width=True, key=f"{kp}_add"):
+        if a5.button("➕ Add", width="stretch", key=f"{kp}_add"):
             _add_row_to(state_key, repo.item_to_grid_row(
                 chosen, area=area, system=system, qty=int(qty), default_margin=default_margin))
             st.rerun()
     elif term:
         st.info("No catalogue match - add a blank row below and type freely.")
     bc1, bc2, _ = st.columns([1, 1, 4])
-    if bc1.button("➕ Blank row", key=f"{kp}_blank", use_container_width=True):
+    if bc1.button("➕ Blank row", key=f"{kp}_blank", width="stretch"):
         _add_row_to(state_key, {**calc.blank_row(system=default_system),
                                 "Margin x": default_margin, "LineType": "item", "_ItemID": None})
         st.rerun()
-    if show_clear and bc2.button("🧹 Clear grid", key=f"{kp}_clear", use_container_width=True):
+    if show_clear and bc2.button("🧹 Clear grid", key=f"{kp}_clear", width="stretch"):
         st.session_state[state_key] = _empty_grid()
         st.rerun()
 
@@ -561,6 +611,8 @@ def _make_pdf_download(h, grid, summary, options=None):
         "name": repo.get_setting("company_name") or "Company Name",
         "tagline": repo.get_setting("company_tagline") or "",
         "contact": repo.get_setting("company_contact") or "",
+        "vat_number": repo.get_setting("company_vat_number") or "",
+        "cr_number": repo.get_setting("company_cr_number") or "",
         "color": repo.get_setting("company_brand_color") or "#002060",
         "header_left": repo.get_setting("header_left_text") or "",
         "header_middle": repo.get_setting("header_middle_text") or "",
@@ -953,7 +1005,7 @@ def _offer_tab_selector(project_id: int, approved: bool) -> str:
     for label, col in zip(tabs, cols):
         locked = label != "BoQ" and not approved
         key = f"offer_tab_{label.lower()}_{project_id}"
-        col.button(label, key=key, disabled=locked, use_container_width=True,
+        col.button(label, key=key, disabled=locked, width="stretch",
                    type="primary" if active == label else "secondary",
                    on_click=_set_offer_active_tab, args=(state_key, label))
 
@@ -1036,7 +1088,7 @@ def _render_tracking_qty_prompt():
             "or only part of it?"
         )
         if st.button(f"Full quantity ({full_qty:g})", key="tracking_prompt_full",
-                     type="primary", use_container_width=True):
+                     type="primary", width="stretch"):
             _set_tracking_qty(prompt["value_key"], prompt["stamp_key"], prompt["qty_key"],
                               full_qty, full_qty)
             _clear_tracking_qty_prompt()
@@ -1051,12 +1103,12 @@ def _render_tracking_qty_prompt():
         )
         b1, b2 = st.columns(2)
         if b1.button(f"Use partial", key="tracking_prompt_partial",
-                     use_container_width=True):
+                     width="stretch"):
             _set_tracking_qty(prompt["value_key"], prompt["stamp_key"], prompt["qty_key"],
                               partial_qty, full_qty)
             _clear_tracking_qty_prompt()
             st.rerun()
-        if b2.button("Cancel", key="tracking_prompt_cancel", use_container_width=True):
+        if b2.button("Cancel", key="tracking_prompt_cancel", width="stretch"):
             _clear_tracking_qty_prompt()
             st.rerun()
 
@@ -1134,7 +1186,7 @@ def _tracking_status_cell(col, lid: int, key_name: str, current: bool, stamp_val
             btn_state = "partial"
     btn_key = f"trkbtn_{btn_state}_{key_name}_{lid}"
     label = "✓" if checked else " "
-    col.button(label, key=btn_key, disabled=not can("tracking"), use_container_width=True,
+    col.button(label, key=btn_key, disabled=not can("tracking"), width="stretch",
                on_click=_handle_tracking_status_click,
                args=(value_key, stamp_key,
                      qty_key if full_qty is not None else None,
@@ -1201,7 +1253,7 @@ def _render_finance_tab(project_id: int, grand_total: float):
             "Invoice #": st.column_config.TextColumn("Invoice #", help="Invoice number (free text)"),
         }
         pay_edit = st.data_editor(st.session_state[pay_src_key], column_config=pay_cfg,
-                                  num_rows="dynamic", hide_index=True, use_container_width=True,
+                                  num_rows="dynamic", hide_index=True, width="stretch",
                                   key=f"fin_pay_{project_id}")
         collected = pay_edit["Amount (SAR)"].map(calc._num).sum()
         remaining = gt - collected
@@ -1219,7 +1271,7 @@ def _render_finance_tab(project_id: int, grand_total: float):
             "PO #": st.column_config.TextColumn("PO #", help="Purchase-order reference (free text)"),
         }
         pur_edit = st.data_editor(st.session_state[pur_src_key], column_config=pur_cfg,
-                                  num_rows="dynamic", hide_index=True, use_container_width=True,
+                                  num_rows="dynamic", hide_index=True, width="stretch",
                                   key=f"fin_pur_{project_id}")
         cost_total = pur_edit["Cost (SAR)"].map(calc._num).sum()
         vat = gt * calc.VAT_RATE
@@ -1242,6 +1294,188 @@ def _render_finance_tab(project_id: int, grand_total: float):
         repo.save_finance(project_id, pay_edit.to_dict("records"), pur_edit.to_dict("records"))
         st.session_state[sig_key] = sig
         st.toast("Finance saved", icon="💾")
+
+
+def _company_dict():
+    return {
+        "name": repo.get_setting("company_name") or "Company",
+        "vat_number": repo.get_setting("company_vat_number") or "",
+        "cr_number": repo.get_setting("company_cr_number") or "",
+        "color": repo.get_setting("company_brand_color") or "#002060",
+    }
+
+
+def _excel_bytes(df_map: dict):
+    """df_map: {sheet_name: DataFrame} -> xlsx bytes."""
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as w:
+        for sheet, d in df_map.items():
+            d.to_excel(w, index=False, sheet_name=sheet[:31])
+    return buf.getvalue()
+
+
+def _render_report_builder(company):
+    ds_name = st.selectbox("Dataset", list(reports.DATASETS), key="rep_ds")
+    meta = reports.DATASETS[ds_name]
+    df = meta["builder"](include_archived=False)
+    if df.empty:
+        st.info("No data available for this dataset yet.")
+        return
+
+    with st.expander("Filters", expanded=True):
+        selections, fcols = {}, [f for f in meta["filters"] if f in df.columns]
+        cols = st.columns(3)
+        for i, fcol in enumerate(fcols):
+            opts = sorted([str(v) for v in df[fcol].dropna().unique() if str(v).strip() != ""])
+            selections[fcol] = cols[i % 3].multiselect(fcol, opts, key=f"rf_{ds_name}_{fcol}")
+        dcol = meta.get("date")
+        date_from = date_to = None
+        if dcol and dcol in df.columns and pd.to_datetime(df[dcol], errors="coerce").notna().any():
+            dc1, dc2 = st.columns(2)
+            date_from = dc1.date_input("From date", value=None, key=f"rf_from_{ds_name}")
+            date_to = dc2.date_input("To date", value=None, key=f"rf_to_{ds_name}")
+
+    filtered = reports.apply_filters(df, selections, meta.get("date"), date_from, date_to)
+
+    with st.expander("Summarize (optional — group & total)"):
+        group_by = st.multiselect("Group by", [c for c in (meta["filters"] + ["Month"]) if c in df.columns],
+                                   key=f"rg_{ds_name}")
+        metrics = st.multiselect("Metrics", meta["metrics"], default=meta["metrics"], key=f"rm_{ds_name}")
+
+    if group_by:
+        result = reports.aggregate(filtered, group_by, metrics)
+        totals = reports.totals_row(result, metrics)
+    else:
+        show = [c for c in meta["show"] if c in filtered.columns]
+        result = filtered[show].reset_index(drop=True)
+        totals = reports.totals_row(filtered, meta["metrics"])
+
+    st.caption(f"{len(result)} row(s)")
+    st.dataframe(result, width="stretch", hide_index=True)
+    if totals:
+        st.markdown("  ·  ".join(f"**{k}:** {v:,.0f}" for k, v in totals.items()))
+
+    # ---- Exports ----
+    sub = [f"Generated {dt.date.today().isoformat()} · {ds_name}"]
+    active = [f"{k}: {', '.join(v)}" for k, v in selections.items() if v]
+    if date_from or date_to:
+        active.append(f"Date: {date_from or '…'} → {date_to or '…'}")
+    if group_by:
+        active.append(f"Grouped by: {', '.join(group_by)}")
+    if active:
+        sub.append("Filters — " + "  |  ".join(active))
+
+    e1, e2 = st.columns(2)
+    e2.download_button("⬇️ Export Excel", _excel_bytes({"Report": result}),
+                       file_name=f"report_{ds_name.split(' ')[0].lower()}.xlsx",
+                       mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                       width="stretch")
+    if e1.button("📄 Build PDF report", width="stretch"):
+        out = os.path.join(db.DATA_DIR, "_last_report.pdf")
+        pdf_export.generate_report_pdf(out, f"{ds_name} report", sub, result, totals, company)
+        with open(out, "rb") as f:
+            st.session_state["report_pdf_bytes"] = f.read()
+    if st.session_state.get("report_pdf_bytes"):
+        st.download_button("⬇️ Download PDF report", st.session_state["report_pdf_bytes"],
+                           file_name="report.pdf", mime="application/pdf")
+
+
+def _bar(ax, labels, values, title, color, horizontal=False, fmt_k=True):
+    if horizontal:
+        ax.barh(labels, values, color=color)
+        ax.invert_yaxis()
+    else:
+        ax.bar(labels, values, color=color)
+        ax.tick_params(axis="x", rotation=45)
+    ax.set_title(title, fontsize=11, fontweight="bold")
+    ax.grid(axis="x" if horizontal else "y", alpha=0.25)
+    for s in ("top", "right"):
+        ax.spines[s].set_visible(False)
+
+
+def _render_dashboard(company):
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    offers = reports.offers_df(include_archived=False)
+    fin = reports.finance_df(include_archived=False)
+    if offers.empty:
+        st.info("No offers yet — nothing to chart.")
+        return
+    brand = company.get("color") or "#002060"
+    figs = []   # (caption, fig)
+
+    # 1) Value & count per month
+    bym = offers.groupby("Month").agg(Value=("Grand Total SAR", "sum"),
+                                      Count=("ProjectID", "count")).reset_index()
+    bym = bym[bym["Month"].astype(str) != "NaT"].tail(12)
+    if not bym.empty:
+        fig, ax = plt.subplots(figsize=(9, 3.2))
+        _bar(ax, bym["Month"], bym["Value"], "Offer value per month (SAR)", brand)
+        figs.append(("Bookings trend", fig))
+
+    # 2) Approved vs pending (value)
+    pipe = offers.groupby("Status")["Grand Total SAR"].sum()
+    if not pipe.empty:
+        fig, ax = plt.subplots(figsize=(4.5, 3.2))
+        ax.pie(pipe.values, labels=pipe.index, autopct="%1.0f%%",
+               colors=["#2FA84F", "#C9D3DF"], startangle=90)
+        ax.set_title("Pipeline value: approved vs pending", fontsize=11, fontweight="bold")
+        figs.append(("Pipeline", fig))
+
+    # 3) Top clients by value
+    topc = offers.groupby("Client")["Grand Total SAR"].sum().sort_values(ascending=False).head(10)
+    if not topc.empty:
+        fig, ax = plt.subplots(figsize=(9, 3.6))
+        _bar(ax, topc.index, topc.values, "Top clients by value (SAR)", brand, horizontal=True)
+        figs.append(("Top clients", fig))
+
+    # 4) Sales-person leaderboard
+    sp = offers[offers["Sales Person"].astype(str).str.strip() != ""]
+    lead = sp.groupby("Sales Person")["Grand Total SAR"].sum().sort_values(ascending=False).head(10)
+    if not lead.empty:
+        fig, ax = plt.subplots(figsize=(9, 3.2))
+        _bar(ax, lead.index, lead.values, "Sales-person leaderboard (SAR)", "#37689B", horizontal=True)
+        figs.append(("Sales leaderboard", fig))
+
+    # 5) Gross profit by top clients
+    gp = offers.groupby("Client")["Gross Profit SAR"].sum().sort_values(ascending=False).head(10)
+    if not gp.empty:
+        fig, ax = plt.subplots(figsize=(9, 3.2))
+        _bar(ax, gp.index, gp.values, "Gross profit by client (SAR)", "#2FA84F", horizontal=True)
+        figs.append(("Profit by client", fig))
+
+    # 6) Finance: collected vs remaining vs PO spend (totals)
+    if not fin.empty:
+        totals = {"Collected": fin["Collected SAR"].sum(), "Remaining/Due": fin["Remaining SAR"].sum(),
+                  "PO Spend": fin["PO Spend SAR"].sum(), "Net Profit": fin["Net Profit SAR"].sum()}
+        fig, ax = plt.subplots(figsize=(9, 3.2))
+        _bar(ax, list(totals.keys()), list(totals.values()), "Finance totals (SAR)", brand)
+        figs.append(("Finance totals", fig))
+
+    for _, fig in figs:
+        st.pyplot(fig, width="stretch")
+
+    if st.button("📄 Export charts as PDF", width="stretch"):
+        import tempfile
+        paths = []
+        tmp = tempfile.mkdtemp(prefix="pq_charts_")
+        for i, (_, fig) in enumerate(figs):
+            p = os.path.join(tmp, f"chart_{i}.png")
+            fig.savefig(p, dpi=130, bbox_inches="tight")
+            paths.append(p)
+        out = os.path.join(db.DATA_DIR, "_last_dashboard.pdf")
+        pdf_export.generate_report_pdf(out, "Statistics dashboard",
+                                       [f"Generated {dt.date.today().isoformat()}"],
+                                       table_df=None, totals=None, company=company, chart_paths=paths)
+        with open(out, "rb") as f:
+            st.session_state["dashboard_pdf_bytes"] = f.read()
+        import shutil
+        shutil.rmtree(tmp, ignore_errors=True)
+    if st.session_state.get("dashboard_pdf_bytes"):
+        st.download_button("⬇️ Download charts PDF", st.session_state["dashboard_pdf_bytes"],
+                           file_name="dashboard.pdf", mime="application/pdf")
 
 
 def _render_tracking_tab(project_id: int, sheet_name: str | None):
@@ -1328,7 +1562,7 @@ def _render_tracking_tab(project_id: int, sheet_name: str | None):
 def _render_login():
     c = st.columns([1, 2, 1])[1]
     if os.path.exists(_LOGO):
-        c.image(_LOGO, use_container_width=True)
+        c.image(_LOGO, width="stretch")
     c.subheader("Sign in")
     if auth.user_count() == 0:
         c.info("First run - create the **owner** account (full access).")
@@ -1379,16 +1613,16 @@ def can(p):
 _ensure_state()
 # Sidebar shows the standalone LOGO (full width); falls back to the banner if no logo.
 if os.path.exists(db.logo_path()):
-    st.sidebar.image(db.logo_path(), use_container_width=True)
+    st.sidebar.image(db.logo_path(), width="stretch")
 elif os.path.exists(_LOGO):
-    st.sidebar.image(_LOGO, use_container_width=True)
+    st.sidebar.image(_LOGO, width="stretch")
 st.sidebar.title(_COMPANY)
 st.sidebar.caption(f"👤 **{USER.get('DisplayName') or USER.get('Username')}** · _{ROLE}_")
-if st.sidebar.button("🔒 Log out", use_container_width=True):
+if st.sidebar.button("🔒 Log out", width="stretch"):
     st.session_state.pop("auth_user", None)
     st.rerun()
 
-_SECTIONS = [("New Project", "new_offer"), ("Load Project", "load"),
+_SECTIONS = [("New Project", "new_offer"), ("Load Project", "load"), ("Reports", "reports"),
              ("Catalogue", "catalogue"), ("Settings", "settings"), ("Users", "users")]
 _allowed = [name for name, p in _SECTIONS if can(p)]
 if not _allowed:
@@ -1415,11 +1649,18 @@ try:
 except (TypeError, ValueError):
     pass
 
-# DB stats
+# DB stats — "Projects" counts distinct offer families (revisions/options count once).
 try:
-    nproj = len(repo.list_projects())
+    _projs = repo.list_projects()
+    _nrows = len(_projs)
+    if _nrows:
+        _nfam = _projs.apply(
+            lambda r: repo.family_key(r.get("OfferNo"), r.get("ProjectName")), axis=1).nunique()
+    else:
+        _nfam = 0
     ncat = len(repo.search_catalog("", limit=100000))
-    st.sidebar.metric("Projects in DB", nproj)
+    st.sidebar.metric("Projects in DB", _nfam)
+    st.sidebar.caption(f"{_nrows} records incl. revisions & options")
     st.sidebar.metric("Catalogue items", ncat)
 except Exception as e:
     st.sidebar.error(f"DB: {e}")
@@ -1520,7 +1761,7 @@ if mode == "New Project":
     ac1, ac2, ac3, ac4, ac5 = st.columns(5)
     _optname = (h.get("option") or "").strip()
     if ac1.button("💾 Save option" if st.session_state.get("no_offer_lock") else "💾 Save offer",
-                  type="primary", use_container_width=True):
+                  type="primary", width="stretch"):
         _locked_now = st.session_state.get("no_offer_lock")
         _done = st.session_state.get("no_saved_options", [])
         if st.session_state.grid.empty:
@@ -1545,13 +1786,13 @@ if mode == "New Project":
             st.session_state.setdefault("no_saved_options", []).append(_optname or "Main")
             st.success(f"Saved {('option ' + _optname) if _optname else 'offer'} (ProjectID {pid}).")
 
-    if ac2.button("➕ Add another option", use_container_width=True,
+    if ac2.button("➕ Add another option", width="stretch",
                   disabled=not st.session_state.get("no_offer_lock")):
         st.session_state.grid = _empty_grid()
         st.session_state["_no_reset_option"] = True   # clear option label on next run
         st.rerun()
 
-    if ac3.button("🆕 New offer", use_container_width=True):
+    if ac3.button("🆕 New offer", width="stretch"):
         st.session_state.grid = _empty_grid()
         st.session_state.no_offer_lock = None
         st.session_state.no_saved_options = []
@@ -1560,23 +1801,23 @@ if mode == "New Project":
         st.session_state.pop("project_sheet_bytes", None)
         st.rerun()
 
-    if ac4.button("📄 Generate Offer PDF", use_container_width=True):
+    if ac4.button("📄 Generate Offer PDF", width="stretch"):
         _make_pdf_download(h, st.session_state.grid, s)
 
-    if ac5.button("📊 Generate Project Sheet", use_container_width=True):
+    if ac5.button("📊 Generate Project Sheet", width="stretch"):
         _make_project_sheet_download(h, s)
 
     dl1, dl2 = st.columns(2)
     if "pdf_bytes" in st.session_state:
         dl1.download_button("⬇️ Download Offer PDF", st.session_state.pdf_bytes,
                             file_name=f"Quotation_{h['offer']}{(' '+_optname) if _optname else ''}.pdf",
-                            mime="application/pdf", use_container_width=True)
+                            mime="application/pdf", width="stretch")
     if "project_sheet_bytes" in st.session_state:
         dl2.download_button("⬇️ Download Project Sheet", st.session_state.project_sheet_bytes,
                             file_name=f"Project_Sheet_{_safe_filename(h.get('offer') or h.get('project'))}.xlsx",
                             mime=("application/vnd.openxmlformats-officedocument."
                                   "spreadsheetml.sheet"),
-                            use_container_width=True)
+                            width="stretch")
 
 
 # ============================ LOAD EXISTING ============================
@@ -1654,34 +1895,48 @@ elif mode == "Load Project":
             st.session_state.pop("load_fam", None)
             st.session_state.pop("view_pid", None)
 
-        st.markdown("**Matching offers**")
-        widths = [2.4, 1.4, 2.3, 0.9, 0.7, 0.7, 0.9, 0.8]
-        hc = st.columns(widths)
-        for col, t in zip(hc, ["Project", "Client", "Offer #", "Date", "Rev.", "Opt.", "Approved", ""]):
-            col.caption(t)
-        for idx, f in enumerate(matches):
-            selected = f["fam"] == current_fam
-            rc = st.columns(widths, vertical_alignment="center")
-            rc[0].write(("▶ " if selected else "") + _text(f["base"], "Offer"))
-            rc[1].write(_text(f["client"], "-"))
-            rc[2].write(", ".join(f["offer_nos"][:3]) if f["offer_nos"] else "-")
-            rc[3].write(_text(f["date"])[:10])
-            rc[4].write(str(f["n_rev"]))
-            rc[5].write(str(f["n_opt"]))
-            rc[6].write("✅" if f["approved"] else "")
-            if rc[7].button("View", key=f"match_view_{idx}_{f['fam']}",
-                            disabled=selected, use_container_width=True):
-                st.session_state.load_fam = f["fam"]
-                st.session_state.pop("view_pid", None)
-                st.session_state.pop("pdf_bytes", None)
-                st.session_state.pop("project_sheet_bytes", None)
-                st.session_state.edit_mode = False
-                st.rerun()
-
+        # While no offer is chosen, show the matching list. Once one is opened,
+        # hide the list and show only that offer (with a Back button).
         if not current_fam:
-            st.info(f"{len(matches)} matching offer{'s' if len(matches) != 1 else ''} found. Click View to open one.")
+            st.markdown("**Matching offers**")
+            widths = [2.4, 1.4, 2.3, 0.9, 0.7, 0.7, 0.9, 0.8]
+            hc = st.columns(widths)
+            for col, t in zip(hc, ["Project", "Client", "Offer #", "Date", "Rev.", "Opt.", "Approved", ""]):
+                col.caption(t)
+            for idx, f in enumerate(matches):
+                rc = st.columns(widths, vertical_alignment="center")
+                rc[0].write(_text(f["base"], "Offer"))
+                rc[1].write(_text(f["client"], "-"))
+                rc[2].write(", ".join(f["offer_nos"][:3]) if f["offer_nos"] else "-")
+                rc[3].write(_fmt_date(f["date"]))
+                rc[4].write(str(f["n_rev"]))
+                rc[5].write(str(f["n_opt"]))
+                rc[6].write("✅" if f["approved"] else "")
+                if rc[7].button("View", key=f"match_view_{idx}_{f['fam']}",
+                                width="stretch"):
+                    st.session_state.load_fam = f["fam"]
+                    st.session_state.pop("view_pid", None)
+                    st.session_state.pop("pdf_bytes", None)
+                    st.session_state.pop("project_sheet_bytes", None)
+                    st.session_state.edit_mode = False
+                    st.rerun()
+            st.info(f"{len(matches)} matching offer{'s' if len(matches) != 1 else ''} found. "
+                    "Click View to open one.")
             st.stop()
 
+        # ---- An offer is open: show a Back button + only this offer ----
+        _sel_f = next((f for f in matches if f["fam"] == current_fam), None)
+        bcol1, bcol2 = st.columns([1.3, 4], vertical_alignment="center")
+        if bcol1.button("← Back to results", width="stretch"):
+            for k in ("load_fam", "view_pid", "pdf_bytes", "project_sheet_bytes"):
+                st.session_state.pop(k, None)
+            st.session_state.edit_mode = False
+            st.rerun()
+        if _sel_f:
+            bcol2.markdown(
+                f"**{_text(_sel_f['base'], 'Offer')}**"
+                + (f" · {_text(_sel_f['client'])}" if _text(_sel_f["client"]) else "")
+                + f"  —  {len(matches)} search match{'es' if len(matches) != 1 else ''}")
         selected_fam = current_fam
 
         grp = (projects[projects["_fam"] == selected_fam]
@@ -1706,22 +1961,27 @@ elif mode == "Load Project":
 
         # Revisions & options, each with its own View button.
         st.markdown("**Revisions & options**")
-        widths = [1.0, 1.2, 1.8, 1.0, 0.5, 1.0, 0.9]
+        widths = [1.0, 1.2, 1.8, 1.0, 1.3, 0.5, 1.0, 0.9]
         hc = st.columns(widths)
-        for col, t in zip(hc, ["Revision", "Option", "Offer #", "Date", "✓", "Status", ""]):
-            col.caption(t)
+        for col, t in zip(hc, ["Revision", "Option", "Offer #", "Date", "Grand Total (SAR)",
+                               "✓", "Status", ""]):
+            _ctr(col, t, header=True)
         for _, row in shown.iterrows():
             rid = int(row["ProjectID"])
             rn = int(row["RevisionNo"]) if pd.notna(row["RevisionNo"]) else 0
             sel = (rid == int(st.session_state.view_pid))
-            rc = st.columns(widths)
-            rc[0].write(("▶ " if sel else "") + (repo.revision_token(rn) if rn > 0 else "Original"))
-            rc[1].write(_text(row["OptionLabel"], "-"))
-            rc[2].write(_text(row["OfferNo"]))
-            rc[3].write(_text(row["CreationDate"])[:10])
-            rc[4].write("✅" if row["Approved"] else "")
-            rc[5].write("📦 Archived" if row["Archived"] else "Active")
-            if rc[6].button("View", key=f"view_{rid}", disabled=sel, use_container_width=True):
+            rc = st.columns(widths, vertical_alignment="center")
+            _ctr(rc[0], ("▶ " if sel else "") + (repo.revision_token(rn) if rn > 0 else "Original"))
+            _ctr(rc[1], _text(row["OptionLabel"], "-"))
+            _ctr(rc[2], _text(row["OfferNo"]))
+            _ctr(rc[3], _fmt_date(row["CreationDate"]))
+            try:
+                _ctr(rc[4], f"{repo.offer_grand_total(rid):,.0f}")
+            except Exception:
+                _ctr(rc[4], "-")
+            _ctr(rc[5], "✅" if row["Approved"] else "")
+            _ctr(rc[6], "📦 Archived" if row["Archived"] else "Active")
+            if rc[7].button("View", key=f"view_{rid}", disabled=sel, width="stretch"):
                 st.session_state.view_pid = rid
                 st.session_state.pop("pdf_bytes", None)
                 st.session_state.pop("project_sheet_bytes", None)
@@ -1769,23 +2029,23 @@ elif mode == "Load Project":
                 else:
                     apc1.info("Active · not approved")
                 if meta.get("Approved"):
-                    if can("approve") and apc2.button("↩️ Unapprove", use_container_width=True):
+                    if can("approve") and apc2.button("↩️ Unapprove", width="stretch"):
                         r = repo.unapprove_offer(pid)
                         st.toast(f"Unapproved. {r} auto-archived entr{'y' if r == 1 else 'ies'} restored."
                                  if r else "Unapproved.", icon="↩️")
                         st.rerun()
                 elif can("approve"):
-                    if apc2.button("✅ Approve", type="primary", use_container_width=True):
+                    if apc2.button("✅ Approve", type="primary", width="stretch"):
                         n = repo.approve_offer(pid)
                         st.toast(f"Approved. {n} other entr{'y' if n == 1 else 'ies'} archived."
                                  if n else "Approved.", icon="✅")
                         st.rerun()
                 if can("archive"):
                     if meta.get("Archived"):
-                        if apc3.button("♻️ Restore", use_container_width=True):
+                        if apc3.button("♻️ Restore", width="stretch"):
                             repo.unarchive_project(pid)
                             st.rerun()
-                    elif apc3.button("📦 Archive", use_container_width=True):
+                    elif apc3.button("📦 Archive", width="stretch"):
                         repo.archive_project(pid)
                         st.rerun()
                 if meta.get("SalesPerson") or meta.get("PresalesEngineer") or meta.get("ProjectManager"):
@@ -1798,7 +2058,7 @@ elif mode == "Load Project":
                 cfg["Qty"] = st.column_config.NumberColumn("Qty", format="%d")
                 cfg["Shipping %"] = st.column_config.NumberColumn("Shipping %", format="%.2f")
                 st.dataframe(disp[[c for c in BUILDER_COLS if c in disp.columns]],
-                             use_container_width=True, hide_index=True, column_config=cfg)
+                             width="stretch", hide_index=True, column_config=cfg)
             elif active_tab == "Tracking":
                 _render_tracking_tab(pid, sheet)
             else:
@@ -1806,7 +2066,7 @@ elif mode == "Load Project":
 
             b1, b2, b3, b4 = st.columns(4)
             if can("edit") and b1.button("✏️ Edit / new revision or option", type="primary",
-                                         use_container_width=True):
+                                         width="stretch"):
                 eg = repo.load_project_grid(pid, sheet).copy()
                 eg["Margin x"] = 0.0   # keep loaded prices; set a margin per line to re-price
                 st.session_state.edit_grid = calc.recompute(eg)
@@ -1815,6 +2075,13 @@ elif mode == "Load Project":
                 st.session_state.edit_system = repo.base_name(sheet or "").replace("BOQ", "").strip() or "LCS"
                 st.session_state.edit_discount = abs(float(meta.get("DiscountAmount") or 0))
                 st.session_state.edit_terms = {**DEFAULT_TERMS, **repo.load_terms(meta)}
+                st.session_state.edit_header = {
+                    "client": _text(meta.get("ClientName")), "project": _text(meta.get("ProjectName")),
+                    "contact": _text(meta.get("ContactName")), "phone": "",
+                    "sales": _text(meta.get("SalesPerson")),
+                    "presales": _text(meta.get("PresalesEngineer")),
+                    "pm": _text(meta.get("ProjectManager")),
+                }
                 st.session_state.edit_project_sheet = {
                     **DEFAULT_PROJECT_SHEET_INFO, **repo.load_project_sheet_info(meta)
                 }
@@ -1840,7 +2107,7 @@ elif mode == "Load Project":
                 st.session_state.pop("project_sheet_bytes", None)
                 st.session_state.pop("saved_rev", None)
                 st.rerun()
-            if can("new_offer") and b2.button("📋 Duplicate", use_container_width=True):
+            if can("new_offer") and b2.button("📋 Duplicate", width="stretch"):
                 dg = repo.load_project_grid(pid, sheet).copy()
                 if dg.empty:
                     st.warning("This offer has no lines to duplicate.")
@@ -1879,23 +2146,23 @@ elif mode == "Load Project":
                               "offer": meta.get("OfferNo"), "date": meta.get("CreationDate"),
                               "project_sheet": repo.load_project_sheet_info(meta)}
             if b3.button(f"📄 Generate Offer PDF{f' ({len(opts)} options)' if _multi else ''}",
-                         use_container_width=True):
+                         width="stretch"):
                 _make_pdf_download(_export_header, disp, s, options=opts if _multi else None)
-            if b4.button("📊 Generate Project Sheet", use_container_width=True):
+            if b4.button("📊 Generate Project Sheet", width="stretch"):
                 _make_project_sheet_download(_export_header, s)
             dl1, dl2 = st.columns(2)
             if "pdf_bytes" in st.session_state and not st.session_state.get("saved_rev"):
                 dl1.download_button(
                     "⬇️ Download Offer PDF", st.session_state.pdf_bytes,
                     file_name=f"Quotation_{meta.get('OfferNo') or meta.get('ProjectName')}.pdf",
-                    mime="application/pdf", use_container_width=True)
+                    mime="application/pdf", width="stretch")
             if "project_sheet_bytes" in st.session_state and not st.session_state.get("saved_rev"):
                 dl2.download_button(
                     "⬇️ Download Project Sheet", st.session_state.project_sheet_bytes,
                     file_name=f"Project_Sheet_{_safe_filename(meta.get('OfferNo') or meta.get('ProjectName'))}.xlsx",
                     mime=("application/vnd.openxmlformats-officedocument."
                           "spreadsheetml.sheet"),
-                    use_container_width=True)
+                    width="stretch")
 
             if can("delete"):
               with st.expander("Delete..."):
@@ -1931,19 +2198,42 @@ elif mode == "Load Project":
                     "set a margin to re-price a line.")
             if "edit_terms" not in st.session_state:
                 st.session_state.edit_terms = {**DEFAULT_TERMS, **repo.load_terms(meta)}
+            if "edit_header" not in st.session_state:
+                st.session_state.edit_header = {
+                    "client": _text(meta.get("ClientName")), "project": _text(meta.get("ProjectName")),
+                    "contact": _text(meta.get("ContactName")), "phone": "",
+                    "sales": _text(meta.get("SalesPerson")),
+                    "presales": _text(meta.get("PresalesEngineer")),
+                    "pm": _text(meta.get("ProjectManager")),
+                }
             if "edit_project_sheet" not in st.session_state:
                 st.session_state.edit_project_sheet = {
                     **DEFAULT_PROJECT_SHEET_INFO, **repo.load_project_sheet_info(meta)
                 }
+
+            # ---- Editable offer header (client / project / people) ----
+            eh = st.session_state.edit_header
+            with st.expander("✏️ Offer header (client · project · contact · people)", expanded=False):
+                hc1, hc2 = st.columns(2)
+                eh["client"] = hc1.text_input("Client", eh.get("client", ""), key="eh_client")
+                eh["project"] = hc1.text_input("Project", eh.get("project", ""), key="eh_project")
+                eh["contact"] = hc2.text_input("Contact", eh.get("contact", ""), key="eh_contact")
+                eh["phone"] = hc2.text_input("Phone", eh.get("phone", ""), key="eh_phone")
+                ph1, ph2, ph3 = st.columns(3)
+                eh["sales"] = _person_select(ph1, "Sales Person", PEOPLE_ROLES["sales"],
+                                             eh.get("sales", ""), "eh_sales")
+                eh["presales"] = _person_select(ph2, "Pre-sales Engineer", PEOPLE_ROLES["presales"],
+                                                eh.get("presales", ""), "eh_presales")
+                eh["pm"] = _person_select(ph3, "Project Manager", PEOPLE_ROLES["pm"],
+                                          eh.get("pm", ""), "eh_pm")
+            st.session_state.edit_header = eh
+
             terms_form(st.session_state.edit_terms, "ed")
             edit_header_for_ps = {
                 **st.session_state.edit_terms,
-                "client": meta.get("ClientName"),
-                "project": meta.get("ProjectName"),
-                "contact": meta.get("ContactName"),
-                "phone": "",
-                "sales": meta.get("SalesPerson"),
-                "date": meta.get("CreationDate"),
+                "client": eh.get("client"), "project": eh.get("project"),
+                "contact": eh.get("contact"), "phone": eh.get("phone"),
+                "sales": eh.get("sales"), "date": meta.get("CreationDate"),
                 "project_sheet": st.session_state.edit_project_sheet,
             }
             project_sheet_info_form(edit_header_for_ps, "ed_ps")
@@ -1969,13 +2259,15 @@ elif mode == "Load Project":
 
             edit_terms = st.session_state.get("edit_terms", dict(DEFAULT_TERMS))
             edit_project_sheet = st.session_state.get("edit_project_sheet", dict(DEFAULT_PROJECT_SHEET_INFO))
+            edit_header = st.session_state.get("edit_header", {})
 
             def _post_save(npid, nname, nrev):
                 offer_rev = repo.project_meta(npid).get("OfferNo") or nname   # actual saved offer #
-                h = {**edit_terms, "client": meta.get("ClientName"), "project": nname,
-                     "contact": meta.get("ContactName"), "phone": "",
-                     "sales": meta.get("SalesPerson"), "presales": meta.get("PresalesEngineer"),
-                     "pm": meta.get("ProjectManager"),
+                h = {**edit_terms,
+                     "client": edit_header.get("client"), "project": edit_header.get("project") or nname,
+                     "contact": edit_header.get("contact"), "phone": edit_header.get("phone", ""),
+                     "sales": edit_header.get("sales"), "presales": edit_header.get("presales"),
+                     "pm": edit_header.get("pm"),
                      "offer": offer_rev, "date": dt.date.today().isoformat(),
                      "project_sheet": edit_project_sheet}
                 _make_pdf_download(h, calc.recompute(st.session_state.edit_grid), s)
@@ -1984,7 +2276,7 @@ elif mode == "Load Project":
             st.divider()
             _cur_rev = int(meta.get("RevisionNo") or 0)
             e1, e2, e3, e4 = st.columns(4)
-            if e1.button("💾 Save on this revision", type="primary", use_container_width=True,
+            if e1.button("💾 Save on this revision", type="primary", width="stretch",
                          help="Overwrite the current revision/option in place - keeps the same "
                               "offer #, revision, option and approval."):
                 repo.update_offer(
@@ -1992,20 +2284,21 @@ elif mode == "Load Project":
                     discount_sar=edit_discount,
                     factors=(s["markup_factor"], None, None),
                     system_suffix=st.session_state.get("edit_system", "LCS"), terms=edit_terms,
-                    project_sheet_info=edit_project_sheet)
-                _post_save(st.session_state.edit_pid, meta.get("ProjectName"), _cur_rev)
-                st.success(f"Updated **{meta.get('ProjectName')}** in place.")
-            if e2.button("💾 Save as new revision", use_container_width=True):
+                    project_sheet_info=edit_project_sheet, header=edit_header)
+                _post_save(st.session_state.edit_pid,
+                           edit_header.get("project") or meta.get("ProjectName"), _cur_rev)
+                st.success(f"Updated **{edit_header.get('project') or meta.get('ProjectName')}** in place.")
+            if e2.button("💾 Save as new revision", width="stretch"):
                 npid, nname, nrev = repo.save_revision(
                     st.session_state.edit_pid, calc.recompute(st.session_state.edit_grid),
                     discount_sar=edit_discount,
                     factors=(s["markup_factor"], None, None),
                     system_suffix=st.session_state.get("edit_system", "LCS"),
                     terms=edit_terms, option_label=opt_label.strip(),
-                    project_sheet_info=edit_project_sheet)
+                    project_sheet_info=edit_project_sheet, header=edit_header)
                 _post_save(npid, nname, nrev)
                 st.success(f"Saved **{nname}** as ProjectID {npid}.")
-            if e3.button("💾 Save as new option", use_container_width=True):
+            if e3.button("💾 Save as new option", width="stretch"):
                 if not opt_label.strip():
                     st.warning("Enter an Option label first (e.g. Dynalite / KNX).")
                 else:
@@ -2015,12 +2308,13 @@ elif mode == "Load Project":
                         discount_sar=edit_discount,
                         factors=(s["markup_factor"], None, None),
                         system_suffix=st.session_state.get("edit_system", "LCS"), terms=edit_terms,
-                        project_sheet_info=edit_project_sheet)
+                        project_sheet_info=edit_project_sheet, header=edit_header)
                     _post_save(npid, nname, nrev)
                     st.success(f"Saved option **{nname}** as ProjectID {npid}.")
-            if e4.button("✖ Cancel edit", use_container_width=True):
+            if e4.button("✖ Cancel edit", width="stretch"):
                 st.session_state.edit_mode = False
-                for k in ("pdf_bytes", "project_sheet_bytes", "edit_terms", "edit_project_sheet", "ed_option",
+                for k in ("pdf_bytes", "project_sheet_bytes", "edit_terms", "edit_header",
+                          "edit_project_sheet", "ed_option",
                           "ed_discount_percent", "ed_discount_driver", "ed_discount_subtotal"):
                     st.session_state.pop(k, None)
                 st.rerun()
@@ -2028,6 +2322,17 @@ elif mode == "Load Project":
                 fn = f"Quotation_{st.session_state.saved_rev[1]}.pdf".replace(" ", "")
                 st.download_button("⬇️ Download Offer PDF", st.session_state.pdf_bytes,
                                    file_name=fn, mime="application/pdf")
+
+
+# ============================ REPORTS ============================
+elif mode == "Reports":
+    st.subheader("Reports & statistics")
+    _rep_company = _company_dict()
+    tab_builder, tab_dash = st.tabs(["🧱 Report Builder", "📊 Dashboard"])
+    with tab_builder:
+        _render_report_builder(_rep_company)
+    with tab_dash:
+        _render_dashboard(_rep_company)
 
 
 # ============================ CATALOGUE ============================
@@ -2072,8 +2377,8 @@ elif mode == "Catalogue":
                "**Del** to remove items. Brand / Model / Description are read-only here - "
                "use **Add new item** above to create one.")
     term = st.text_input("Search", placeholder="Model / Description / Brand")
-    res = repo.search_catalog(term, limit=300).reset_index(drop=True)
-    st.caption(f"{len(res)} item(s)")
+    res = repo.search_catalog(term, limit=100000).reset_index(drop=True)
+    st.caption(f"{len(res)} item(s)" + ("" if term.strip() else " (full catalogue) — type to filter"))
     if not res.empty:
         rename = {"ListPriceUSD": "List Price $", "ExUnitCostUSD": "Ex Unit Cost $",
                   "Currency": "Cur",
@@ -2101,19 +2406,19 @@ elif mode == "Catalogue":
         colcfg["Shipping %"] = st.column_config.NumberColumn("Shipping %", format="%.2f", min_value=0.0, step=5.0)
         colcfg["Times Quoted"] = st.column_config.NumberColumn("Times Quoted", format="%d")
         if not _cat_edit:                              # read-only catalogue
-            st.dataframe(disp[base_cols], use_container_width=True, hide_index=True,
+            st.dataframe(disp[base_cols], width="stretch", hide_index=True,
                          column_config=colcfg)
         else:
             disp["Del"] = False
             colcfg["Del"] = st.column_config.CheckboxColumn("Del", help="Tick to delete this item")
             edited = st.data_editor(
                 disp[["Del"] + base_cols], column_config=colcfg, num_rows="fixed", hide_index=True,
-                use_container_width=True, key=f"cat_editor::{term}",
+                width="stretch", key=f"cat_editor::{term}",
                 disabled=["Brand", "Model", "Description", "Times Quoted"])
             del_ids = [int(res.iloc[i]["ItemID"]) for i in range(len(edited))
                        if bool(edited.iloc[i]["Del"])]
             b1, b2 = st.columns(2)
-            if b1.button("💾 Save price changes", type="primary", use_container_width=True):
+            if b1.button("💾 Save price changes", type="primary", width="stretch"):
                 n = 0
                 for i in range(len(edited)):
                     changes = {}
@@ -2131,7 +2436,7 @@ elif mode == "Catalogue":
                         n += 1
                 st.success(f"Updated {n} catalogue item(s).")
                 st.rerun()
-            if b2.button(f"Delete {len(del_ids)} checked item(s)", use_container_width=True,
+            if b2.button(f"Delete {len(del_ids)} checked item(s)", width="stretch",
                          disabled=not del_ids):
                 n = repo.delete_catalog_items(del_ids)
                 st.success(f"Deleted {n} item(s).")
@@ -2141,502 +2446,759 @@ elif mode == "Catalogue":
 # ============================ SETTINGS ============================
 elif mode == "Settings":
     st.subheader("Settings")
-    st.caption("Offer reference numbers are built from a **template** with variables.")
+    (
+        tab_company,
+        tab_offer,
+        tab_images_pdf,
+        tab_data,
+        tab_backup,
+        tab_updates,
+    ) = st.tabs([
+        "Company Details",
+        "Offer & Pricing",
+        "Images & PDF",
+        "Data Tools",
+        "Backups",
+        "Updates",
+    ])
 
-    with st.form("settings_form"):
-        template = st.text_input("Offer # template", repo.get_setting("offer_template"),
-                                 help="Variables: *TYPE* = System Offer (AV, LCS…), *YY* = 2-digit "
-                                      "year, *YYYY* = 4-digit year, and a run of x's = the auto-number "
-                                      "(its length is the zero-padding). e.g. LG-*TYPE*-*YY*/xxxx → "
-                                      "LG-AV-26/0053. Omit *TYPE* for a fixed prefix (e.g. SWS-*YY*-xxxx).")
-        c1, c2, c3 = st.columns(3)
-        pad = c1.number_input("Fallback digits (no x-run)", min_value=1, max_value=8,
-                              value=int(repo.get_setting("offer_number_pad") or 3),
-                              help="Padding used only when the template has no x's.")
-        types = c2.text_input("System Offer types (comma-separated)", repo.get_setting("offer_types"),
-                              help="Shown as the 'System Offer' dropdown on a new offer. "
-                                   "Pick '(none)' there to skip the *TYPE* segment.")
-        dmargin = c3.number_input("Default margin x", min_value=0.0, step=0.05,
-                                  value=float(repo.get_setting("default_margin") or 1.6),
-                                  help="Applied to new blank rows and catalogue items with no "
-                                       "historical price, in New Project and Edit.")
+    with tab_offer:
+        st.markdown("##### Offer numbers")
+        st.caption("Offer reference numbers are built from a **template** with variables.")
 
-        st.markdown("**Revision label**")
-        rcol1, rcol2 = st.columns(2)
-        rev_fmt = rcol1.text_input("Revision format", repo.get_setting("revision_format"),
-                                   help="A run of x's = the revision number (length = padding). "
-                                        "e.g. Rev.x → Rev.1 / Rev.10 ;  Rxx → R01 / R10.")
-        sep_opts = {"Dash   (…0053-Rev.1)": "-", "Space   (…0053 Rev.1)": " ",
-                    "Underscore   (…0053_Rev.1)": "_"}
-        _cur_sep = repo.get_setting("revision_separator")
-        _cur_lbl = next((k for k, v in sep_opts.items() if v == _cur_sep), list(sep_opts)[0])
-        rev_sep_lbl = rcol2.selectbox("Separator (offer # → revision)", list(sep_opts.keys()),
-                                      index=list(sep_opts.keys()).index(_cur_lbl))
+        with st.form("settings_offer_form"):
+            template = st.text_input(
+                "Offer # template",
+                repo.get_setting("offer_template"),
+                help=(
+                    "Variables: *TYPE* = System Offer (AV, LCS...), *YY* = 2-digit year, "
+                    "*YYYY* = 4-digit year, and a run of x's = the auto-number "
+                    "(its length is the zero-padding). e.g. LG-*TYPE*-*YY*/xxxx -> "
+                    "LG-AV-26/0053. Omit *TYPE* for a fixed prefix (e.g. SWS-*YY*-xxxx)."
+                ),
+            )
+            c1, c2, c3 = st.columns(3)
+            pad = c1.number_input(
+                "Fallback digits (no x-run)",
+                min_value=1,
+                max_value=8,
+                value=int(repo.get_setting("offer_number_pad") or 3),
+                help="Padding used only when the template has no x's.",
+            )
+            types = c2.text_input(
+                "System Offer types (comma-separated)",
+                repo.get_setting("offer_types"),
+                help=(
+                    "Shown as the 'System Offer' dropdown on a new offer. "
+                    "Pick '(none)' there to skip the *TYPE* segment."
+                ),
+            )
+            dmargin = c3.number_input(
+                "Default margin x",
+                min_value=0.0,
+                step=0.05,
+                value=float(repo.get_setting("default_margin") or 1.6),
+                help=(
+                    "Applied to new blank rows and catalogue items with no historical price, "
+                    "in New Project and Edit."
+                ),
+            )
 
-        st.markdown("**Tax**")
-        vcol1, vcol2 = st.columns([1, 2])
-        vat_pct = vcol1.number_input("VAT %", min_value=0.0, max_value=100.0, step=0.5,
-                                     value=float(repo.get_setting("vat_percent") or 15),
-                                     help="VAT rate applied across offers, quotations and the Finance tab. "
-                                          "KSA = 15%; change it for other countries.")
-        vcol2.caption("Applies everywhere VAT is shown - new offers, loaded offers, the client PDF "
-                      "and the Finance tab. Changing it re-computes VAT on all offers.")
+            st.markdown("**Revision label**")
+            rcol1, rcol2 = st.columns(2)
+            rev_fmt = rcol1.text_input(
+                "Revision format",
+                repo.get_setting("revision_format"),
+                help=(
+                    "A run of x's = the revision number (length = padding). "
+                    "e.g. Rev.x -> Rev.1 / Rev.10 ; Rxx -> R01 / R10."
+                ),
+            )
+            sep_opts = {
+                "Dash (...0053-Rev.1)": "-",
+                "Space (...0053 Rev.1)": " ",
+                "Underscore (...0053_Rev.1)": "_",
+            }
+            _cur_sep = repo.get_setting("revision_separator")
+            _cur_lbl = next((k for k, v in sep_opts.items() if v == _cur_sep), list(sep_opts)[0])
+            rev_sep_lbl = rcol2.selectbox(
+                "Separator (offer # -> revision)",
+                list(sep_opts.keys()),
+                index=list(sep_opts.keys()).index(_cur_lbl),
+            )
 
-        st.markdown("**Currencies / exchange rates**")
-        ecol1, ecol2 = st.columns([1, 2])
-        eur_rate = ecol1.number_input("1 EUR = ? USD", min_value=0.0, step=0.01, format="%.4f",
-                                      value=float(repo.get_setting("eur_to_usd") or 1.08),
-                                      help="Converts EUR buy prices to USD when computing the Unit Cost.")
-        ecol2.caption(f"Pegged (fixed, not editable): 1 USD = {calc.SAR_PER_USD:g} SAR "
-                      f"(1 SAR ≈ {1 / calc.SAR_PER_USD:.4f} USD)  ·  "
-                      f"1 USD = {calc.AED_PER_USD:g} AED (1 AED ≈ {1 / calc.AED_PER_USD:.4f} USD).")
+            st.markdown("**Tax**")
+            vcol1, vcol2 = st.columns([1, 2])
+            vat_pct = vcol1.number_input(
+                "VAT %",
+                min_value=0.0,
+                max_value=100.0,
+                step=0.5,
+                value=float(repo.get_setting("vat_percent") or 15),
+                help=(
+                    "VAT rate applied across offers, quotations and the Finance tab. "
+                    "KSA = 15%; change it for other countries."
+                ),
+            )
+            vcol2.caption(
+                "Applies everywhere VAT is shown - new offers, loaded offers, the client PDF "
+                "and the Finance tab. Changing it re-computes VAT on all offers."
+            )
 
-        st.markdown("**Company / Branding**")
-        gc1, gc2 = st.columns([3, 1])
-        company_name = gc1.text_input("Company name", repo.get_setting("company_name") or "",
-                                      help="Shown in the page title, client PDF and project sheet.")
-        brand_color = gc2.color_picker("Brand color", repo.get_setting("company_brand_color") or "#002060",
-                                       help="Primary colour for PDF titles, table headers and footer.")
-        company_tagline = st.text_input("Tagline", repo.get_setting("company_tagline") or "")
-        company_contact = st.text_input("Contact line (city / country)",
-                                        repo.get_setting("company_contact") or "")
+            st.markdown("**Currencies / exchange rates**")
+            ecol1, ecol2 = st.columns([1, 2])
+            eur_rate = ecol1.number_input(
+                "1 EUR = ? USD",
+                min_value=0.0,
+                step=0.01,
+                format="%.4f",
+                value=float(repo.get_setting("eur_to_usd") or 1.08),
+                help="Converts EUR buy prices to USD when computing the Unit Cost.",
+            )
+            ecol2.caption(
+                f"Pegged (fixed, not editable): 1 USD = {calc.SAR_PER_USD:g} SAR "
+                f"(1 SAR ~= {1 / calc.SAR_PER_USD:.4f} USD)  |  "
+                f"1 USD = {calc.AED_PER_USD:g} AED (1 AED ~= {1 / calc.AED_PER_USD:.4f} USD)."
+            )
 
-        st.markdown("**PDF body template**")
-        pdf_body_options = {
-            "Template 1 - current ProQuote layout": "template1",
-            "Template 2 - proposal page + BOQ table": "template2",
-        }
-        current_pdf_body_template = repo.get_setting("pdf_body_template") or "template1"
-        current_pdf_body_label = next(
-            (label for label, value in pdf_body_options.items() if value == current_pdf_body_template),
-            list(pdf_body_options)[0],
+            saved_offer = st.form_submit_button("Save offer and pricing settings", type="primary")
+            if saved_offer:
+                repo.set_setting("offer_template", template.strip())
+                repo.set_setting("offer_number_pad", int(pad))
+                repo.set_setting("offer_types", types.strip())
+                repo.set_setting("default_margin", float(dmargin))
+                repo.set_setting("revision_format", rev_fmt.strip() or "Rev.x")
+                repo.set_setting("revision_separator", sep_opts[rev_sep_lbl])
+                repo.set_setting("eur_to_usd", float(eur_rate))
+                repo.set_setting("vat_percent", float(vat_pct))
+                st.success("Offer and pricing settings saved.")
+
+        st.divider()
+        st.markdown("##### Offer-number preview")
+        st.caption(
+            "Numbering is **per series** - each rendered template (type + year) keeps its own "
+            "counter, so LG-AV-26/... and LG-LC-26/... don't conflict."
         )
-        pdf_body_template_label = st.selectbox(
-            "Client PDF body",
-            list(pdf_body_options.keys()),
-            index=list(pdf_body_options.keys()).index(current_pdf_body_label),
-            help="Template 1 keeps the current PDF body. Template 2 follows the attached proposal/BOQ body style.",
-        )
-
-        st.markdown("**PDF header text**")
-        st.caption("Used when no full-width banner is uploaded. Optional placeholders: `{company}`, `{project}`, `{offer}`, `{page}`.")
-        htxt1, htxt2, htxt3 = st.columns(3)
-        header_left_text = htxt1.text_area("Left header", repo.get_setting("header_left_text") or "",
-                                           height=90)
-        header_middle_text = htxt2.text_area("Middle header", repo.get_setting("header_middle_text") or "",
-                                             height=90)
-        header_right_text = htxt3.text_area("Right header", repo.get_setting("header_right_text") or "",
-                                            height=90)
-
-        st.markdown("**PDF footer text**")
-        st.caption("Optional placeholders: `{company}`, `{project}`, `{offer}`, `{page}`.")
-        ftxt1, ftxt2, ftxt3 = st.columns(3)
-        footer_left_text = ftxt1.text_area("Left footer", repo.get_setting("footer_left_text") or "",
-                                           height=90)
-        footer_middle_text = ftxt2.text_area("Middle footer", repo.get_setting("footer_middle_text") or "",
-                                             height=90)
-        footer_right_text = ftxt3.text_area("Right footer", repo.get_setting("footer_right_text") or "",
-                                            height=90)
-
-        saved = st.form_submit_button("💾 Save settings", type="primary")
-        if saved:
-            repo.set_setting("offer_template", template.strip())
-            repo.set_setting("offer_number_pad", int(pad))
-            repo.set_setting("offer_types", types.strip())
-            repo.set_setting("default_margin", float(dmargin))
-            repo.set_setting("revision_format", rev_fmt.strip() or "Rev.x")
-            repo.set_setting("revision_separator", sep_opts[rev_sep_lbl])
-            repo.set_setting("eur_to_usd", float(eur_rate))
-            repo.set_setting("vat_percent", float(vat_pct))
-            repo.set_setting("company_name", company_name.strip() or "Company Name")
-            repo.set_setting("company_tagline", company_tagline.strip())
-            repo.set_setting("company_contact", company_contact.strip())
-            repo.set_setting("company_brand_color", brand_color)
-            repo.set_setting("pdf_body_template", pdf_body_options[pdf_body_template_label])
-            repo.set_setting("header_left_text", header_left_text.strip())
-            repo.set_setting("header_middle_text", header_middle_text.strip())
-            repo.set_setting("header_right_text", header_right_text.strip())
-            repo.set_setting("footer_left_text", footer_left_text.strip())
-            repo.set_setting("footer_middle_text", footer_middle_text.strip())
-            repo.set_setting("footer_right_text", footer_right_text.strip())
-            st.success("Settings saved. (Page title updates on next reload.)")
-
-    # ---- Branding images (per company; outside the form for file upload) ----
-    st.divider()
-    st.markdown("##### Branding images")
-    bcol, lcol = st.columns([2, 1])
-    with bcol:
-        st.markdown("**Banner** - full-width header (app, PDF, project sheet)")
-        if os.path.exists(db.banner_path()):
-            st.image(db.banner_path(), use_container_width=True)
-        else:
-            st.info("No banner yet.")
-        up_b = st.file_uploader("Upload / replace banner (PNG)", type=["png"], key="banner_up")
-        bb1, bb2 = st.columns(2)
-        if up_b is not None and bb1.button("Save banner", key="save_banner"):
-            with open(db.banner_path(), "wb") as f:
-                f.write(up_b.getbuffer())
-            st.success("Banner updated. (Reload to see it in the header/sidebar.)")
-            st.rerun()
-        if os.path.exists(db.banner_path()) and bb2.button("Remove banner", key="remove_banner"):
-            os.remove(db.banner_path())
-            st.success("Banner removed. PDF header sections will be used if configured.")
-            st.rerun()
-    with lcol:
-        st.markdown("**Logo** - standalone mark")
-        if os.path.exists(db.logo_path()):
-            st.image(db.logo_path(), width=160)
-        else:
-            st.info("No logo yet.")
-        up_l = st.file_uploader("Upload / replace logo (PNG)", type=["png"], key="logo_up")
-        if up_l is not None and st.button("💾 Save logo", key="save_logo"):
-            with open(db.logo_path(), "wb") as f:
-                f.write(up_l.getbuffer())
-            st.success("Logo updated.")
-            st.rerun()
-    st.caption("Banner: wide and shallow PNG, about 1400x155 px. Logo: square transparent PNG works best.")
-
-    st.divider()
-    st.markdown("##### PDF header images")
-    st.caption("The banner is the full-width PDF header. If no banner is uploaded, the left/middle/right header images and text are used. Section images work best as wide, shallow PNGs with transparent or white backgrounds.")
-    if os.path.exists(db.banner_path()):
-        st.info("A banner is currently uploaded, so header section images and text are saved but not used in the PDF until the banner is removed.")
-    head_specs = [
-        ("Left", db.header_left_path(), "header_left_up", "save_header_left", "remove_header_left"),
-        ("Middle", db.header_middle_path(), "header_middle_up", "save_header_middle", "remove_header_middle"),
-        ("Right", db.header_right_path(), "header_right_up", "save_header_right", "remove_header_right"),
-    ]
-    head_cols = st.columns(3)
-    for col, (label, path, upload_key, save_key, remove_key) in zip(head_cols, head_specs):
-        with col:
-            st.markdown(f"**{label} section image**")
-            if os.path.exists(path):
-                st.image(path, use_container_width=True)
-            else:
-                st.info("No image yet.")
-            up = st.file_uploader(f"Upload / replace {label.lower()} image (PNG)", type=["png"], key=upload_key)
-            if up is not None and st.button(f"Save {label.lower()} image", key=save_key):
-                with open(path, "wb") as f:
-                    f.write(up.getbuffer())
-                st.success(f"{label} header image updated.")
-                st.rerun()
-            if os.path.exists(path) and st.button(f"Remove {label.lower()} image", key=remove_key):
-                os.remove(path)
-                st.success(f"{label} header image removed.")
-                st.rerun()
-
-
-    st.divider()
-    st.markdown("##### PDF footer images")
-    st.caption("A full-width footer image overrides the three-section footer. If no full footer image is uploaded, the left/middle/right images and text are used. Keep footer images wide and shallow so they do not crowd quotation content.")
-    full_col, preview_col = st.columns([2, 1])
-    with full_col:
-        st.markdown("**Full footer image** - full-width footer section")
-        if os.path.exists(db.footer_full_path()):
-            st.image(db.footer_full_path(), use_container_width=True)
-        else:
-            st.info("No full footer image yet.")
-        up_footer_full = st.file_uploader("Upload / replace full footer (PNG)", type=["png"], key="footer_full_up")
-        ffu1, ffu2 = st.columns(2)
-        if up_footer_full is not None and ffu1.button("Save full footer", key="save_footer_full"):
-            with open(db.footer_full_path(), "wb") as f:
-                f.write(up_footer_full.getbuffer())
-            st.success("Full footer image updated.")
-            st.rerun()
-        if os.path.exists(db.footer_full_path()) and ffu2.button("Remove full footer", key="remove_footer_full"):
-            os.remove(db.footer_full_path())
-            st.success("Full footer image removed.")
-            st.rerun()
-    with preview_col:
-        st.info("Suggested full footer ratio: wide and shallow, similar to the header banner.")
-
-    foot_specs = [
-        ("Left", db.footer_left_path(), "footer_left_up", "save_footer_left", "remove_footer_left"),
-        ("Middle", db.footer_middle_path(), "footer_middle_up", "save_footer_middle", "remove_footer_middle"),
-        ("Right", db.footer_right_path(), "footer_right_up", "save_footer_right", "remove_footer_right"),
-    ]
-    foot_cols = st.columns(3)
-    for col, (label, path, upload_key, save_key, remove_key) in zip(foot_cols, foot_specs):
-        with col:
-            st.markdown(f"**{label} section image**")
-            if os.path.exists(path):
-                st.image(path, use_container_width=True)
-            else:
-                st.info("No image yet.")
-            up = st.file_uploader(f"Upload / replace {label.lower()} image (PNG)", type=["png"], key=upload_key)
-            if up is not None and st.button(f"Save {label.lower()} image", key=save_key):
-                with open(path, "wb") as f:
-                    f.write(up.getbuffer())
-                st.success(f"{label} footer image updated.")
-                st.rerun()
-            if os.path.exists(path) and st.button(f"Remove {label.lower()} image", key=remove_key):
-                os.remove(path)
-                st.success(f"{label} footer image removed.")
-                st.rerun()
-
-
-    st.divider()
-    st.markdown("##### Software updates")
-    gh_owner = repo.get_setting("github_owner") or "Hollako"
-    gh_repo = repo.get_setting("github_repo") or "_ProQuote"
-    st.metric("Installed version", APP_VERSION)
-    git_update_ok, git_update_message = runtime_env.git_update_available(db.APP_DIR)
-    if git_update_message:
-        st.caption(git_update_message)
-
-    if st.button("Check for updates", use_container_width=True):
-        try:
-            rel = updater.latest_release(gh_owner, gh_repo)
-            st.session_state.latest_release = rel
-            st.session_state.update_available = updater.is_newer(rel.tag, APP_VERSION)
-        except Exception as exc:
-            st.session_state.latest_release = None
-            st.session_state.update_available = False
-            st.error(str(exc))
-
-    rel = st.session_state.get("latest_release")
-    if rel:
-        if st.session_state.get("update_available"):
-            st.warning(f"New {rel.source} available: **{rel.tag}** ({rel.name})")
-            if rel.url:
-                st.link_button("Open GitHub page", rel.url, use_container_width=True)
-            if git_update_ok:
-                if st.button("Update this instance", type="primary", use_container_width=True):
-                    ok, output = updater.run_git_update(db.APP_DIR)
-                    if ok:
-                        st.success("Update downloaded. Restart this Streamlit instance to load the new code.")
-                    else:
-                        st.error("Update failed. Details below.")
-                    st.code(output or "No output", language="text")
-            else:
-                st.info(git_update_message or "Use your deployment platform or a newer installer to update this instance.")
-        else:
-            st.success(f"You are up to date. Latest {rel.source}: {rel.tag or rel.name}")
-
-    st.divider()
-    st.markdown("##### Import Excel workbooks")
-    if runtime_env.is_streamlit_cloud():
-        st.info("Folder import only works for folders visible to the server. On cloud, restore a database backup or use a future ZIP import flow.")
-    else:
-        st.caption("A safety backup is created automatically before importing.")
-    if "import_folder_path" not in st.session_state:
-        st.session_state.import_folder_path = repo.get_setting("last_import_folder") or ""
-
-    ipath_col, browse_col = st.columns([4, 1])
-    ipath_col.text_input(
-        "Folder containing Excel project folders",
-        key="import_folder_path",
-        placeholder=r"C:\Projects\Old BoQ Files",
-    )
-    if browse_col.button("Browse...", use_container_width=True):
-        picked, pick_error = _choose_local_folder(st.session_state.import_folder_path)
-        if picked:
-            st.session_state.import_folder_path = picked
-            st.rerun()
-        elif pick_error:
-            st.warning(f"Folder picker is unavailable on this machine: {pick_error}")
-
-    if st.button("Import workbooks", type="primary", use_container_width=True):
-        import_root = (st.session_state.import_folder_path or "").strip().strip('"')
-        if not import_root:
-            st.warning("Choose or enter a folder path first.")
-        elif not os.path.isdir(import_root):
-            st.error("Folder not found. Check the path and try again.")
-        else:
-            repo.set_setting("last_import_folder", import_root)
-            safety_backup = db_backup.create_backup("before-import")
-            st.info(f"Safety backup created before import: {os.path.basename(safety_backup)}")
-            progress = st.progress(0, text="Scanning Excel workbooks...")
-
-            def _import_progress(done, total, path):
-                if total:
-                    progress.progress(min(done / total, 1.0),
-                                      text=f"Importing {done}/{total}: {os.path.basename(path)}")
-
-            try:
-                with st.spinner("Importing Excel workbooks..."):
-                    stats = ingest.ingest_folder(import_root, progress=_import_progress)
-                progress.empty()
-                st.success("Import completed.")
-                m1, m2, m3, m4 = st.columns(4)
-                m1.metric("Workbooks found", stats.get("workbooks_found", 0))
-                m2.metric("Files ingested", stats.get("files", 0))
-                m3.metric("BOQ sheets", stats.get("sheets", 0))
-                m4.metric("Catalogue items", stats.get("catalogue_items", 0))
-                d1, d2, d3 = st.columns(3)
-                d1.metric("Offer lines", stats.get("lines", 0))
-                d2.metric("Spare items", stats.get("spares", 0))
-                d3.metric("Skipped", stats.get("skipped_no_boq", 0))
-                if stats.get("errors"):
-                    with st.expander(f"Import warnings / errors ({len(stats['errors'])})"):
-                        for name, err in stats["errors"][:30]:
-                            st.write(f"- {name}: {err}")
-            except Exception as exc:
-                progress.empty()
-                st.error(f"Import failed: {exc}")
-
-    st.divider()
-    st.markdown("##### Backup and restore")
-    st.caption("Database backups are small `.db` files. Full profile backups are `.zip` files that include the database and branding images from `assets/`.")
-
-    if not owner:
-        st.info("Only the owner role can create, download, or restore database backups.")
-    else:
-        b1, b2, b3 = st.columns([1, 1, 2])
-        if b1.button("Create backup", use_container_width=True):
-            try:
-                backup_path = db_backup.create_backup("manual")
-                st.session_state.latest_db_backup = backup_path
-                st.success(f"Backup created: {os.path.basename(backup_path)}")
-            except Exception as exc:
-                st.error(f"Backup failed: {exc}")
-
-        latest_backup = st.session_state.get("latest_db_backup")
-        if latest_backup and os.path.exists(latest_backup):
-            with open(latest_backup, "rb") as f:
-                b2.download_button(
-                    "Download backup",
-                    data=f.read(),
-                    file_name=os.path.basename(latest_backup),
-                    mime="application/octet-stream",
-                    use_container_width=True,
-                )
-        else:
-            b2.button("Download backup", disabled=True, use_container_width=True)
-
-        backups = db_backup.list_backups(limit=5)
-        if backups:
-            names = [f"{b['name']} ({b['size'] / 1024 / 1024:.1f} MB)" for b in backups]
-            pick = b3.selectbox("Recent backups", names, label_visibility="collapsed")
-            picked_backup = backups[names.index(pick)]
-            with open(picked_backup["path"], "rb") as f:
-                b3.download_button(
-                    "Download selected recent backup",
-                    data=f.read(),
-                    file_name=picked_backup["name"],
-                    mime="application/octet-stream",
-                    use_container_width=True,
-                )
-        else:
-            b3.info("No local backups yet.")
-
-        restore_file = st.file_uploader("Restore database from backup (.db)", type=["db"], key="restore_db_upload")
-        restore_ok = st.checkbox(
-            "I understand restore replaces the current database. A safety backup will be created first.",
-            key="restore_db_confirm",
-        )
-        if st.button("Restore database", type="primary", disabled=not (restore_file and restore_ok), use_container_width=True):
-            try:
-                restored_path, safety_backup = db_backup.restore_from_bytes(restore_file.getvalue())
-                st.success("Database restored. The app will reload now.")
-                if safety_backup:
-                    st.info(f"Safety backup created: {os.path.basename(safety_backup)}")
-                st.cache_data.clear()
-                st.cache_resource.clear()
-                st.rerun()
-            except Exception as exc:
-                st.error(f"Restore failed: {exc}")
-
-        st.markdown("**Full profile backup (database + branding images)**")
-        p1, p2, p3 = st.columns([1, 1, 2])
-        if p1.button("Create full backup", use_container_width=True):
-            try:
-                backup_path = db_backup.create_profile_backup("manual")
-                st.session_state.latest_profile_backup = backup_path
-                st.success(f"Full backup created: {os.path.basename(backup_path)}")
-            except Exception as exc:
-                st.error(f"Full backup failed: {exc}")
-
-        latest_profile_backup = st.session_state.get("latest_profile_backup")
-        if latest_profile_backup and os.path.exists(latest_profile_backup):
-            with open(latest_profile_backup, "rb") as f:
-                p2.download_button(
-                    "Download full backup",
-                    data=f.read(),
-                    file_name=os.path.basename(latest_profile_backup),
-                    mime="application/zip",
-                    use_container_width=True,
-                )
-        else:
-            p2.button("Download full backup", disabled=True, use_container_width=True)
-
-        profile_backups = db_backup.list_profile_backups(limit=5)
-        if profile_backups:
-            profile_names = [f"{b['name']} ({b['size'] / 1024 / 1024:.1f} MB)" for b in profile_backups]
-            profile_pick = p3.selectbox("Recent full backups", profile_names, label_visibility="collapsed")
-            picked_profile_backup = profile_backups[profile_names.index(profile_pick)]
-            with open(picked_profile_backup["path"], "rb") as f:
-                p3.download_button(
-                    "Download selected full backup",
-                    data=f.read(),
-                    file_name=picked_profile_backup["name"],
-                    mime="application/zip",
-                    use_container_width=True,
-                )
-        else:
-            p3.info("No local full backups yet.")
-
-        profile_restore_file = st.file_uploader(
-            "Restore full profile backup (.zip)",
-            type=["zip"],
-            key="restore_profile_upload",
-        )
-        profile_restore_ok = st.checkbox(
-            "I understand full restore replaces the current database and branding images. A full safety backup will be created first.",
-            key="restore_profile_confirm",
-        )
-        if st.button(
-            "Restore full profile",
-            type="primary",
-            disabled=not (profile_restore_file and profile_restore_ok),
-            use_container_width=True,
-        ):
-            try:
-                restored_path, safety_backup = db_backup.restore_profile_from_bytes(profile_restore_file.getvalue())
-                st.success("Full profile restored. The app will reload now.")
-                if safety_backup:
-                    st.info(f"Full safety backup created: {os.path.basename(safety_backup)}")
-                st.cache_data.clear()
-                st.cache_resource.clear()
-                st.rerun()
-            except Exception as exc:
-                st.error(f"Full restore failed: {exc}")
-
-    st.divider()
-    st.markdown("##### Offer-number preview")
-    st.caption("Numbering is **per series** - each rendered template (type + year) keeps its own "
-               "counter, so LG-AV-26/… and LG-LC-26/… don't conflict.")
-    ex_type = (repo.offer_types() or ["AV"])[0]
-    _ex = repo.make_offer_no(ex_type)
-    st.write("Next offer # examples:")
-    st.code(f"no type      :  {repo.make_offer_no('')}\n"
+        ex_type = (repo.offer_types() or ["AV"])[0]
+        _ex = repo.make_offer_no(ex_type)
+        st.write("Next offer # examples:")
+        st.code(
+            f"no type      :  {repo.make_offer_no('')}\n"
             f"type {ex_type:<6}  :  {_ex}\n"
             f"revision     :  {_ex}{repo.revision_separator()}{repo.revision_token(1)}"
-            f"   /   {_ex}{repo.revision_separator()}{repo.revision_token(2)}")
+            f"   /   {_ex}{repo.revision_separator()}{repo.revision_token(2)}"
+        )
 
-    st.divider()
-    st.markdown("##### Reset / force a starting number")
-    st.caption("Force a series to begin at a chosen number; numbering then continues "
-               "incrementing from there. (Numbers at or below the current next have no effect "
-               "- it never reuses an existing number.)")
-    rc1, rc2, rc3 = st.columns([2, 1, 1])
-    rsel = rc1.selectbox("Series (System Offer)", ["(none)"] + repo.offer_types(), key="reset_series")
-    r_otype = "" if rsel == "(none)" else rsel
-    r_next = repo.next_offer_number(r_otype)
-    r_floor = repo.get_series_start(repo.series_key(r_otype))
-    rc1.caption(f"Next: `{repo.make_offer_no(r_otype)}`"
-                + (f" · forced start: {r_floor}" if r_floor else ""))
-    start_at = rc2.number_input("Start at", min_value=1, value=max(int(r_next), 1), step=1,
-                                key="reset_start_val")
-    if rc3.button("✅ Apply", use_container_width=True):
-        repo.set_series_start(r_otype, int(start_at))
-        st.success(f"This series will start at {int(start_at)}, then continue incrementing.")
-        st.rerun()
-    if r_floor and rc3.button("↩️ Clear", use_container_width=True):
-        repo.clear_series_start(r_otype)
-        st.success("Forced start cleared - back to automatic numbering.")
-        st.rerun()
+        st.divider()
+        st.markdown("##### Reset / force a starting number")
+        st.caption(
+            "Force a series to begin at a chosen number; numbering then continues "
+            "incrementing from there. (Numbers at or below the current next have no effect "
+            "- it never reuses an existing number.)"
+        )
+        rc1, rc2, rc3 = st.columns([2, 1, 1])
+        rsel = rc1.selectbox("Series (System Offer)", ["(none)"] + repo.offer_types(), key="reset_series")
+        r_otype = "" if rsel == "(none)" else rsel
+        r_next = repo.next_offer_number(r_otype)
+        r_floor = repo.get_series_start(repo.series_key(r_otype))
+        rc1.caption(
+            f"Next: `{repo.make_offer_no(r_otype)}`"
+            + (f" | forced start: {r_floor}" if r_floor else "")
+        )
+        start_at = rc2.number_input(
+            "Start at",
+            min_value=1,
+            value=max(int(r_next), 1),
+            step=1,
+            key="reset_start_val",
+        )
+        if rc3.button("Apply", key="reset_series_apply", width="stretch"):
+            repo.set_series_start(r_otype, int(start_at))
+            st.success(f"This series will start at {int(start_at)}, then continue incrementing.")
+            st.rerun()
+        if r_floor and rc3.button("Clear", key="reset_series_clear", width="stretch"):
+            repo.clear_series_start(r_otype)
+            st.success("Forced start cleared - back to automatic numbering.")
+            st.rerun()
 
+    with tab_company:
+        st.markdown("##### Company / branding")
+        with st.form("settings_company_form"):
+            gc1, gc2 = st.columns([3, 1])
+            company_name = gc1.text_input(
+                "Company name",
+                repo.get_setting("company_name") or "",
+                help="Shown in the page title, client PDF and project sheet.",
+            )
+            brand_color = gc2.color_picker(
+                "Brand color",
+                repo.get_setting("company_brand_color") or "#002060",
+                help="Primary colour for PDF titles, table headers and footer.",
+            )
+            company_tagline = st.text_input("Tagline", repo.get_setting("company_tagline") or "")
+            company_contact = st.text_input(
+                "Contact line (city / country)",
+                repo.get_setting("company_contact") or "",
+            )
+            id1, id2 = st.columns(2)
+            company_vat_number = id1.text_input(
+                "VAT Number",
+                repo.get_setting("company_vat_number") or "",
+            )
+            company_cr_number = id2.text_input(
+                "C.R. Number",
+                repo.get_setting("company_cr_number") or "",
+            )
+            saved_company = st.form_submit_button("Save company settings", type="primary")
+            if saved_company:
+                repo.set_setting("company_name", company_name.strip() or "Company Name")
+                repo.set_setting("company_tagline", company_tagline.strip())
+                repo.set_setting("company_contact", company_contact.strip())
+                repo.set_setting("company_vat_number", company_vat_number.strip())
+                repo.set_setting("company_cr_number", company_cr_number.strip())
+                repo.set_setting("company_brand_color", brand_color)
+                st.success("Company settings saved. (Page title updates on next reload.)")
+
+    with tab_images_pdf:
+        st.markdown("##### PDF body template")
+        with st.form("settings_pdf_form"):
+            pdf_body_options = {
+                "Template 1 - current ProQuote layout": "template1",
+                "Template 2 - proposal page + BOQ table": "template2",
+            }
+            current_pdf_body_template = repo.get_setting("pdf_body_template") or "template1"
+            current_pdf_body_label = next(
+                (label for label, value in pdf_body_options.items() if value == current_pdf_body_template),
+                list(pdf_body_options)[0],
+            )
+            pdf_body_template_label = st.selectbox(
+                "Client PDF body",
+                list(pdf_body_options.keys()),
+                index=list(pdf_body_options.keys()).index(current_pdf_body_label),
+                help=(
+                    "Template 1 keeps the current PDF body. Template 2 follows the attached "
+                    "proposal/BOQ body style."
+                ),
+            )
+
+            st.markdown("**PDF header text**")
+            st.caption(
+                "Used when no full-width banner is uploaded. Optional placeholders: "
+                "`{company}`, `{project}`, `{offer}`, `{page}`, `{vat_number}` / `{vat}`, "
+                "`{cr_number}` / `{cr}`."
+            )
+            htxt1, htxt2, htxt3 = st.columns(3)
+            header_left_text = htxt1.text_area(
+                "Left header",
+                repo.get_setting("header_left_text") or "",
+                height=90,
+            )
+            header_middle_text = htxt2.text_area(
+                "Middle header",
+                repo.get_setting("header_middle_text") or "",
+                height=90,
+            )
+            header_right_text = htxt3.text_area(
+                "Right header",
+                repo.get_setting("header_right_text") or "",
+                height=90,
+            )
+
+            st.markdown("**PDF footer text**")
+            st.caption(
+                "Optional placeholders: `{company}`, `{project}`, `{offer}`, `{page}`, "
+                "`{vat_number}` / `{vat}`, `{cr_number}` / `{cr}`."
+            )
+            ftxt1, ftxt2, ftxt3 = st.columns(3)
+            footer_left_text = ftxt1.text_area(
+                "Left footer",
+                repo.get_setting("footer_left_text") or "",
+                height=90,
+            )
+            footer_middle_text = ftxt2.text_area(
+                "Middle footer",
+                repo.get_setting("footer_middle_text") or "",
+                height=90,
+            )
+            footer_right_text = ftxt3.text_area(
+                "Right footer",
+                repo.get_setting("footer_right_text") or "",
+                height=90,
+            )
+
+            saved_pdf = st.form_submit_button("Save PDF text settings", type="primary")
+            if saved_pdf:
+                repo.set_setting("pdf_body_template", pdf_body_options[pdf_body_template_label])
+                repo.set_setting("header_left_text", header_left_text.strip())
+                repo.set_setting("header_middle_text", header_middle_text.strip())
+                repo.set_setting("header_right_text", header_right_text.strip())
+                repo.set_setting("footer_left_text", footer_left_text.strip())
+                repo.set_setting("footer_middle_text", footer_middle_text.strip())
+                repo.set_setting("footer_right_text", footer_right_text.strip())
+                st.success("PDF text settings saved.")
+
+    with tab_images_pdf:
+        # ---- Branding images (per company; outside forms for file upload) ----
+        st.markdown("##### Branding images")
+        bcol, lcol = st.columns([2, 1])
+        with bcol:
+            st.markdown("**Banner** - full-width header (app, PDF, project sheet)")
+            if os.path.exists(db.banner_path()):
+                st.image(db.banner_path(), width="stretch")
+            else:
+                st.info("No banner yet.")
+            up_b = st.file_uploader("Upload / replace banner (PNG)", type=["png"], key="banner_up")
+            bb1, bb2 = st.columns(2)
+            if up_b is not None and bb1.button("Save banner", key="save_banner"):
+                with open(db.banner_path(), "wb") as f:
+                    f.write(up_b.getbuffer())
+                st.success("Banner updated. (Reload to see it in the header/sidebar.)")
+                st.rerun()
+            if os.path.exists(db.banner_path()) and bb2.button("Remove banner", key="remove_banner"):
+                os.remove(db.banner_path())
+                st.success("Banner removed. PDF header sections will be used if configured.")
+                st.rerun()
+        with lcol:
+            st.markdown("**Logo** - standalone mark")
+            if os.path.exists(db.logo_path()):
+                st.image(db.logo_path(), width=160)
+            else:
+                st.info("No logo yet.")
+            up_l = st.file_uploader("Upload / replace logo (PNG)", type=["png"], key="logo_up")
+            if up_l is not None and st.button("Save logo", key="save_logo"):
+                with open(db.logo_path(), "wb") as f:
+                    f.write(up_l.getbuffer())
+                st.success("Logo updated.")
+                st.rerun()
+        st.caption("Banner: wide and shallow PNG, about 1400x155 px. Logo: square transparent PNG works best.")
+
+        st.divider()
+        st.markdown("##### PDF header images")
+        st.caption(
+            "The banner is the full-width PDF header. If no banner is uploaded, the left/middle/right "
+            "header images and text are used. Section images work best as wide, shallow PNGs with "
+            "transparent or white backgrounds."
+        )
+        if os.path.exists(db.banner_path()):
+            st.info(
+                "A banner is currently uploaded, so header section images and text are saved but not "
+                "used in the PDF until the banner is removed."
+            )
+        head_specs = [
+            ("Left", db.header_left_path(), "header_left_up", "save_header_left", "remove_header_left"),
+            ("Middle", db.header_middle_path(), "header_middle_up", "save_header_middle", "remove_header_middle"),
+            ("Right", db.header_right_path(), "header_right_up", "save_header_right", "remove_header_right"),
+        ]
+        head_cols = st.columns(3)
+        for col, (label, path, upload_key, save_key, remove_key) in zip(head_cols, head_specs):
+            with col:
+                st.markdown(f"**{label} section image**")
+                if os.path.exists(path):
+                    st.image(path, width="stretch")
+                else:
+                    st.info("No image yet.")
+                up = st.file_uploader(
+                    f"Upload / replace {label.lower()} image (PNG)",
+                    type=["png"],
+                    key=upload_key,
+                )
+                if up is not None and st.button(f"Save {label.lower()} image", key=save_key):
+                    with open(path, "wb") as f:
+                        f.write(up.getbuffer())
+                    st.success(f"{label} header image updated.")
+                    st.rerun()
+                if os.path.exists(path) and st.button(f"Remove {label.lower()} image", key=remove_key):
+                    os.remove(path)
+                    st.success(f"{label} header image removed.")
+                    st.rerun()
+
+        st.divider()
+        st.markdown("##### PDF footer images")
+        st.caption(
+            "A full-width footer image overrides the three-section footer. If no full footer image is "
+            "uploaded, the left/middle/right images and text are used. Keep footer images wide and "
+            "shallow so they do not crowd quotation content."
+        )
+        full_col, preview_col = st.columns([2, 1])
+        with full_col:
+            st.markdown("**Full footer image** - full-width footer section")
+            if os.path.exists(db.footer_full_path()):
+                st.image(db.footer_full_path(), width="stretch")
+            else:
+                st.info("No full footer image yet.")
+            up_footer_full = st.file_uploader(
+                "Upload / replace full footer (PNG)",
+                type=["png"],
+                key="footer_full_up",
+            )
+            ffu1, ffu2 = st.columns(2)
+            if up_footer_full is not None and ffu1.button("Save full footer", key="save_footer_full"):
+                with open(db.footer_full_path(), "wb") as f:
+                    f.write(up_footer_full.getbuffer())
+                st.success("Full footer image updated.")
+                st.rerun()
+            if os.path.exists(db.footer_full_path()) and ffu2.button("Remove full footer", key="remove_footer_full"):
+                os.remove(db.footer_full_path())
+                st.success("Full footer image removed.")
+                st.rerun()
+        with preview_col:
+            st.info("Suggested full footer ratio: wide and shallow, similar to the header banner.")
+
+        foot_specs = [
+            ("Left", db.footer_left_path(), "footer_left_up", "save_footer_left", "remove_footer_left"),
+            ("Middle", db.footer_middle_path(), "footer_middle_up", "save_footer_middle", "remove_footer_middle"),
+            ("Right", db.footer_right_path(), "footer_right_up", "save_footer_right", "remove_footer_right"),
+        ]
+        foot_cols = st.columns(3)
+        for col, (label, path, upload_key, save_key, remove_key) in zip(foot_cols, foot_specs):
+            with col:
+                st.markdown(f"**{label} section image**")
+                if os.path.exists(path):
+                    st.image(path, width="stretch")
+                else:
+                    st.info("No image yet.")
+                up = st.file_uploader(
+                    f"Upload / replace {label.lower()} image (PNG)",
+                    type=["png"],
+                    key=upload_key,
+                )
+                if up is not None and st.button(f"Save {label.lower()} image", key=save_key):
+                    with open(path, "wb") as f:
+                        f.write(up.getbuffer())
+                    st.success(f"{label} footer image updated.")
+                    st.rerun()
+                if os.path.exists(path) and st.button(f"Remove {label.lower()} image", key=remove_key):
+                    os.remove(path)
+                    st.success(f"{label} footer image removed.")
+                    st.rerun()
+
+    with tab_data:
+        st.markdown("##### Import Excel workbooks")
+        st.caption(
+            "A safety backup is created automatically before importing. Imports work "
+            "on any deployment (upload through the browser)."
+        )
+
+        # ---- Primary: upload through the browser (works locally AND when deployed) ----
+        uploads = st.file_uploader(
+            "Upload Excel workbooks (.xlsx / .xlsm) - or a single .zip of your project folder",
+            type=["xlsx", "xlsm", "zip"],
+            accept_multiple_files=True,
+            key="import_uploads",
+            help="Select the files from your computer. A .zip keeps any sub-folder structure.",
+        )
+        if st.button(
+            "Import uploaded files",
+            type="primary",
+            width="stretch",
+            disabled=not uploads,
+        ):
+            import tempfile, zipfile, shutil
+
+            tmpdir = tempfile.mkdtemp(prefix="pq_import_")
+            try:
+                saved = 0
+                for f in uploads:
+                    if f.name.lower().endswith(".zip"):
+                        try:
+                            with zipfile.ZipFile(io.BytesIO(f.getbuffer())) as z:
+                                z.extractall(tmpdir)
+                            saved += 1
+                        except zipfile.BadZipFile:
+                            st.error(f"'{f.name}' is not a valid .zip file.")
+                    else:
+                        with open(os.path.join(tmpdir, f.name), "wb") as out:
+                            out.write(f.getbuffer())
+                        saved += 1
+                if saved:
+                    _run_excel_import(tmpdir)
+            finally:
+                shutil.rmtree(tmpdir, ignore_errors=True)
+
+        # ---- Secondary: a folder already on the server / this machine ----
+        with st.expander("Or import from a folder on the server (files must be on the host)"):
+            # Apply a pending Browse pick BEFORE the widget is created. You cannot set a
+            # widget-keyed session_state value after that widget exists in the same run.
+            if "_import_folder_pick" in st.session_state:
+                st.session_state.import_folder_path = st.session_state.pop("_import_folder_pick")
+            if "import_folder_path" not in st.session_state:
+                st.session_state.import_folder_path = repo.get_setting("last_import_folder") or ""
+            ipath_col, browse_col = st.columns([4, 1])
+            ipath_col.text_input(
+                "Folder path on the server",
+                key="import_folder_path",
+                placeholder=r"C:\Projects\Old BoQ Files  (or /data/imports on a Linux host)",
+            )
+            # The OS folder dialog only works when the server IS a local Windows desktop.
+            if os.name == "nt":
+                if browse_col.button("Browse...", width="stretch"):
+                    picked, pick_error = _choose_local_folder(st.session_state.import_folder_path)
+                    if picked:
+                        st.session_state["_import_folder_pick"] = picked   # deferred; applied next run
+                        st.rerun()
+                    elif pick_error:
+                        st.warning(f"Folder picker unavailable: {pick_error}")
+            if st.button("Import from server folder", width="stretch"):
+                import_root = (st.session_state.import_folder_path or "").strip().strip('"')
+                if not import_root:
+                    st.warning("Enter a folder path first.")
+                elif not os.path.isdir(import_root):
+                    st.error("Folder not found on the server. Use the upload option above instead.")
+                else:
+                    repo.set_setting("last_import_folder", import_root)
+                    _run_excel_import(import_root)
+
+        st.divider()
+        st.markdown("##### Clean database (migrated data)")
+        if not owner:
+            st.info("Only the owner role can run database clean-up.")
+        else:
+            st.caption(
+                "Fix-ups for offers imported from old Excel files. Each shows a preview "
+                "first and creates a safety backup before applying."
+            )
+
+            # ---- 1) Stamp year from offer number ----
+            st.markdown(
+                "**Stamp date from project name / offer #** - uses the full date in the "
+                "name (e.g. ...-24.03.2024 -> 2024-03-24); if there's only a year in the offer "
+                "ref, it fixes the year and keeps the month/day."
+            )
+            if st.button("Preview year stamping", key="prev_year"):
+                st.session_state["clean_year"] = repo.cleanup_stamp_years(apply=False)
+            yp = st.session_state.get("clean_year")
+            if yp:
+                st.write(
+                    f"Will update **{yp['to_update']}** | already correct {yp['already_ok']} | "
+                    f"no year in offer # {yp['no_year']}"
+                )
+                if yp["sample"]:
+                    st.dataframe(
+                        pd.DataFrame(yp["sample"], columns=["ProjectID", "Offer #", "Old date", "New date"]),
+                        hide_index=True,
+                        width="stretch",
+                    )
+                    st.caption(
+                        f"Sample only - showing the first {len(yp['sample'])} of "
+                        f"**{yp['to_update']}**. Clicking Apply updates all {yp['to_update']}."
+                    )
+                if yp["to_update"] and st.button(
+                    "Apply year stamping (creates backup)",
+                    type="primary",
+                    key="apply_year",
+                ):
+                    db_backup.create_profile_backup("before-year-cleanup")
+                    res = repo.cleanup_stamp_years(apply=True)
+                    st.session_state.pop("clean_year", None)
+                    st.success(f"Stamped year on {res['to_update']} offers. Backup created first.")
+                    st.rerun()
+
+            st.markdown("---")
+            # ---- 2) Merge revisions (Rxx) ----
+            st.markdown(
+                "**Merge revisions (Rxx)** - links offers like `...-R01 / -R02` into one "
+                "offer with multiple revisions (R01 -> Rev 1, no suffix -> original)."
+            )
+            if st.button("Preview revision merge", key="prev_rev"):
+                st.session_state["clean_rev"] = repo.cleanup_merge_revisions(apply=False)
+            rp = st.session_state.get("clean_rev")
+            if rp:
+                st.write(
+                    f"Will link **{rp['to_update']}** revision offers into **{rp['families']}** "
+                    "offer families."
+                )
+                if rp["sample"]:
+                    st.dataframe(
+                        pd.DataFrame(rp["sample"], columns=["ProjectID", "Offer #", "Rev #", "Base offer #"]),
+                        hide_index=True,
+                        width="stretch",
+                    )
+                    st.caption(
+                        f"Sample only - showing the first {len(rp['sample'])} of "
+                        f"**{rp['to_update']}**. Clicking Apply updates all {rp['to_update']}."
+                    )
+                if rp["to_update"] and st.button(
+                    "Apply revision merge (creates backup)",
+                    type="primary",
+                    key="apply_rev",
+                ):
+                    db_backup.create_profile_backup("before-revision-cleanup")
+                    res = repo.cleanup_merge_revisions(apply=True)
+                    st.session_state.pop("clean_rev", None)
+                    st.success(
+                        f"Linked {res['to_update']} revisions into {res['families']} families. "
+                        "Backup created first."
+                    )
+                    st.rerun()
+
+            st.markdown("---")
+            # ---- 3) Parse client from project name ----
+            st.markdown(
+                "**Parse client from project name** - fills the **Client** field (only where "
+                "it's blank) from the name, e.g. `...Al Rashed Farm-Laptop...` -> **Al Rashed Farm**."
+            )
+            if st.button("Preview client parsing", key="prev_client"):
+                st.session_state["clean_client"] = repo.cleanup_parse_clients(apply=False)
+            cp = st.session_state.get("clean_client")
+            if cp:
+                st.write(f"Will set Client on **{cp['to_update']}** offers that are currently blank.")
+                if cp["sample"]:
+                    st.dataframe(
+                        pd.DataFrame(cp["sample"], columns=["ProjectID", "Project name", "-> Client"]),
+                        hide_index=True,
+                        width="stretch",
+                    )
+                    st.caption(
+                        f"Sample only - showing the first {len(cp['sample'])} of "
+                        f"**{cp['to_update']}**. Review these - if the client looks wrong, "
+                        "don't apply and tell me the pattern."
+                    )
+                if cp["to_update"] and st.button(
+                    "Apply client parsing (creates backup)",
+                    type="primary",
+                    key="apply_client",
+                ):
+                    db_backup.create_profile_backup("before-client-cleanup")
+                    res = repo.cleanup_parse_clients(apply=True)
+                    st.session_state.pop("clean_client", None)
+                    st.success(f"Set client on {res['to_update']} offers. Backup created first.")
+                    st.rerun()
+
+            st.markdown("---")
+            # ---- Clear everything for a clean re-import ----
+            st.markdown("**Clear all imported data (for a fresh re-import)**")
+            st.caption(
+                "Deletes ALL projects (and their lines, finance) and the catalogue - keeps "
+                "users, roles, settings and branding. A full backup is created first. Use this "
+                "before re-importing so the import doesn't create duplicates."
+            )
+            clr_ok = st.checkbox(
+                "Yes - wipe all projects & catalogue (a backup is created first).",
+                key="clear_confirm",
+            )
+            if st.button("Clear & prepare for fresh import", disabled=not clr_ok, key="do_clear"):
+                bk = db_backup.create_profile_backup("before-fresh-import")
+                res = repo.clear_imported_data()
+                st.session_state.pop("clear_confirm", None)
+                st.success(
+                    f"Cleared {res['projects']} projects and {res['catalogue']} catalogue items. "
+                    f"Backup: {os.path.basename(bk)}. Now re-import your files (top of this page)."
+                )
+                st.rerun()
+
+    with tab_backup:
+        st.markdown("##### Backup and restore")
+        st.caption(
+            "Backups are `.zip` files that include the database and branding images from `assets/`."
+        )
+
+        if not owner:
+            st.info("Only the owner role can create, download, or restore backups.")
+        else:
+            b1, b2, b3 = st.columns([1, 1, 2])
+            if b1.button("Create backup", width="stretch"):
+                try:
+                    backup_path = db_backup.create_profile_backup("manual")
+                    st.session_state.latest_profile_backup = backup_path
+                    st.success(f"Backup created: {os.path.basename(backup_path)}")
+                except Exception as exc:
+                    st.error(f"Backup failed: {exc}")
+
+            latest_backup = st.session_state.get("latest_profile_backup")
+            if latest_backup and os.path.exists(latest_backup):
+                with open(latest_backup, "rb") as f:
+                    b2.download_button(
+                        "Download backup",
+                        data=f.read(),
+                        file_name=os.path.basename(latest_backup),
+                        mime="application/zip",
+                        width="stretch",
+                    )
+            else:
+                b2.button("Download backup", disabled=True, width="stretch")
+
+            backups = db_backup.list_profile_backups(limit=5)
+            if backups:
+                names = [f"{b['name']} ({b['size'] / 1024 / 1024:.1f} MB)" for b in backups]
+                pick = b3.selectbox("Recent backups", names, label_visibility="collapsed")
+                picked_backup = backups[names.index(pick)]
+                with open(picked_backup["path"], "rb") as f:
+                    b3.download_button(
+                        "Download selected recent backup",
+                        data=f.read(),
+                        file_name=picked_backup["name"],
+                        mime="application/zip",
+                        width="stretch",
+                    )
+            else:
+                b3.info("No local backups yet.")
+
+            restore_file = st.file_uploader(
+                "Restore from backup (.zip)",
+                type=["zip"],
+                key="restore_zip_upload",
+            )
+            restore_ok = st.checkbox(
+                "I understand restore replaces the current database and branding images. A safety backup will be created first.",
+                key="restore_zip_confirm",
+            )
+            if st.button(
+                "Restore backup",
+                type="primary",
+                disabled=not (restore_file and restore_ok),
+                width="stretch",
+            ):
+                try:
+                    restored_path, safety_backup = db_backup.restore_profile_from_bytes(restore_file.getvalue())
+                    st.success("Backup restored. The app will reload now.")
+                    if safety_backup:
+                        st.info(f"Safety backup created: {os.path.basename(safety_backup)}")
+                    st.cache_data.clear()
+                    st.cache_resource.clear()
+                    st.rerun()
+                except Exception as exc:
+                    st.error(f"Restore failed: {exc}")
+
+    with tab_updates:
+        st.markdown("##### Software updates")
+        gh_owner = repo.get_setting("github_owner") or "Hollako"
+        gh_repo = repo.get_setting("github_repo") or "_ProQuote"
+        st.metric("Installed version", APP_VERSION)
+        git_update_ok, git_update_message = runtime_env.git_update_available(db.APP_DIR)
+        if git_update_message:
+            st.caption(git_update_message)
+
+        if st.button("Check for updates", width="stretch"):
+            try:
+                rel = updater.latest_release(gh_owner, gh_repo)
+                st.session_state.latest_release = rel
+                st.session_state.update_available = updater.is_newer(rel.tag, APP_VERSION)
+            except Exception as exc:
+                st.session_state.latest_release = None
+                st.session_state.update_available = False
+                st.error(str(exc))
+
+        rel = st.session_state.get("latest_release")
+        if rel:
+            if st.session_state.get("update_available"):
+                st.warning(f"New {rel.source} available: **{rel.tag}** ({rel.name})")
+                if rel.url:
+                    st.link_button("Open GitHub page", rel.url, width="stretch")
+                if git_update_ok:
+                    if st.button("Update this instance", type="primary", width="stretch"):
+                        ok, output = updater.run_git_update(db.APP_DIR)
+                        if ok:
+                            st.success("Update downloaded. Restart this Streamlit instance to load the new code.")
+                        else:
+                            st.error("Update failed. Details below.")
+                        st.code(output or "No output", language="text")
+                else:
+                    st.info(
+                        git_update_message
+                        or "Use your deployment platform or a newer installer to update this instance."
+                    )
+            else:
+                st.success(f"You are up to date. Latest {rel.source}: {rel.tag or rel.name}")
 
 # ============================ USERS (owner) ============================
 elif mode == "Users":
@@ -2684,7 +3246,7 @@ elif mode == "Users":
                 active = cc[3].toggle("On", value=bool(u["Active"]), key=f"act_{uid}",
                                       label_visibility="collapsed")
                 if (new_role != u["Role"] or active != bool(u["Active"])):
-                    if cc[4].button("💾 Save", key=f"saveu_{uid}", use_container_width=True):
+                    if cc[4].button("💾 Save", key=f"saveu_{uid}", width="stretch"):
                         if last_owner and (new_role != auth.PROTECTED_ROLE or not active):
                             st.warning("Can't remove the last active owner.")
                         else:
@@ -2695,12 +3257,12 @@ elif mode == "Users":
                 newpw = pc[0].text_input("pw", type="password", key=f"pw_{uid}",
                                          label_visibility="collapsed",
                                          placeholder="New password (blank = keep)")
-                if pc[1].button("🔑 Set password", key=f"setpw_{uid}", use_container_width=True,
+                if pc[1].button("🔑 Set password", key=f"setpw_{uid}", width="stretch",
                                 disabled=not newpw):
                     auth.set_password(uid, newpw)
                     st.toast(f"Password updated for {u['Username']}.")
                     st.rerun()
-                if pc[2].button("Delete", key=f"delu_{uid}", use_container_width=True,
+                if pc[2].button("Delete", key=f"delu_{uid}", width="stretch",
                                 disabled=is_self or last_owner):
                     auth.delete_user(uid)
                     st.toast(f"Deleted {u['Username']}.")
@@ -2724,7 +3286,7 @@ elif mode == "Users":
         for _, label in auth.PERMISSIONS:
             colcfg[label] = st.column_config.CheckboxColumn(label)
         edited = st.data_editor(mat, column_config=colcfg, hide_index=True,
-                                num_rows="fixed", use_container_width=True,
+                                num_rows="fixed", width="stretch",
                                 disabled=["Role"], key="role_matrix")
 
         if st.button("💾 Save role permissions", type="primary"):
@@ -2745,7 +3307,7 @@ elif mode == "Users":
             new_role_name = arc1.text_input("New role name", key="new_role_name",
                                             label_visibility="collapsed",
                                             placeholder="e.g. Estimator")
-            if arc2.button("➕ Add", use_container_width=True):
+            if arc2.button("➕ Add", width="stretch"):
                 if auth.add_role(new_role_name):
                     st.toast(f"Added role '{new_role_name.strip()}'.")
                     st.rerun()
@@ -2757,7 +3319,7 @@ elif mode == "Users":
             drc1, drc2 = st.columns([3, 1.4], vertical_alignment="bottom")
             drole = drc1.selectbox("Role to delete", deletable, key="del_role",
                                    label_visibility="collapsed") if deletable else None
-            if drc2.button("Delete", use_container_width=True, disabled=not deletable):
+            if drc2.button("Delete", width="stretch", disabled=not deletable):
                 in_use = auth.role_user_count(drole)
                 if in_use:
                     st.warning(f"{in_use} user(s) still have the '{drole}' role - "

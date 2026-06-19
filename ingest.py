@@ -25,8 +25,28 @@ import openpyxl
 
 import calc
 import db as dbmod
+import repo
 
 DEFAULT_ROOT = r"J:\My Drive\1-Projects"
+
+
+def _parse_date_text(text):
+    """ISO date from a string: a DD.MM.YYYY anywhere, or a worded date like
+    'May 13,2026'. Returns 'YYYY-MM-DD' or None."""
+    s = str(text or "").strip()
+    if not s:
+        return None
+    m = re.search(r"(\d{1,2})\.(\d{1,2})\.(20\d{2})", s)
+    if m:
+        d, mo, y = int(m.group(1)), int(m.group(2)), int(m.group(3))
+        if 1 <= d <= 31 and 1 <= mo <= 12:
+            return f"{y:04d}-{mo:02d}-{d:02d}"
+    for fmt in ("%B %d,%Y", "%B %d, %Y", "%d %B %Y", "%Y-%m-%d", "%d/%m/%Y"):
+        try:
+            return dt.datetime.strptime(s, fmt).date().isoformat()
+        except ValueError:
+            pass
+    return None
 
 # Canonical BOQ columns -> normalized keys. Detection matches these labels
 # (lowercased, punctuation-stripped) against the header row.
@@ -220,7 +240,8 @@ def _find_quotation_sheet(wb, suffix):
 def parse_quotation_meta(wb, suffix):
     """Pull client/project/offer metadata from the matching Quotation sheet."""
     ws = _find_quotation_sheet(wb, suffix)
-    meta = {"client": None, "project": None, "contact": None, "offer": None, "date": None}
+    meta = {"client": None, "project": None, "contact": None, "offer": None,
+            "date": None, "sales": None}
     if ws is None:
         return meta
     labels = {
@@ -241,6 +262,27 @@ def parse_quotation_meta(wb, suffix):
                     if norm(val) in labels:          # adjacent label, not a value
                         break
                     meta[labels[key]] = val
+                    break
+
+    # Single-cell labelled fields ("M/S MJS", "Project:Rowleys...", "Reference: ...",
+    # "From: ...", "Date:..."). Only fill what the label|value pass left blank.
+    prefixes = [("m/s", "client"), ("messrs", "client"),
+                ("project:", "project"), ("project :", "project"),
+                ("reference:", "offer"), ("offer #:", "offer"), ("offer no:", "offer"),
+                ("from:", "sales"), ("date:", "date"), ("date :", "date"),
+                ("attn:", "contact"), ("attn :", "contact"), ("attention:", "contact")]
+    for r in range(1, min(ws.max_row, 20) + 1):
+        for c in range(1, min(ws.max_column, 9) + 1):
+            v = ws.cell(row=r, column=c).value
+            if not isinstance(v, str):
+                continue
+            vs = v.strip()
+            low = vs.lower()
+            for pref, field in prefixes:
+                if low.startswith(pref) and not meta.get(field):
+                    val = vs[len(pref):].strip(" :\t ")
+                    if val:
+                        meta[field] = val
                     break
     return meta
 
@@ -311,6 +353,32 @@ def system_suffix(sheet_name):
     return re.sub(r"^\s*boq\s*", "", sheet_name, flags=re.I).strip()
 
 
+# Sheets that are never the priced BoQ grid (matched by name prefix).
+_NON_GRID_SHEETS = ("pivot", "quotation", "mark up", "markup", "sheet", "balance",
+                    "summary", "cost", "profit")
+
+
+def _detect_boq_sheets(wb):
+    """BoQ grid sheets = any 'BOQ*'-named sheet, PLUS any other sheet (not Pivot /
+    Quotation / Mark Up / Sheet1 / …) that has a recognizable BoQ header (the grid
+    is often named by system/area, e.g. 'Sound System', 'LANDSCAPE AREA')."""
+    out = []
+    for s in wb.sheetnames:
+        sl = s.lower().strip()
+        if sl.startswith("boq"):
+            out.append(s)
+            continue
+        if any(sl.startswith(x) for x in _NON_GRID_SHEETS):
+            continue
+        try:
+            hdr, _ = find_header(wb[s])
+        except Exception:
+            hdr = None
+        if hdr is not None:
+            out.append(s)
+    return out
+
+
 def upsert_item(conn, ln, src_file, now):
     """Upsert into Items_Catalog by (Brand, Model, Description); refresh defaults."""
     if not (ln.get("description") or ln.get("model")):
@@ -356,13 +424,13 @@ def ingest_file(conn, path, stats):
         stats["errors"].append((os.path.basename(path), repr(e)[:90]))
         return
 
-    boq_sheets = [s for s in wb.sheetnames if s.lower().strip().startswith("boq")]
+    boq_sheets = _detect_boq_sheets(wb)
     if not boq_sheets:
         wb.close()
         stats["skipped_no_boq"] += 1
         return
 
-    # remove any prior ingest of this exact file (idempotent)
+    # Idempotent by full path: re-ingesting the same file replaces its prior copy.
     conn.execute("DELETE FROM Projects_Master WHERE SourceFile=?", (path,))
 
     # project-level metadata from the first system's Quotation sheet
@@ -370,19 +438,37 @@ def ingest_file(conn, path, stats):
     qmeta = parse_quotation_meta(wb, first_suffix)
     qterms = parse_quotation_terms(wb, first_suffix)
     terms_json = json.dumps(qterms) if qterms else None
-    cdate = None
-    if isinstance(qmeta.get("date"), (dt.date, dt.datetime)):
-        cdate = qmeta["date"].date().isoformat() if isinstance(qmeta["date"], dt.datetime) else qmeta["date"].isoformat()
+    fname = os.path.basename(path)
+    # CreationDate: Quotation date cell -> a date in the filename -> file mtime.
+    qd = qmeta.get("date")
+    if isinstance(qd, (dt.date, dt.datetime)):
+        cdate = qd.date().isoformat() if isinstance(qd, dt.datetime) else qd.isoformat()
+    else:
+        cdate = _parse_date_text(qd) or _parse_date_text(fname)
     if not cdate:
         cdate = dt.datetime.fromtimestamp(os.path.getmtime(path)).date().isoformat()
-    project_name = str(qmeta.get("project") or os.path.splitext(os.path.basename(path))[0]).strip()
+    project_name = str(qmeta.get("project") or os.path.splitext(fname)[0]).strip()
+
+    # Offer number + revision: base ref from the Quotation 'Reference' (else the
+    # filename), revision from a trailing 'R0x'; OfferNo written in the configured
+    # revision format so an offer + its revisions group as one family.
+    ref_raw = _s(qmeta.get("offer")) or (repo.parse_offer_ref(fname)[0] or "")
+    base_ref = repo.base_name(ref_raw) if ref_raw else ""
+    revno = repo.parse_revision_no(fname) or repo.parse_revision_no(ref_raw)
+    if base_ref and revno:
+        offer_no = f"{base_ref}{repo.revision_separator()}{repo.revision_token(revno)}"
+    else:
+        offer_no = base_ref or _s(qmeta.get("offer"))
+    base_name_val = base_ref or None
 
     cur = conn.execute(
         """INSERT INTO Projects_Master
-             (ProjectName,ClientName,ContactName,OfferNo,CreationDate,SourceFile,IngestedAt,OfferTerms)
-           VALUES (?,?,?,?,?,?,?,?)""",
+             (ProjectName,ClientName,ContactName,SalesPerson,OfferNo,CreationDate,
+              RevisionNo,BaseName,SourceFile,IngestedAt,OfferTerms)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
         (project_name, _s(qmeta.get("client")), _s(qmeta.get("contact")),
-         _s(qmeta.get("offer")), cdate, path, now, terms_json),
+         _s(qmeta.get("sales")), offer_no, cdate, revno or 0, base_name_val,
+         path, now, terms_json),
     )
     pid = cur.lastrowid
     primary_discount = None

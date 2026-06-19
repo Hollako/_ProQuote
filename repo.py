@@ -83,10 +83,12 @@ def _revision_strip_pattern() -> str:
 
 
 def base_name(name) -> str:
-    """Strip a trailing revision suffix (configured format, plus legacy 'Rev.N')."""
+    """Strip a trailing revision suffix (configured format, plus legacy 'Rev.N'
+    and migrated 'R01/R02' numbering) so an offer groups with its revisions."""
     s = _str(name)
     s = re.sub(_revision_strip_pattern(), "", s, flags=re.I)
     s = re.sub(r"\s*[-/_.: ]?\s*rev\.?\s*\d+\s*$", "", s, flags=re.I)   # legacy / mixed data
+    s = re.sub(r"\s*[-/_.: ]\s*r\d+\s*$", "", s, flags=re.I)           # migrated 'R01/R02'
     return s.strip() or "Offer"
 
 
@@ -107,13 +109,15 @@ DEFAULT_SETTINGS = {
     "company_name": "Company Name",
     "company_tagline": "Smart & Low-Current Systems",
     "company_contact": "Riyadh, Kingdom of Saudi Arabia",
+    "company_vat_number": "",
+    "company_cr_number": "",
     "company_brand_color": "#002060",
     # PDF header. The full-width banner image overrides these section settings.
-    # Placeholders: {company}, {project}, {offer}, {page}.
+    # Placeholders: {company}, {project}, {offer}, {page}, {vat_number}, {cr_number}.
     "header_left_text": "{company}",
     "header_middle_text": "",
     "header_right_text": "{offer}",
-    # PDF footer. Placeholders: {company}, {project}, {offer}, {page}.
+    # PDF footer. Placeholders: {company}, {project}, {offer}, {page}, {vat_number}, {cr_number}.
     "footer_left_text": "{company} - {project}",
     "footer_middle_text": "",
     "footer_right_text": "Page {page}",
@@ -248,6 +252,165 @@ def next_revision(base: str) -> int:
         r = c.execute("SELECT MAX(RevisionNo) m FROM Projects_Master WHERE BaseName=?",
                       (base,)).fetchone()
     return (r["m"] or 0) + 1
+
+
+# ---------- Clean database (migrated-data fix-ups) ----------
+
+# Offer reference at the start, e.g. "LG-AV-25-2098" / "LK-LC-24-2027" /
+# "OFR-SWS-RUH-26-024": <code>-<YY>-<number>. Group 1 = full ref, group 2 = YY.
+_REF_RE = re.compile(r"^\s*(\S+?-(\d{2})-[A-Za-z0-9]+)")
+# Revision marker right after the ref, e.g. "... -2027 R02 ...".
+_REV_RE = re.compile(r"-\d{2}-[A-Za-z0-9]+\s+R(\d+)\b", re.I)
+# A full date embedded as DD.MM.YYYY (the offer ref uses dashes, so this only
+# matches the trailing real date).
+_DATE_RE = re.compile(r"(\d{1,2})\.(\d{1,2})\.(20\d{2})")
+
+
+def parse_offer_ref(text):
+    """Return (ref_code, year) from an offer reference like LK-LC-24-2027 -> ('LK-LC-24-2027', 2024)."""
+    m = _REF_RE.match(_str(text))
+    if not m:
+        return None, None
+    yy = int(m.group(2))
+    return m.group(1), (2000 + yy if 20 <= yy <= 39 else None)
+
+
+def parse_revision_no(text) -> int:
+    """Revision number from an 'R<n>' right after the offer ref (0 = original)."""
+    m = _REV_RE.search(_str(text))
+    return int(m.group(1)) if m else 0
+
+
+def parse_full_date(text) -> str | None:
+    """Full date from a trailing DD.MM.YYYY -> 'YYYY-MM-DD' (last valid one wins)."""
+    best = None
+    for m in _DATE_RE.finditer(_str(text)):
+        d, mo, y = int(m.group(1)), int(m.group(2)), int(m.group(3))
+        if 1 <= d <= 31 and 1 <= mo <= 12:
+            best = f"{y:04d}-{mo:02d}-{d:02d}"
+    return best
+
+
+def cleanup_stamp_years(apply: bool = False) -> dict:
+    """Set each offer's CreationDate from its project name / offer #: the full
+    DD.MM.YYYY date if present, else the year from the offer ref (keep month/day)."""
+    changes, none_found, already = [], 0, 0
+    with _conn() as c:
+        rows = c.execute(
+            "SELECT ProjectID,OfferNo,ProjectName,CreationDate FROM Projects_Master"
+        ).fetchall()
+    for r in rows:
+        name, off = _str(r["ProjectName"]), _str(r["OfferNo"])
+        new = parse_full_date(name) or parse_full_date(off)
+        if not new:                                  # no full date -> try the ref year
+            _ref, yr = parse_offer_ref(off)
+            if not yr:
+                _ref, yr = parse_offer_ref(name)
+            if not yr:
+                none_found += 1
+                continue
+            cd = _str(r["CreationDate"])
+            mo = re.match(r"(\d{4})-(\d{2})-(\d{2})", cd)
+            mm_dd = f"{mo.group(2)}-{mo.group(3)}" if mo else "01-01"
+            new = f"{yr}-{mm_dd}"
+        if _str(r["CreationDate"]) == new:
+            already += 1
+            continue
+        label = (off or name)[:48]
+        changes.append((r["ProjectID"], label, _str(r["CreationDate"]) or "(none)", new))
+    if apply and changes:
+        with _conn() as c:
+            for pid, _l, _old, new in changes:
+                c.execute("UPDATE Projects_Master SET CreationDate=? WHERE ProjectID=?", (new, pid))
+            c.commit()
+    return {"to_update": len(changes), "no_year": none_found, "already_ok": already,
+            "sample": changes[:50]}
+
+
+def cleanup_merge_revisions(apply: bool = False) -> dict:
+    """Link '<ref> R01/R02' offers into one family: write the clean offer ref into
+    OfferNo (so they group), set RevisionNo from the Rxx, and BaseName to the ref."""
+    updates, changes = [], []
+    with _conn() as c:
+        rows = c.execute(
+            "SELECT ProjectID,OfferNo,ProjectName,RevisionNo,BaseName FROM Projects_Master"
+        ).fetchall()
+    for r in rows:
+        ref, _y = parse_offer_ref(r["OfferNo"])
+        text = _str(r["OfferNo"])
+        if not ref:
+            ref, _y = parse_offer_ref(r["ProjectName"])
+            text = _str(r["ProjectName"])
+        if not ref:
+            continue                                 # no recognizable ref -> skip
+        revno = parse_revision_no(text)
+        # Write the revision suffix in the company's configured format (Settings →
+        # Revision format / separator), e.g. " R01" (Rxx) or "-Rev.1" (Rev.x).
+        new_off = f"{ref}{revision_separator()}{revision_token(revno)}" if revno else ref
+        if (int(r["RevisionNo"] or 0) == revno and _str(r["BaseName"]) == ref
+                and _str(r["OfferNo"]) == new_off):
+            continue
+        updates.append((r["ProjectID"], new_off, revno, ref))
+        changes.append((r["ProjectID"], new_off, revno, ref))
+    if apply and updates:
+        with _conn() as c:
+            for pid, new_off, revno, ref in updates:
+                c.execute("UPDATE Projects_Master SET OfferNo=?, RevisionNo=?, BaseName=? "
+                          "WHERE ProjectID=?", (new_off, revno, ref, pid))
+            c.commit()
+    return {"to_update": len(changes), "families": len({ch[3] for ch in changes}),
+            "sample": changes[:50]}
+
+
+def parse_client_from_name(name) -> str | None:
+    """Best-effort client from a migrated project name: drop the offer ref, revision
+    and trailing date, then take the part before the scope (' - ' else last '-')."""
+    s = _str(name)
+    if not s:
+        return None
+    s = _DATE_RE.sub("", s)                                  # remove DD.MM.YYYY
+    s = re.sub(r"^\s*\S+?-\d{2}-[A-Za-z0-9]+\s*", "", s)     # strip leading offer ref
+    s = re.sub(r"^\s*R\d+\s+", "", s)                        # strip leading revision
+    s = s.strip(" -")
+    if not s:
+        return None
+    if " - " in s:                                           # explicit client / scope split
+        s = s.split(" - ", 1)[0]
+    elif "-" in s:                                           # scope is the last '-segment'
+        s = s.rsplit("-", 1)[0]
+    return s.strip() or None
+
+
+def cleanup_parse_clients(apply: bool = False) -> dict:
+    """Fill ClientName from the project name for offers where it's currently blank."""
+    changes = []
+    with _conn() as c:
+        rows = c.execute("SELECT ProjectID,ProjectName,ClientName FROM Projects_Master").fetchall()
+    for r in rows:
+        if _str(r["ClientName"]):
+            continue                                          # keep existing clients
+        cl = parse_client_from_name(r["ProjectName"])
+        if not cl:
+            continue
+        changes.append((r["ProjectID"], _str(r["ProjectName"])[:48], cl))
+    if apply and changes:
+        with _conn() as c:
+            for pid, _n, cl in changes:
+                c.execute("UPDATE Projects_Master SET ClientName=? WHERE ProjectID=?", (cl, pid))
+            c.commit()
+    return {"to_update": len(changes), "sample": changes[:50]}
+
+
+def clear_imported_data() -> dict:
+    """Delete ALL projects (cascades to lines/sheets/finance) and catalogue items,
+    for a clean re-import. Keeps Settings, Users, Roles and branding."""
+    with _conn() as c:
+        np = c.execute("SELECT COUNT(*) FROM Projects_Master").fetchone()[0]
+        nc = c.execute("SELECT COUNT(*) FROM Items_Catalog").fetchone()[0]
+        c.execute("DELETE FROM Projects_Master")     # FK cascade: lines/sheets/finance
+        c.execute("DELETE FROM Items_Catalog")
+        c.commit()
+    return {"projects": np, "catalogue": nc}
 
 
 def _conn():
@@ -772,9 +935,10 @@ def _write_sheet_and_lines(c, pid, system_suffix, discount_sar, factors, grid) -
 
 def update_offer(base_project_id: int, grid: pd.DataFrame, discount_sar=0.0,
                  factors=(None, None, None), system_suffix="LCS", terms=None,
-                 project_sheet_info=None) -> int:
+                 project_sheet_info=None, header=None) -> int:
     """Overwrite an existing revision/option IN PLACE - same ProjectID, Offer #,
-    revision, option, approval and people. Replaces its lines, discount and terms."""
+    revision, option, approval. Replaces lines, discount, terms; updates the offer
+    header (client/project/contact/sales/pre-sales/PM) when `header` is given."""
     discount_sar = _discount_amount(discount_sar)
     terms_json = json.dumps({k: terms.get(k) for k in TERMS_KEYS}) if terms else None
     ps_json = (json.dumps({k: project_sheet_info.get(k) for k in PROJECT_SHEET_KEYS})
@@ -785,6 +949,14 @@ def update_offer(base_project_id: int, grid: pd.DataFrame, discount_sar=0.0,
             "OfferTerms=COALESCE(?, OfferTerms), "
             "ProjectSheetInfo=COALESCE(?, ProjectSheetInfo) WHERE ProjectID=?",
             (discount_sar, factors[0], terms_json, ps_json, base_project_id))
+        if header is not None:
+            c.execute(
+                "UPDATE Projects_Master SET ProjectName=COALESCE(?,ProjectName), ClientName=?, "
+                "ContactName=?, SalesPerson=?, PresalesEngineer=?, ProjectManager=? "
+                "WHERE ProjectID=?",
+                ((header.get("project") or "").strip() or None, _str(header.get("client")),
+                 _str(header.get("contact")), _str(header.get("sales")),
+                 _str(header.get("presales")), _str(header.get("pm")), base_project_id))
         c.execute("DELETE FROM Project_BoQ_Lines WHERE ProjectID=?", (base_project_id,))
         c.execute("DELETE FROM Project_Sheets WHERE ProjectID=?", (base_project_id,))
         _write_sheet_and_lines(c, base_project_id, system_suffix, discount_sar, factors, grid)
@@ -792,9 +964,20 @@ def update_offer(base_project_id: int, grid: pd.DataFrame, discount_sar=0.0,
     return base_project_id
 
 
+def _header_fields(meta, header):
+    """Resolve (client, contact, sales, presales, pm) from an edited header dict,
+    falling back to the offer's stored values when no header is given."""
+    if header is None:
+        return (meta.get("ClientName"), meta.get("ContactName"), meta.get("SalesPerson"),
+                meta.get("PresalesEngineer"), meta.get("ProjectManager"))
+    return (_str(header.get("client")), _str(header.get("contact")), _str(header.get("sales")),
+            _str(header.get("presales")), _str(header.get("pm")))
+
+
 def save_revision(base_project_id: int, grid: pd.DataFrame, discount_sar=0.0,
                   factors=(None, None, None), system_suffix="LCS",
-                  terms=None, option_label=None, project_sheet_info=None) -> tuple[int, str, int]:
+                  terms=None, option_label=None, project_sheet_info=None,
+                  header=None) -> tuple[int, str, int]:
     """Save `grid` as the next revision of an existing offer.
 
     Returns (new_project_id, new_name, revision_no). The new offer is named
@@ -805,15 +988,16 @@ def save_revision(base_project_id: int, grid: pd.DataFrame, discount_sar=0.0,
     rev = next_revision(base)
     opt = option_label if option_label is not None else (meta.get("OptionLabel") or "")
     sep, tok = revision_separator(), revision_token(rev)
-    name = f"{base}{sep}{tok}" + (f" ({opt})" if opt else "")
+    proj_override = (header.get("project") or "").strip() if header is not None else ""
+    name = (proj_override or f"{base}{sep}{tok}") + (f" ({opt})" if opt else "")
     offer = meta.get("OfferNo")
     offer_rev = f"{base_name(offer)}{sep}{tok}" if offer else None
+    client, contact, sales, presales, pm = _header_fields(meta, header)
     pid = save_offer(
-        name=name, client=meta.get("ClientName"), contact=meta.get("ContactName"),
+        name=name, client=client, contact=contact,
         offer_no=offer_rev, system_suffix=system_suffix, grid=grid,
         discount_sar=discount_sar, factors=factors,
-        sales_person=meta.get("SalesPerson"), presales_engineer=meta.get("PresalesEngineer"),
-        project_manager=meta.get("ProjectManager"),
+        sales_person=sales, presales_engineer=presales, project_manager=pm,
         revision_no=rev, base=base, terms=terms if terms is not None else load_terms(meta),
         project_sheet_info=(project_sheet_info if project_sheet_info is not None
                             else load_project_sheet_info(meta)),
@@ -823,7 +1007,7 @@ def save_revision(base_project_id: int, grid: pd.DataFrame, discount_sar=0.0,
 
 def save_option(base_project_id: int, grid: pd.DataFrame, option_label: str,
                 discount_sar=0.0, factors=(None, None, None), system_suffix="LCS",
-                terms=None, project_sheet_info=None) -> tuple[int, str, int]:
+                terms=None, project_sheet_info=None, header=None) -> tuple[int, str, int]:
     """Save `grid` as another OPTION of the SAME revision (e.g. Dynalite vs KNX).
 
     Keeps the source revision number and Offer #; only the option label differs.
@@ -833,14 +1017,15 @@ def save_option(base_project_id: int, grid: pd.DataFrame, option_label: str,
     base = meta.get("BaseName") or base_name(meta.get("ProjectName") or "Offer")
     rev = int(meta.get("RevisionNo") or 0)
     opt = (option_label or "").strip() or "Option"
-    name = (f"{base}{revision_separator()}{revision_token(rev)} ({opt})" if rev
-            else f"{base} ({opt})")
+    proj_override = (header.get("project") or "").strip() if header is not None else ""
+    stem = proj_override or (f"{base}{revision_separator()}{revision_token(rev)}" if rev else base)
+    name = f"{stem} ({opt})"
+    client, contact, sales, presales, pm = _header_fields(meta, header)
     pid = save_offer(
-        name=name, client=meta.get("ClientName"), contact=meta.get("ContactName"),
+        name=name, client=client, contact=contact,
         offer_no=meta.get("OfferNo"), system_suffix=system_suffix, grid=grid,
         discount_sar=discount_sar, factors=factors,
-        sales_person=meta.get("SalesPerson"), presales_engineer=meta.get("PresalesEngineer"),
-        project_manager=meta.get("ProjectManager"),
+        sales_person=sales, presales_engineer=presales, project_manager=pm,
         revision_no=rev, base=base, terms=terms if terms is not None else load_terms(meta),
         project_sheet_info=(project_sheet_info if project_sheet_info is not None
                             else load_project_sheet_info(meta)),
