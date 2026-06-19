@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 import json
 import datetime as dt
+from functools import lru_cache
 import pandas as pd
 
 import db as dbmod
@@ -95,6 +96,7 @@ def revision_token(rev) -> str:
     return f"{fmt}{int(rev)}"
 
 
+@lru_cache(maxsize=1)
 def _revision_strip_pattern() -> str:
     fmt = revision_format()
     m = re.search(r"x+", fmt, flags=re.I)
@@ -170,12 +172,16 @@ def set_setting(key: str, value) -> None:
         c.execute("INSERT INTO Settings(key,value) VALUES(?,?) "
                   "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, str(value)))
         c.commit()
+    if key == "revision_format":
+        _revision_strip_pattern.cache_clear()
 
 
 def delete_setting(key: str) -> None:
     with _conn() as c:
         c.execute("DELETE FROM Settings WHERE key=?", (key,))
         c.commit()
+    if key == "revision_format":
+        _revision_strip_pattern.cache_clear()
 
 
 def offer_types() -> list[str]:
@@ -843,10 +849,10 @@ def load_project_grid(project_id: int, sheet_name: str | None = None) -> pd.Data
     # effective margin = U. Price $ / Unit Cost $ (read-only, for display)
     uc = df["Unit Cost $"].map(calc._num)
     up = df["U. Price $"].map(calc._num)
-    df["Shipping %"] = df.apply(
-        lambda r: calc.shipping_percent(r.get("Shipping %"), r.get("Ex Unit Cost $"), r.get("Unit Cost $")),
-        axis=1,
-    )
+    df["Shipping %"] = [
+        calc.shipping_percent(ship, ex, unit)
+        for ship, ex, unit in zip(df["Shipping %"], df["Ex Unit Cost $"], df["Unit Cost $"])
+    ]
     df["Margin x"] = (up / uc.where(uc > 0)).round(2).fillna(0.0)
     return df[[c for c in calc.GRID_COLUMNS] + ["LineType", "_ItemID"]]
 
@@ -1066,39 +1072,49 @@ def _write_sheet_and_lines(c, pid, system_suffix, discount_sar, factors, grid) -
         (pid, f"BOQ {system_suffix}", system_suffix, discount_sar, *factors),
     )
     sid = scur.lastrowid
+    discount_rows = []
+    item_rows = []
     for order, (_, r) in enumerate(grid.iterrows(), 1):
         lt = str(r.get("LineType", "item"))
         if lt == "discount":
-            c.execute(
-                """INSERT INTO Project_BoQ_Lines
-                     (ProjectID,SheetID,RowOrder,Description,LineType,TPriceSAR)
-                   VALUES (?,?,?,?,?,?)""",
-                (pid, sid, order, "Discount", "discount", _discount_line_amount(r.get("T. Price SAR"))),
+            discount_rows.append(
+                (pid, sid, order, "Discount", "discount", _discount_line_amount(r.get("T. Price SAR")))
             )
             continue
         cur_code = str(r.get("Cur") or "USD")
         if cur_code not in calc.CURRENCIES:
             cur_code = "USD"
-        c.execute(
-            """INSERT INTO Project_BoQ_Lines
-                 (ProjectID,SheetID,ItemID,RowOrder,Area,System,Description,Brand,Model,
-                  Qty,ListPriceUSD,ExUnitCostUSD,Currency,ShippingPercent,FinalUnitCostUSD,TotalCostUSD,
-                  FinalUPriceUSD,TPriceUSD,FinalUPriceSAR,TPriceSAR,MarginExtra,LineType)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+        item_rows.append(
             (pid, sid, r.get("_ItemID"), order, r.get("Area"), r.get("System"),
              r.get("Description"), r.get("Brand"), r.get("Model"), _f(r.get("Qty")),
              _f(r.get("List Price $")), _f(r.get("Ex Unit Cost $")), cur_code,
              _f(r.get("Shipping %")), _f(r.get("Unit Cost $")), _f(r.get("Total Cost $")),
              _f(r.get("U. Price $")), _f(r.get("T. Price $")),
              _f(r.get("U. Price SAR")), _f(r.get("T. Price SAR")),
-             _f(r.get("Margin x")), lt),
+             _f(r.get("Margin x")), lt)
+        )
+    if discount_rows:
+        c.executemany(
+            """INSERT INTO Project_BoQ_Lines
+                 (ProjectID,SheetID,RowOrder,Description,LineType,TPriceSAR)
+               VALUES (?,?,?,?,?,?)""",
+            discount_rows,
+        )
+    if item_rows:
+        c.executemany(
+            """INSERT INTO Project_BoQ_Lines
+                 (ProjectID,SheetID,ItemID,RowOrder,Area,System,Description,Brand,Model,
+                  Qty,ListPriceUSD,ExUnitCostUSD,Currency,ShippingPercent,FinalUnitCostUSD,TotalCostUSD,
+                  FinalUPriceUSD,TPriceUSD,FinalUPriceSAR,TPriceSAR,MarginExtra,LineType)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            item_rows,
         )
     return sid
 
 
 def update_offer(base_project_id: int, grid: pd.DataFrame, discount_sar=0.0,
                  factors=(None, None, None), system_suffix="LCS", terms=None,
-                 project_sheet_info=None, header=None) -> int:
+                 project_sheet_info=None, header=None, option_label=None) -> int:
     """Overwrite an existing revision/option IN PLACE - same ProjectID, Offer #,
     revision, option, approval. Replaces lines, discount, terms; updates the offer
     header (client/project/contact/sales/pre-sales/PM) when `header` is given."""
@@ -1123,6 +1139,9 @@ def update_offer(base_project_id: int, grid: pd.DataFrame, discount_sar=0.0,
                  _str(header.get("contractor")), _str(header.get("region")),
                  _str(header.get("sales")), _str(header.get("presales")),
                  _str(header.get("pm")), base_project_id))
+        if option_label is not None:
+            c.execute("UPDATE Projects_Master SET OptionLabel=? WHERE ProjectID=?",
+                      (_str(option_label), base_project_id))
         c.execute("DELETE FROM Project_BoQ_Lines WHERE ProjectID=?", (base_project_id,))
         c.execute("DELETE FROM Project_Sheets WHERE ProjectID=?", (base_project_id,))
         _write_sheet_and_lines(c, base_project_id, system_suffix, discount_sar, factors, grid)

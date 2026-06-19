@@ -44,6 +44,40 @@ st.set_page_config(page_title=f"ProQuote - {_COMPANY}", layout="wide",
                    initial_sidebar_state="expanded")
 
 
+def _request_scroll_top():
+    st.session_state["_scroll_to_top"] = True
+
+
+def _scroll_to_top_if_requested():
+    if not st.session_state.pop("_scroll_to_top", False):
+        return
+    st.iframe(
+        """
+        <script>
+        const scrollToTop = () => {
+            const doc = window.parent.document;
+            const targets = [
+                doc.querySelector('[data-testid="stMain"]'),
+                doc.querySelector('[data-testid="stAppViewContainer"]'),
+                doc.scrollingElement
+            ];
+            targets.forEach((target) => {
+                if (!target) return;
+                target.scrollTop = 0;
+                if (typeof target.scrollTo === 'function') target.scrollTo(0, 0);
+            });
+            window.parent.scrollTo(0, 0);
+        };
+        scrollToTop();
+        requestAnimationFrame(scrollToTop);
+        setTimeout(scrollToTop, 100);
+        </script>
+        """,
+        height=1,
+        width=1,
+    )
+
+
 def _choose_local_folder(initial_dir: str = "") -> tuple[str, str]:
     """Open a Windows folder picker on the machine running Streamlit."""
     try:
@@ -94,6 +128,10 @@ def _run_excel_import(import_root: str):
 
 # Larger button text + icons; tracking status cells are compact and centered.
 st.markdown("""<style>
+[data-testid="stMainBlockContainer"],
+.main .block-container {
+  padding-top: 2.5rem !important;
+}
 .stButton button { font-size: 1.05rem; font-weight: 600; min-height: 2.9rem; }
 .stButton button p { font-size: 1.05rem; }
 div[data-testid="stPopover"] button {
@@ -381,6 +419,7 @@ def _ensure_state():
             "client": "", "project": "", "contact": "", "phone": "",
             "contractor": "", "region": "",
             "sales": "", "presales": "", "pm": "",
+            "option": "",
             "offer": _next_offer_no(), "system": "LCS",
             "date": dt.date.today().isoformat(), "margin": 1.60,
             "project_sheet": dict(DEFAULT_PROJECT_SHEET_INFO),
@@ -429,7 +468,7 @@ def _prime_new_offer_form(header: dict | None = None, grid: pd.DataFrame | None 
     st.session_state["no_presales"] = h.get("presales", "")
     st.session_state["no_pm"] = h.get("pm", "")
     st.session_state["no_offer_ov"] = ""
-    st.session_state["no_option"] = ""
+    st.session_state["no_option"] = h.get("option", "")
 
     offer_types = repo.offer_types()
     system = h.get("system") or ""
@@ -540,7 +579,8 @@ def _editor_full_height(row_count: int) -> int:
 EDIT_WIDGET_KEYS = (
     "edit_grid", "edit_key", "edit_pid", "edit_system", "edit_terms", "edit_header",
     "edit_project_sheet", "edit_discount", "edit_dirty_snapshot", "edit_show_cancel_dialog",
-    "edit_close_after_save", "edit_editor", "ed_option", "ed_discount_percent",
+    "edit_close_after_save", "pending_close_edit", "pending_save", "pending_option_label",
+    "edit_editor", "ed_option", "ed_discount_percent",
     "ed_discount_driver", "ed_discount_subtotal", "eh_client", "eh_project", "eh_contact",
     "eh_phone", "eh_contractor", "eh_region", "eh_sales", "eh_presales", "eh_pm",
     "ed_subject", "ed_greet", "ed_sys", "ed_scope", "ed_excl", "ed_prereq",
@@ -627,6 +667,14 @@ def _sync_edit_state_from_widgets():
                 st.session_state.edit_project_sheet[field] = st.session_state.get(key)
 
 
+def _queue_edit_save(action: str):
+    _sync_edit_state_from_widgets()
+    st.session_state.pending_save = action
+    st.session_state.pending_option_label = (
+        st.session_state.get("ed_option") or ""
+    ).strip()
+
+
 def _sync_new_header_from_widgets():
     if "header" not in st.session_state:
         return
@@ -702,7 +750,11 @@ def _mark_edit_clean():
 
 def _close_edit_mode():
     st.session_state.edit_mode = False
-    for key in EDIT_WIDGET_KEYS + ("pdf_bytes", "project_sheet_bytes", "saved_rev"):
+    _request_scroll_top()
+    for key in EDIT_WIDGET_KEYS + (
+        "pdf_bytes", "project_sheet_bytes", "saved_rev",
+        "saved_export_header", "saved_export_grid", "saved_export_summary",
+    ):
         st.session_state.pop(key, None)
 
 
@@ -719,7 +771,7 @@ def _cancel_edit_dialog():
     save_col, close_col = st.columns(2)
     if save_col.button("💾 Save", type="primary", key="ed_cancel_modal_save",
                        width="stretch"):
-        st.session_state.pending_save = "this"
+        _queue_edit_save("this")
         st.session_state.edit_close_after_save = True
         st.session_state.edit_show_cancel_dialog = False
         st.rerun()
@@ -812,28 +864,24 @@ def _edit_panel(meta):
 
     _sync_edit_state_from_widgets()
     ea1, ea2, ea3, ea4 = st.columns([1.55, 1.55, 1.45, 0.36], vertical_alignment="center")
-    if ea1.button("💾 Save on this revision", type="primary", width="stretch",
-                  key="ed_save_this_top",
-                  help="Overwrite the current revision/option in place - keeps the same "
-                       "offer #, revision, option and approval."):
-        _sync_edit_state_from_widgets()
-        st.session_state.pending_save = "this"
-        st.rerun()
-    if ea2.button("💾 Save as new revision", width="stretch", key="ed_save_revision_top",
-                  help=f"Create {repo.revision_token(nextrev)} as a changed version."):
-        _sync_edit_state_from_widgets()
-        st.session_state.pending_save = "revision"
-        st.rerun()
-    if ea3.button("💾 Save as new option", width="stretch", key="ed_save_option_top",
-                  help="Needs an Option label (set it in the Totals section below)."):
-        _sync_edit_state_from_widgets()
-        st.session_state.pending_save = "option"
-        st.rerun()
+    ea1.button(
+        "💾 Save on this revision", type="primary", width="stretch",
+        key="ed_save_this_top", on_click=_queue_edit_save, args=("this",),
+        help="Overwrite the current revision/option in place - keeps the same "
+             "offer #, revision and approval.",
+    )
+    ea2.button(
+        "💾 Save as new revision", width="stretch", key="ed_save_revision_top",
+        on_click=_queue_edit_save, args=("revision",),
+        help=f"Create {repo.revision_token(nextrev)} as a changed version.",
+    )
+    ea3.button(
+        "💾 Save as new option", width="stretch", key="ed_save_option_top",
+        on_click=_queue_edit_save, args=("option",),
+        help="Needs an Option label.",
+    )
     if ea4.button("X", key="ed_cancel", width="stretch", help="Close editor"):
-        if _edit_has_unsaved_changes():
-            st.session_state.edit_show_cancel_dialog = True
-        else:
-            _close_edit_mode()
+        st.session_state.pending_close_edit = True
         st.rerun()
     if st.session_state.get("edit_show_cancel_dialog"):
         _cancel_edit_dialog()
@@ -880,19 +928,23 @@ def _edit_panel(meta):
         st.session_state.edit_project_sheet = edit_header_for_ps["project_sheet"]
     catalogue_add("edit_grid", float(repo.get_setting("default_margin") or 1.6), "ed",
                   st.session_state.get("edit_system", ""))
-    col_pick, _ = st.columns([0.9, 5.1], vertical_alignment="center")
+    col_pick, option_col, _ = st.columns([0.9, 2.0, 3.1], vertical_alignment="bottom")
     edit_column_order = _builder_column_order("edit_editor", host=col_pick, width="stretch")
+    opt_label = option_col.text_input(
+        "Option label",
+        key="ed_option",
+        placeholder="e.g. Dynalite, KNX",
+        help="Names this alternative. Required for 'Save as new option'.",
+    )
     grid = render_editable_grid("edit_grid", "edit_editor", in_fragment=True,
                                 column_order=edit_column_order)
 
     st.markdown("##### Totals")
     edit_calc_grid = calc.recompute(st.session_state.edit_grid)
     edit_base_summary = calc.summarize(edit_calc_grid, 0)
-    tcol, pcol, ocol = st.columns([1, 1, 2])
+    tcol, pcol, _ = st.columns([1, 1, 2])
     edit_discount = _discount_inputs(
         "ed", "edit_discount", edit_base_summary["subtotal_sar"], tcol, pcol)
-    opt_label = ocol.text_input("Option label (e.g. Dynalite, KNX)", key="ed_option",
-                                help="Names this alternative. Required for 'Save as new option'.")
     s = calc.summarize(edit_calc_grid, edit_discount)
     m1, m2, m3 = st.columns(3)
     _subtotal_metric(m1, s)
@@ -914,13 +966,18 @@ def _edit_panel(meta):
              "pm": edit_header.get("pm"),
              "offer": offer_rev, "date": dt.date.today().isoformat(),
              "project_sheet": edit_project_sheet}
-        _make_pdf_download(h, calc.recompute(st.session_state.edit_grid), s)
+        st.session_state.saved_export_header = h
+        st.session_state.saved_export_grid = calc.recompute(st.session_state.edit_grid)
+        st.session_state.saved_export_summary = dict(s)
         st.session_state.saved_rev = (npid, nname, nrev)
 
     # Execute the save requested from the action row above the grid (the buttons
     # there only set the flag; the work needs the totals/option computed above).
     _cur_rev = int(meta.get("RevisionNo") or 0)
     pending = st.session_state.pop("pending_save", None)
+    pending_option_label = (
+        st.session_state.pop("pending_option_label", opt_label) or ""
+    ).strip() if pending else opt_label.strip()
     close_after_save = bool(st.session_state.pop("edit_close_after_save", False)) if pending else False
     if pending:
         _sync_edit_state_from_widgets()
@@ -933,12 +990,19 @@ def _edit_panel(meta):
             discount_sar=edit_discount,
             factors=(s["markup_factor"], None, None),
             system_suffix=st.session_state.get("edit_system", "LCS"), terms=edit_terms,
-            project_sheet_info=edit_project_sheet, header=edit_header)
+            project_sheet_info=edit_project_sheet, header=edit_header,
+            option_label=pending_option_label)
+        saved_option_label = _text(
+            repo.project_meta(st.session_state.edit_pid).get("OptionLabel")
+        )
         _post_save(st.session_state.edit_pid,
                    edit_header.get("project") or meta.get("ProjectName"), _cur_rev)
         _name = edit_header.get("project") or meta.get("ProjectName")
         st.toast(f"Updated {_name} in place.", icon="✅")
-        st.success(f"Updated **{_name}** in place.")
+        st.success(
+            f"Updated **{_name}** in place. Option label saved as "
+            f"**{saved_option_label or 'Main'}**."
+        )
         if close_after_save:
             _close_edit_mode()
             st.rerun()
@@ -949,38 +1013,72 @@ def _edit_panel(meta):
             discount_sar=edit_discount,
             factors=(s["markup_factor"], None, None),
             system_suffix=st.session_state.get("edit_system", "LCS"),
-            terms=edit_terms, option_label=opt_label.strip(),
+            terms=edit_terms, option_label=pending_option_label,
             project_sheet_info=edit_project_sheet, header=edit_header)
+        saved_option_label = _text(repo.project_meta(npid).get("OptionLabel"))
         _post_save(npid, nname, nrev)
         st.toast(f"Saved {nname} as ProjectID {npid}.", icon="✅")
-        st.success(f"Saved **{nname}** as ProjectID {npid}.")
+        st.success(
+            f"Saved **{nname}** as ProjectID {npid}. Option label: "
+            f"**{saved_option_label or 'Main'}**."
+        )
         _mark_edit_clean()
     elif pending == "option":
-        if not opt_label.strip():
-            st.toast("Enter an Option label first (set it below).", icon="⚠️")
+        if not pending_option_label:
+            st.toast("Enter an Option label first.", icon="⚠️")
             st.warning("Enter an Option label first (e.g. Dynalite / KNX).")
         else:
             npid, nname, nrev = repo.save_option(
                 st.session_state.edit_pid, calc.recompute(st.session_state.edit_grid),
-                option_label=opt_label.strip(),
+                option_label=pending_option_label,
                 discount_sar=edit_discount,
                 factors=(s["markup_factor"], None, None),
                 system_suffix=st.session_state.get("edit_system", "LCS"), terms=edit_terms,
                 project_sheet_info=edit_project_sheet, header=edit_header)
+            saved_option_label = _text(repo.project_meta(npid).get("OptionLabel"))
             _post_save(npid, nname, nrev)
             st.toast(f"Saved option {nname} as ProjectID {npid}.", icon="✅")
-            st.success(f"Saved option **{nname}** as ProjectID {npid}.")
+            st.success(
+                f"Saved option **{nname}** as ProjectID {npid}. Option label: "
+                f"**{saved_option_label or 'Main'}**."
+            )
             _mark_edit_clean()
-    if "pdf_bytes" in st.session_state and st.session_state.get("saved_rev"):
-        fn = f"Quotation_{st.session_state.saved_rev[1]}.pdf".replace(" ", "")
-        st.download_button("⬇️ Download Offer PDF", st.session_state.pdf_bytes,
-                           file_name=fn, mime="application/pdf")
+
+    if st.session_state.pop("pending_close_edit", False):
+        if _edit_has_unsaved_changes():
+            st.session_state.edit_show_cancel_dialog = True
+        else:
+            _close_edit_mode()
+        st.rerun()
+
+    if st.session_state.get("saved_rev"):
+        pdf_col, download_col = st.columns(2)
+        if pdf_col.button("📄 Generate saved offer PDF", key="ed_generate_saved_pdf",
+                          width="stretch"):
+            _make_pdf_download(
+                st.session_state.saved_export_header,
+                st.session_state.saved_export_grid,
+                st.session_state.saved_export_summary,
+            )
+        if "pdf_bytes" in st.session_state:
+            fn = f"Quotation_{st.session_state.saved_rev[1]}.pdf".replace(" ", "")
+            download_col.download_button(
+                "⬇️ Download Offer PDF", st.session_state.pdf_bytes,
+                file_name=fn, mime="application/pdf", width="stretch")
 
 
 @st.fragment
 def _new_project_editor():
     _sync_new_header_from_widgets()
     h = st.session_state.header
+    opt_col, _ = st.columns([1.4, 3.6])
+    h["option"] = opt_col.text_input(
+        "Option label (optional)",
+        key="no_option",
+        help="Name this alternative (e.g. Dynalite, KNX). Leave blank for a single-option offer.",
+    )
+    st.session_state.header = h
+
     # ---- Add items from catalogue ----
     _dm = float(repo.get_setting("default_margin") or 1.6)   # default margin from Settings
     catalogue_add("grid", _dm, "no", st.session_state.header["system"], show_clear=True)
@@ -1021,7 +1119,8 @@ def _new_project_editor():
                   type="primary", width="stretch"):
         _sync_new_header_from_widgets()
         h = st.session_state.header
-        _optname = (h.get("option") or "").strip()
+        _optname = (st.session_state.get("no_option") or h.get("option") or "").strip()
+        h["option"] = _optname
         _locked_now = st.session_state.get("no_offer_lock")
         _done = st.session_state.get("no_saved_options", [])
         if st.session_state.grid.empty:
@@ -1043,9 +1142,13 @@ def _new_project_editor():
                 terms={k: h.get(k) for k in TERMS_KEYS}, option_label=_optname,
                 project_sheet_info=h.get("project_sheet"), phone=h.get("phone"),
                 contractor=h.get("contractor"), region=h.get("region"))
+            saved_option_label = _text(repo.project_meta(pid).get("OptionLabel"))
             st.session_state.no_offer_lock = h["offer"]          # lock # for further options
-            st.session_state.setdefault("no_saved_options", []).append(_optname or "Main")
-            st.success(f"Saved {('option ' + _optname) if _optname else 'offer'} (ProjectID {pid}).")
+            st.session_state.setdefault("no_saved_options", []).append(saved_option_label or "Main")
+            st.success(
+                f"Saved {('option ' + saved_option_label) if saved_option_label else 'offer'} "
+                f"(ProjectID {pid}). Option label: **{saved_option_label or 'Main'}**."
+            )
 
     if ac2.button("➕ Add another option", width="stretch",
                   disabled=not st.session_state.get("no_offer_lock")):
@@ -2032,6 +2135,68 @@ def _cached_finance_df(include_archived: bool, db_stamp):
     return reports.finance_df(include_archived=include_archived)
 
 
+@st.cache_data(show_spinner=False, max_entries=48)
+def _cached_project_grid(project_id: int, sheet_name: str | None, db_stamp):
+    return repo.load_project_grid(project_id, sheet_name)
+
+
+@st.cache_data(show_spinner=False, max_entries=4)
+def _cached_project_index(db_stamp):
+    projects = repo.list_projects()
+    if projects.empty:
+        return projects, []
+
+    projects = projects.copy()
+    groups = {}
+    fam_keys = []
+    for row in projects.itertuples(index=False):
+        fam = repo.family_key(row.OfferNo, row.ProjectName)
+        fam_keys.append(fam)
+        rev = int(row.RevisionNo or 0) if pd.notna(row.RevisionNo) else 0
+        option = _text(row.OptionLabel)
+        sort_key = (rev, bool(option), option)
+        group = groups.setdefault(fam, {
+            "fam": fam, "offer_nos": set(), "project_names": set(),
+            "revision_counts": {}, "approved": False, "date": "",
+            "rep_sort": None, "base": "", "client": "",
+        })
+        offer_no = _text(row.OfferNo)
+        project_name = _text(row.ProjectName)
+        if offer_no:
+            group["offer_nos"].add(offer_no)
+        if project_name:
+            group["project_names"].add(project_name)
+        group["revision_counts"][rev] = group["revision_counts"].get(rev, 0) + 1
+        group["approved"] = group["approved"] or bool(row.Approved or 0)
+        group["date"] = max(group["date"], _text(row.CreationDate))
+        if group["rep_sort"] is None or sort_key >= group["rep_sort"]:
+            group["rep_sort"] = sort_key
+            group["base"] = _text(row.BaseName) or repo.base_name(project_name or "Offer")
+            group["client"] = _text(row.ClientName)
+
+    projects["_fam"] = fam_keys
+    fams = []
+    for group in groups.values():
+        offer_nos = sorted(group["offer_nos"])
+        project_names = sorted(group["project_names"])
+        base = group["base"]
+        client = group["client"]
+        project_label = ", ".join(project_names) if project_names else base
+        fams.append({
+            "fam": group["fam"], "base": base, "client": client,
+            "offer_nos": offer_nos, "project_names": project_names,
+            "project_label": project_label,
+            "name_search": " ".join([base, client] + project_names).lower(),
+            "offer_search": " ".join(offer_nos).lower(),
+            "n_rev": len(group["revision_counts"]),
+            "n_opt": max(group["revision_counts"].values()),
+            "approved": group["approved"],
+            "date": group["date"],
+        })
+    fams.sort(key=lambda f: f["date"], reverse=True)
+    return projects, fams
+
+
 def _render_report_builder(company):
     ds_name = st.selectbox("Dataset", list(reports.DATASETS), key="rep_ds")
     meta = reports.DATASETS[ds_name]
@@ -2291,6 +2456,7 @@ def _render_tracking_tab(project_id: int, sheet_name: str | None):
 
 
 def _render_login():
+    st.markdown("<div style='height:1.25rem'></div>", unsafe_allow_html=True)
     c = st.columns([1, 2, 1])[1]
     if os.path.exists(_LOGO):
         c.image(_LOGO, width="stretch")
@@ -2365,6 +2531,10 @@ if _nav_mode in _allowed:
 if st.session_state.get("workspace_mode") not in _allowed:
     st.session_state["workspace_mode"] = _allowed[0]
 mode = st.sidebar.radio("Workspace", _allowed, key="workspace_mode")
+if st.session_state.get("_rendered_workspace_mode") != mode:
+    _request_scroll_top()
+st.session_state["_rendered_workspace_mode"] = mode
+_scroll_to_top_if_requested()
 admin = can("view_costs")          # on-screen internal cost metrics (client PDF never shows costs)
 owner = ROLE == auth.PROTECTED_ROLE
 
@@ -2437,15 +2607,12 @@ if mode == "New Project":
         h["pm"] = _person_select(p3, "Project Manager", PEOPLE_ROLES["pm"],
                                  h.get("pm", ""), "no_pm")
         # "System Offer" drives BOTH the offer-ref type segment and the BOQ system suffix.
-        o1, o2, o3 = st.columns(3)
+        o1, o2 = st.columns(2)
         o1.selectbox("System Offer", ["(none)"] + repo.offer_types(), key="no_offer_type",
                      help="The system being quoted (AV, LCS, …). Used in the offer reference "
                           "and as the BOQ system. Manage the list in Settings.")
         o2.text_input("Offer # (blank = auto)", key="no_offer_ov",
                       help="Leave blank to auto-number; type a value to override.")
-        h["option"] = o3.text_input("Option label (optional)", key="no_option",
-                                    help="Name this alternative (e.g. Dynalite, KNX). "
-                                         "Leave blank for a single-option offer.")
 
     terms_form(st.session_state.header, "no")
     if _ps_enabled():
@@ -2479,41 +2646,10 @@ elif mode == "Load Project":
         st.info("Search by project name, client name, or offer number.")
         st.stop()
 
-    projects = repo.list_projects()
+    projects, fams = _cached_project_index(_db_cache_stamp())
     if projects.empty:
         st.info("No projects ingested yet. Run `python ingest.py`.")
     else:
-        # Group revisions into offer families; pick a family, then a revision.
-        projects["_fam"] = projects.apply(
-            lambda r: repo.family_key(r.get("OfferNo"), r.get("ProjectName")), axis=1)
-        fams = []
-        for fam, grp in projects.groupby("_fam", sort=False):
-            grp = grp.sort_values(["RevisionNo", "OptionLabel"], na_position="first")
-            rep = grp.iloc[-1]
-            base = _text(rep.get("BaseName")) or repo.base_name(_text(rep.get("ProjectName"), "Offer"))
-            client = _text(rep.get("ClientName"))
-            offer_nos = sorted({_text(v) for v in grp["OfferNo"].tolist() if _text(v)})
-            project_names = sorted({_text(v) for v in grp["ProjectName"].tolist() if _text(v)})
-            n_rev = int(grp["RevisionNo"].fillna(0).astype(int).nunique())          # distinct revisions
-            n_opt = int(grp.groupby(grp["RevisionNo"].fillna(0)).size().max())      # most options in a revision
-            project_label = ", ".join(project_names) if project_names else base
-            fams.append({"fam": fam, "base": base, "client": client,
-                         "offer_nos": offer_nos, "project_names": project_names,
-                         "project_label": project_label,
-                         "name_search": " ".join([base, client] + project_names).lower(),
-                         "offer_search": " ".join(offer_nos).lower(),
-                         "n_rev": n_rev, "n_opt": n_opt,
-                         "approved": bool(grp["Approved"].fillna(0).max()),
-                         "date": _text(grp["CreationDate"].max())})
-        fams.sort(key=lambda f: f["date"], reverse=True)
-
-        def _famlabel(f):
-            parts = [_text(f["base"], "Offer")] + ([_text(f["client"])] if _text(f["client"]) else [])
-            if f["offer_nos"]:
-                parts.append(", ".join(f["offer_nos"][:3]))
-            parts.append(f"{f['n_rev']} rev. - {f['n_opt']} opt.")
-            return ("✅ " if f["approved"] else "") + " · ".join(parts)
-
         matches = [
             f for f in fams
             if (not q_name or q_name in f["name_search"])
@@ -2556,6 +2692,7 @@ elif mode == "Load Project":
                     st.session_state.pop("pdf_bytes", None)
                     st.session_state.pop("project_sheet_bytes", None)
                     st.session_state.edit_mode = False
+                    _request_scroll_top()
                     st.rerun()
             st.info(f"{len(matches)} matching offer{'s' if len(matches) != 1 else ''} found. "
                     "Click View to open one.")
@@ -2568,6 +2705,7 @@ elif mode == "Load Project":
             for k in ("load_fam", "view_pid", "pdf_bytes", "project_sheet_bytes"):
                 st.session_state.pop(k, None)
             st.session_state.edit_mode = False
+            _request_scroll_top()
             st.rerun()
         if _sel_f:
             bcol2.markdown(
@@ -2632,6 +2770,7 @@ elif mode == "Load Project":
                     st.session_state.view_pid = rid
                     st.session_state.pop("pdf_bytes", None)
                     st.session_state.pop("project_sheet_bytes", None)
+                    _request_scroll_top()
                     st.rerun()
 
         pid = int(st.session_state.view_pid)
@@ -2644,24 +2783,18 @@ elif mode == "Load Project":
 
         if not editing:
             # -------------------- VIEW: tabbed offer view --------------------
-            grid = repo.load_project_grid(pid, sheet)
+            grid = _cached_project_grid(pid, sheet, _db_cache_stamp()).copy()
             disp = grid.copy()
             for col in MONEY_COLS:
                 if col in disp.columns:
                     disp[col] = disp[col].map(lambda v: calc.roundup(v, 0))
             s = calc.summarize(disp, meta.get("DiscountAmount") or 0)
 
-            rev = meta.get("RevisionNo") or 0
             _subj = repo.load_terms(meta).get("subject")
             if _subj:
                 st.markdown(f"#### 📄 {_subj}")
-            _opt = meta.get("OptionLabel") or ""
-            _ttl = (repo.revision_token(rev) if rev else "original") + (f" · Option: {_opt}" if _opt else "")
-            if meta.get("Approved"):
-                st.caption(f"✅ Approved · {_ttl}")
-            else:
-                st.caption(f"Active · {_ttl} - click **Edit** to make a new revision or option.")
 
+            view_actions = st.container()
             _project_details_readonly(meta)
             active_tab = _offer_tab_selector(pid, bool(meta.get("Approved")))
             if active_tab == "BoQ":
@@ -2709,10 +2842,11 @@ elif mode == "Load Project":
             else:
                 _render_finance_tab(pid, s["grand_total_sar"])
 
-            b1, b2, b3, b4 = st.columns(4)
+            with view_actions:
+                b1, b2, b3, b4 = st.columns(4)
             if can("edit") and b1.button("✏️ Edit / new revision or option", type="primary",
-                                         width="stretch"):
-                eg = repo.load_project_grid(pid, sheet).copy()
+                                          width="stretch"):
+                eg = grid.copy()
                 eg["Margin x"] = 0.0   # keep loaded prices; set a margin per line to re-price
                 st.session_state.edit_grid = calc.recompute(eg)
                 st.session_state.edit_key = cur_key
@@ -2755,9 +2889,13 @@ elif mode == "Load Project":
                 st.session_state.pop("pdf_bytes", None)
                 st.session_state.pop("project_sheet_bytes", None)
                 st.session_state.pop("saved_rev", None)
+                st.session_state.pop("saved_export_header", None)
+                st.session_state.pop("saved_export_grid", None)
+                st.session_state.pop("saved_export_summary", None)
+                _request_scroll_top()
                 st.rerun()
             if can("new_offer") and b2.button("📋 Duplicate", width="stretch"):
-                dg = repo.load_project_grid(pid, sheet).copy()
+                dg = grid.copy()
                 if dg.empty:
                     st.warning("This offer has no lines to duplicate.")
                 else:
@@ -2786,23 +2924,30 @@ elif mode == "Load Project":
                     }
                     st.session_state["_nav_mode"] = "New Project"
                     st.session_state.edit_mode = False
+                    _request_scroll_top()
                     st.rerun()
-            opts = revision_options(pid)
-            _multi = len(opts) > 1
-            _export_header = {**DEFAULT_TERMS, **repo.load_terms(meta),
-                              "client": meta.get("ClientName"), "project": meta.get("ProjectName"),
-                              "contact": meta.get("ContactName"), "phone": meta.get("ContactPhone") or "",
-                              "contractor": meta.get("Contractor") or "",
-                              "region": meta.get("Region") or "",
-                              "sales": meta.get("SalesPerson"), "presales": meta.get("PresalesEngineer"),
-                              "pm": meta.get("ProjectManager"),
-                              "offer": meta.get("OfferNo"), "date": meta.get("CreationDate"),
-                              "project_sheet": repo.load_project_sheet_info(meta)}
-            if b3.button(f"📄 Generate Offer PDF{f' ({len(opts)} options)' if _multi else ''}",
+            _pdf_rev = int(meta.get("RevisionNo") or 0)
+            _rev_rows = shown_opts[shown_opts["RevisionNo"].fillna(0).astype(int) == _pdf_rev]
+            _active_rev_rows = _rev_rows[_rev_rows["Archived"].fillna(0) == 0]
+            _pdf_opt_count = len(_active_rev_rows if not _active_rev_rows.empty else _rev_rows)
+
+            def _export_header():
+                return {**DEFAULT_TERMS, **repo.load_terms(meta),
+                        "client": meta.get("ClientName"), "project": meta.get("ProjectName"),
+                        "contact": meta.get("ContactName"), "phone": meta.get("ContactPhone") or "",
+                        "contractor": meta.get("Contractor") or "",
+                        "region": meta.get("Region") or "",
+                        "sales": meta.get("SalesPerson"), "presales": meta.get("PresalesEngineer"),
+                        "pm": meta.get("ProjectManager"),
+                        "offer": meta.get("OfferNo"), "date": meta.get("CreationDate"),
+                        "project_sheet": repo.load_project_sheet_info(meta)}
+
+            if b3.button(f"📄 Generate Offer PDF{f' ({_pdf_opt_count} options)' if _pdf_opt_count > 1 else ''}",
                          width="stretch"):
-                _make_pdf_download(_export_header, disp, s, options=opts if _multi else None)
+                opts = revision_options(pid)
+                _make_pdf_download(_export_header(), disp, s, options=opts if len(opts) > 1 else None)
             if _ps_enabled() and b4.button("📊 Generate Project Sheet", width="stretch"):
-                _make_project_sheet_download(_export_header, s)
+                _make_project_sheet_download(_export_header(), s)
             dl1, dl2 = st.columns(2)
             if "pdf_bytes" in st.session_state and not st.session_state.get("saved_rev"):
                 dl1.download_button(
