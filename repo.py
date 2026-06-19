@@ -21,6 +21,8 @@ PROJECT_SHEET_KEYS = [
     "salesman_signature", "gm_signature",
 ]
 
+CATALOG_INITIAL_PRICE_DATE = "2025-01-01"
+
 
 def load_terms(meta: dict) -> dict:
     """Parse the OfferTerms JSON blob from a project_meta row (empty if none)."""
@@ -49,6 +51,29 @@ def _str(x) -> str:
     if x is None or (isinstance(x, float) and x != x):   # NaN != NaN
         return ""
     return str(x)
+
+
+def _catalog_price_date(value=None) -> str:
+    """Normalize catalogue price-date values to ISO date text."""
+    if value is None or _str(value).strip() == "":
+        return CATALOG_INITIAL_PRICE_DATE
+    try:
+        if pd.isna(value):
+            return CATALOG_INITIAL_PRICE_DATE
+    except (TypeError, ValueError):
+        pass
+    if isinstance(value, dt.datetime):
+        return value.date().isoformat()
+    if isinstance(value, dt.date):
+        return value.isoformat()
+
+    text = _str(value).strip()
+    for fmt in ("%Y-%m-%d", "%m-%Y", "%m/%Y", "%Y-%m", "%d-%m-%Y", "%d/%m/%Y"):
+        try:
+            return dt.datetime.strptime(text[:10], fmt).date().replace(day=1).isoformat()
+        except ValueError:
+            continue
+    return CATALOG_INITIAL_PRICE_DATE
 
 
 def revision_format() -> str:
@@ -105,6 +130,7 @@ DEFAULT_SETTINGS = {
     "revision_separator": "-",      # between offer # and revision token
     "eur_to_usd": "1.08",           # USD value of 1 EUR (SAR uses the 3.75 peg)
     "vat_percent": "15",            # VAT rate (%) applied to offers & finance
+    "project_sheet_enabled": "1",   # "0" hides the Project Sheet info form + export
     # Per-company branding (banner image lives in the data dir's assets/).
     "company_name": "Company Name",
     "company_tagline": "Smart & Low-Current Systems",
@@ -426,7 +452,8 @@ def search_catalog(term: str, limit: int = 25) -> pd.DataFrame:
             like = f"%{term.strip()}%"
             rows = c.execute(
                 """SELECT ItemID,Brand,Model,Description,ListPriceUSD,ExUnitCostUSD,Currency,
-                          ShippingPercent,UnitCostUSD,DefaultUPriceUSD,DefaultUPriceSAR,TimesQuoted
+                          ShippingPercent,UnitCostUSD,DefaultUPriceUSD,DefaultUPriceSAR,
+                          PriceUpdatedAt,TimesQuoted
                    FROM Items_Catalog
                    WHERE Model LIKE ? OR Description LIKE ? OR Brand LIKE ?
                    ORDER BY TimesQuoted DESC LIMIT ?""",
@@ -435,7 +462,8 @@ def search_catalog(term: str, limit: int = 25) -> pd.DataFrame:
         else:
             rows = c.execute(
                 """SELECT ItemID,Brand,Model,Description,ListPriceUSD,ExUnitCostUSD,Currency,
-                          ShippingPercent,UnitCostUSD,DefaultUPriceUSD,DefaultUPriceSAR,TimesQuoted
+                          ShippingPercent,UnitCostUSD,DefaultUPriceUSD,DefaultUPriceSAR,
+                          PriceUpdatedAt,TimesQuoted
                    FROM Items_Catalog ORDER BY TimesQuoted DESC LIMIT ?""",
                 (limit,),
             ).fetchall()
@@ -478,9 +506,11 @@ def update_catalog_item(item_id: int, fields: dict) -> None:
                 fields["ShippingPercent"] = calc.infer_shipping_percent(ex_usd, unit)
 
         cols = [c for c in fields if c in _CATALOG_WRITABLE]
-        sets = ", ".join(f"{c}=?" for c in cols)
+        if not cols:
+            return
+        sets = ", ".join([f"{col}=?" for col in cols] + ["PriceUpdatedAt=?"])
         c.execute(f"UPDATE Items_Catalog SET {sets} WHERE ItemID=?",
-                  (*[fields[k] for k in cols], item_id))
+                  (*[fields[k] for k in cols], dt.date.today().isoformat(), item_id))
         c.commit()
 
 
@@ -505,11 +535,12 @@ def add_catalog_item(brand, model, description, list_price=None, ex_cost=None,
         cur = c.execute(
             """INSERT INTO Items_Catalog
                  (Description,Brand,Model,ListPriceUSD,ExUnitCostUSD,Currency,ShippingPercent,
-                  UnitCostUSD,DefaultUPriceUSD,DefaultUPriceSAR,TimesQuoted,LastSeenFile,LastSeenAt)
-               VALUES (?,?,?,?,?,?,?,?,?,?,0,?,?)""",
+                  UnitCostUSD,DefaultUPriceUSD,DefaultUPriceSAR,PriceUpdatedAt,TimesQuoted,
+                  LastSeenFile,LastSeenAt)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,0,?,?)""",
             (description, brand, model, list_price, ex_cost, currency,
              ship, unit_cost,
-             uprice_usd, uprice_sar, "app://catalog-add", now))
+             uprice_usd, uprice_sar, dt.date.today().isoformat(), "app://catalog-add", now))
         c.commit()
         return cur.lastrowid
 
@@ -526,6 +557,85 @@ def delete_catalog_items(ids) -> int:
         c.execute(f"DELETE FROM Items_Catalog WHERE ItemID IN ({qs})", ids)
         c.commit()
     return len(ids)
+
+
+# Columns carried in a catalogue backup / restore file (ItemID is regenerated).
+CATALOG_BACKUP_COLS = ["Brand", "Model", "Description", "ListPriceUSD", "ExUnitCostUSD",
+                       "Currency", "ShippingPercent", "UnitCostUSD", "DefaultUPriceUSD",
+                       "DefaultUPriceSAR", "PriceUpdatedAt", "TimesQuoted"]
+
+
+def catalog_all() -> pd.DataFrame:
+    """Every catalogue item (for backup / dedupe), ordered Brand, Model, Description."""
+    with _conn() as c:
+        rows = c.execute(
+            "SELECT ItemID, " + ",".join(CATALOG_BACKUP_COLS) + " FROM Items_Catalog "
+            "ORDER BY Brand, Model, Description").fetchall()
+    return pd.DataFrame([dict(r) for r in rows])
+
+
+def replace_catalog(df: pd.DataFrame) -> int:
+    """Restore: replace the WHOLE catalogue with df's rows. Offer lines are unlinked
+    from the old IDs first (they keep their own stored data). Refuses to clear the
+    catalogue if the file has no usable rows. Returns the item count afterwards."""
+    now = dt.datetime.now().isoformat(timespec="seconds")
+    recs = []
+    for _, r in df.iterrows():
+        brand, model, desc = _str(r.get("Brand")), _str(r.get("Model")), _str(r.get("Description"))
+        if not (brand or model or desc):
+            continue
+        cur = _str(r.get("Currency")) or "USD"
+        recs.append((desc, brand, model, _f(r.get("ListPriceUSD")), _f(r.get("ExUnitCostUSD")),
+                     cur if cur in calc.CURRENCIES else "USD", _f(r.get("ShippingPercent")),
+                     _f(r.get("UnitCostUSD")), _f(r.get("DefaultUPriceUSD")),
+                     _f(r.get("DefaultUPriceSAR")), _catalog_price_date(r.get("PriceUpdatedAt")),
+                     int(calc._num(r.get("TimesQuoted"))), now))
+    if not recs:
+        raise ValueError("No usable rows found - the file needs Brand / Model / Description columns.")
+    with _conn() as c:
+        c.execute("UPDATE Project_BoQ_Lines SET ItemID=NULL")
+        c.execute("DELETE FROM Items_Catalog")
+        c.executemany(
+            """INSERT OR IGNORE INTO Items_Catalog
+                 (Description,Brand,Model,ListPriceUSD,ExUnitCostUSD,Currency,ShippingPercent,
+                  UnitCostUSD,DefaultUPriceUSD,DefaultUPriceSAR,PriceUpdatedAt,TimesQuoted,LastSeenAt)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""", recs)
+        n = c.execute("SELECT COUNT(*) FROM Items_Catalog").fetchone()[0]
+        c.commit()
+    return n
+
+
+def _norm_key(x) -> str:
+    return " ".join(str(x or "").split()).strip().lower()
+
+
+def catalog_duplicates() -> list:
+    """Groups of catalogue items sharing the same (Model, Description) ignoring case and
+    spacing. Returns [{model, description, identical, items:[...]}] for groups of >1 item;
+    `identical` means brand/currency/all prices match across the group too."""
+    df = catalog_all()
+    if df.empty:
+        return []
+    groups: dict = {}
+    for _, r in df.iterrows():
+        key = (_norm_key(r.get("Model")), _norm_key(r.get("Description")))
+        if not any(key):                       # skip rows with no Model AND no Description
+            continue
+        groups.setdefault(key, []).append(dict(r))
+    cmp_num = ["ListPriceUSD", "ExUnitCostUSD", "ShippingPercent", "UnitCostUSD",
+               "DefaultUPriceUSD", "DefaultUPriceSAR"]
+    out = []
+    for items in groups.values():
+        if len(items) < 2:
+            continue
+        def sig(it):
+            return (_norm_key(it.get("Brand")), _norm_key(it.get("Currency")),
+                    tuple(round(calc._num(it.get(c)), 2) for c in cmp_num))
+        identical = len({sig(it) for it in items}) == 1
+        out.append({"model": items[0].get("Model"), "description": items[0].get("Description"),
+                    "identical": identical, "items": items})
+    out.sort(key=lambda g: (not g["identical"], str(g["description"] or "").lower()))
+    return out
 
 
 def item_to_grid_row(item: dict, area="", system="", qty=1, default_margin=0.0) -> dict:
@@ -867,7 +977,7 @@ def save_offer(name, client, contact, offer_no, system_suffix, grid: pd.DataFram
                discount_sar=0.0, factors=(None, None, None),
                sales_person=None, presales_engineer=None, project_manager=None,
                revision_no=0, base=None, terms=None, option_label="",
-               project_sheet_info=None) -> int:
+               project_sheet_info=None, phone="", contractor="", region="") -> int:
     """Persist a NEW offer (and its lines) created in the interface."""
     discount_sar = _discount_amount(discount_sar)
     now = dt.datetime.now().isoformat(timespec="seconds")
@@ -879,11 +989,13 @@ def save_offer(name, client, contact, offer_no, system_suffix, grid: pd.DataFram
     with _conn() as c:
         cur = c.execute(
             """INSERT INTO Projects_Master
-                 (ProjectName,ClientName,ContactName,SalesPerson,PresalesEngineer,ProjectManager,
+                 (ProjectName,ClientName,ContactName,ContactPhone,
+                  Contractor,Region,SalesPerson,PresalesEngineer,ProjectManager,
                   OfferNo,CreationDate,DiscountAmount,ConversionFactor,SourceFile,IngestedAt,
                   RevisionNo,BaseName,OfferTerms,ProjectSheetInfo,OptionLabel)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-            (name, client, contact, sales_person, presales_engineer, project_manager, offer_no,
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (name, client, contact, _str(phone), _str(contractor), _str(region),
+             sales_person, presales_engineer, project_manager, offer_no,
              today, discount_sar, factors[0], f"app://offer/{name}/{now}", now, revision_no, base,
              terms_json, ps_json, option_label or ""),
         )
@@ -952,11 +1064,14 @@ def update_offer(base_project_id: int, grid: pd.DataFrame, discount_sar=0.0,
         if header is not None:
             c.execute(
                 "UPDATE Projects_Master SET ProjectName=COALESCE(?,ProjectName), ClientName=?, "
-                "ContactName=?, SalesPerson=?, PresalesEngineer=?, ProjectManager=? "
+                "ContactName=?, ContactPhone=?, Contractor=?, Region=?, "
+                "SalesPerson=?, PresalesEngineer=?, ProjectManager=? "
                 "WHERE ProjectID=?",
                 ((header.get("project") or "").strip() or None, _str(header.get("client")),
-                 _str(header.get("contact")), _str(header.get("sales")),
-                 _str(header.get("presales")), _str(header.get("pm")), base_project_id))
+                 _str(header.get("contact")), _str(header.get("phone")),
+                 _str(header.get("contractor")), _str(header.get("region")),
+                 _str(header.get("sales")), _str(header.get("presales")),
+                 _str(header.get("pm")), base_project_id))
         c.execute("DELETE FROM Project_BoQ_Lines WHERE ProjectID=?", (base_project_id,))
         c.execute("DELETE FROM Project_Sheets WHERE ProjectID=?", (base_project_id,))
         _write_sheet_and_lines(c, base_project_id, system_suffix, discount_sar, factors, grid)
@@ -965,12 +1080,16 @@ def update_offer(base_project_id: int, grid: pd.DataFrame, discount_sar=0.0,
 
 
 def _header_fields(meta, header):
-    """Resolve (client, contact, sales, presales, pm) from an edited header dict,
-    falling back to the offer's stored values when no header is given."""
+    """Resolve edited header fields, falling back to the stored offer when absent.
+
+    Returns client, contact, phone, contractor, region, sales, presales, pm.
+    """
     if header is None:
-        return (meta.get("ClientName"), meta.get("ContactName"), meta.get("SalesPerson"),
+        return (meta.get("ClientName"), meta.get("ContactName"), meta.get("ContactPhone"),
+                meta.get("Contractor"), meta.get("Region"), meta.get("SalesPerson"),
                 meta.get("PresalesEngineer"), meta.get("ProjectManager"))
-    return (_str(header.get("client")), _str(header.get("contact")), _str(header.get("sales")),
+    return (_str(header.get("client")), _str(header.get("contact")), _str(header.get("phone")),
+            _str(header.get("contractor")), _str(header.get("region")), _str(header.get("sales")),
             _str(header.get("presales")), _str(header.get("pm")))
 
 
@@ -992,7 +1111,7 @@ def save_revision(base_project_id: int, grid: pd.DataFrame, discount_sar=0.0,
     name = (proj_override or f"{base}{sep}{tok}") + (f" ({opt})" if opt else "")
     offer = meta.get("OfferNo")
     offer_rev = f"{base_name(offer)}{sep}{tok}" if offer else None
-    client, contact, sales, presales, pm = _header_fields(meta, header)
+    client, contact, phone, contractor, region, sales, presales, pm = _header_fields(meta, header)
     pid = save_offer(
         name=name, client=client, contact=contact,
         offer_no=offer_rev, system_suffix=system_suffix, grid=grid,
@@ -1001,7 +1120,7 @@ def save_revision(base_project_id: int, grid: pd.DataFrame, discount_sar=0.0,
         revision_no=rev, base=base, terms=terms if terms is not None else load_terms(meta),
         project_sheet_info=(project_sheet_info if project_sheet_info is not None
                             else load_project_sheet_info(meta)),
-        option_label=opt)
+        option_label=opt, phone=phone, contractor=contractor, region=region)
     return pid, name, rev
 
 
@@ -1020,7 +1139,7 @@ def save_option(base_project_id: int, grid: pd.DataFrame, option_label: str,
     proj_override = (header.get("project") or "").strip() if header is not None else ""
     stem = proj_override or (f"{base}{revision_separator()}{revision_token(rev)}" if rev else base)
     name = f"{stem} ({opt})"
-    client, contact, sales, presales, pm = _header_fields(meta, header)
+    client, contact, phone, contractor, region, sales, presales, pm = _header_fields(meta, header)
     pid = save_offer(
         name=name, client=client, contact=contact,
         offer_no=meta.get("OfferNo"), system_suffix=system_suffix, grid=grid,
@@ -1029,7 +1148,7 @@ def save_option(base_project_id: int, grid: pd.DataFrame, option_label: str,
         revision_no=rev, base=base, terms=terms if terms is not None else load_terms(meta),
         project_sheet_info=(project_sheet_info if project_sheet_info is not None
                             else load_project_sheet_info(meta)),
-        option_label=opt)
+        option_label=opt, phone=phone, contractor=contractor, region=region)
     return pid, name, rev
 
 

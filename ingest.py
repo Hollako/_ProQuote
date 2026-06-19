@@ -240,14 +240,14 @@ def _find_quotation_sheet(wb, suffix):
 def parse_quotation_meta(wb, suffix):
     """Pull client/project/offer metadata from the matching Quotation sheet."""
     ws = _find_quotation_sheet(wb, suffix)
-    meta = {"client": None, "project": None, "contact": None, "offer": None,
-            "date": None, "sales": None}
+    meta = {"client": None, "project": None, "contact": None, "phone": None,
+            "offer": None, "date": None, "sales": None}
     if ws is None:
         return meta
     labels = {
         "client name": "client", "project name": "project",
-        "contact": "contact", "offer #": "offer", "offer no": "offer",
-        "date": "date", "date:": "date", "phone": None, "billed to": None,
+        "contact": "contact", "phone": "phone", "offer #": "offer", "offer no": "offer",
+        "date": "date", "date:": "date", "billed to": None,
     }
     for r in range(1, min(ws.max_row, 20) + 1):
         for c in range(1, min(ws.max_column, 9) + 1):
@@ -270,6 +270,7 @@ def parse_quotation_meta(wb, suffix):
                 ("project:", "project"), ("project :", "project"),
                 ("reference:", "offer"), ("offer #:", "offer"), ("offer no:", "offer"),
                 ("from:", "sales"), ("date:", "date"), ("date :", "date"),
+                ("phone:", "phone"), ("phone :", "phone"),
                 ("attn:", "contact"), ("attn :", "contact"), ("attention:", "contact")]
     for r in range(1, min(ws.max_row, 20) + 1):
         for c in range(1, min(ws.max_column, 9) + 1):
@@ -359,15 +360,17 @@ _NON_GRID_SHEETS = ("pivot", "quotation", "mark up", "markup", "sheet", "balance
 
 
 def _detect_boq_sheets(wb):
-    """BoQ grid sheets = any 'BOQ*'-named sheet, PLUS any other sheet (not Pivot /
-    Quotation / Mark Up / Sheet1 / …) that has a recognizable BoQ header (the grid
-    is often named by system/area, e.g. 'Sound System', 'LANDSCAPE AREA')."""
+    """BoQ grid sheets. Prefer the canonical 'BOQ*'-named sheet(s) (original
+    behaviour). ONLY when a file has no 'BOQ'-named sheet do we detect the grid by
+    its header columns (the grid is then named by system/area, e.g. 'Sound System',
+    'LANDSCAPE AREA'). This avoids picking up draft/duplicate sheets like
+    'Lighting Control BOQ' alongside the real 'BOQ'."""
+    named = [s for s in wb.sheetnames if s.lower().strip().startswith("boq")]
+    if named:
+        return named
     out = []
     for s in wb.sheetnames:
         sl = s.lower().strip()
-        if sl.startswith("boq"):
-            out.append(s)
-            continue
         if any(sl.startswith(x) for x in _NON_GRID_SHEETS):
             continue
         try:
@@ -384,12 +387,27 @@ def upsert_item(conn, ln, src_file, now):
     if not (ln.get("description") or ln.get("model")):
         return None
     cur = conn.execute(
-        "SELECT ItemID FROM Items_Catalog WHERE IFNULL(Brand,'')=? AND IFNULL(Model,'')=? AND IFNULL(Description,'')=?",
+        """SELECT ItemID,ListPriceUSD,ExUnitCostUSD,ShippingPercent,UnitCostUSD,
+                  DefaultUPriceUSD,DefaultUPriceSAR
+             FROM Items_Catalog
+            WHERE IFNULL(Brand,'')=? AND IFNULL(Model,'')=? AND IFNULL(Description,'')=?""",
         (ln.get("brand") or "", ln.get("model") or "", ln.get("description") or ""),
     )
     row = cur.fetchone()
     if row:
         iid = row["ItemID"]
+        price_cols = {
+            "list_price": "ListPriceUSD",
+            "ex_unit_cost": "ExUnitCostUSD",
+            "shipping_percent": "ShippingPercent",
+            "unit_cost": "UnitCostUSD",
+            "u_price": "DefaultUPriceUSD",
+            "u_price_sar": "DefaultUPriceSAR",
+        }
+        price_changed = any(
+            ln.get(src) is not None and abs(calc._num(ln.get(src)) - calc._num(row[dst])) > 1e-9
+            for src, dst in price_cols.items()
+        )
         conn.execute(
             """UPDATE Items_Catalog SET
                  ListPriceUSD=COALESCE(?,ListPriceUSD),
@@ -398,20 +416,22 @@ def upsert_item(conn, ln, src_file, now):
                  UnitCostUSD=COALESCE(?,UnitCostUSD),
                  DefaultUPriceUSD=COALESCE(?,DefaultUPriceUSD),
                  DefaultUPriceSAR=COALESCE(?,DefaultUPriceSAR),
+                 PriceUpdatedAt=COALESCE(?,PriceUpdatedAt),
                  TimesQuoted=TimesQuoted+1, LastSeenFile=?, LastSeenAt=?
                WHERE ItemID=?""",
             (ln.get("list_price"), ln.get("ex_unit_cost"), ln.get("shipping_percent"), ln.get("unit_cost"),
-             ln.get("u_price"), ln.get("u_price_sar"), src_file, now, iid),
+             ln.get("u_price"), ln.get("u_price_sar"),
+             dt.date.today().isoformat() if price_changed else None, src_file, now, iid),
         )
         return iid
     cur = conn.execute(
         """INSERT INTO Items_Catalog
              (Description,Brand,Model,ListPriceUSD,ExUnitCostUSD,ShippingPercent,UnitCostUSD,
-              DefaultUPriceUSD,DefaultUPriceSAR,TimesQuoted,LastSeenFile,LastSeenAt)
-           VALUES (?,?,?,?,?,?,?,?,?,1,?,?)""",
+              DefaultUPriceUSD,DefaultUPriceSAR,PriceUpdatedAt,TimesQuoted,LastSeenFile,LastSeenAt)
+           VALUES (?,?,?,?,?,?,?,?,?,?,1,?,?)""",
         (ln.get("description"), ln.get("brand"), ln.get("model"), ln.get("list_price"),
          ln.get("ex_unit_cost"), ln.get("shipping_percent"), ln.get("unit_cost"), ln.get("u_price"),
-         ln.get("u_price_sar"), src_file, now),
+         ln.get("u_price_sar"), repo.CATALOG_INITIAL_PRICE_DATE, src_file, now),
     )
     return cur.lastrowid
 
@@ -461,12 +481,21 @@ def ingest_file(conn, path, stats):
         offer_no = base_ref or _s(qmeta.get("offer"))
     base_name_val = base_ref or None
 
+    # Client: the Quotation 'M/S' line when present. Older 2023-template offers
+    # have no M/S (only 'Attn:'), so fall back to the first 1-2 words of the
+    # clean project name (user-chosen heuristic for migrated/legacy files).
+    client = _s(qmeta.get("client"))
+    if not client:
+        proj_src = _s(qmeta.get("project")) or (repo.parse_client_from_name(fname) or "")
+        words = proj_src.split()
+        client = " ".join(words[:2]) if words else None
+
     cur = conn.execute(
         """INSERT INTO Projects_Master
-             (ProjectName,ClientName,ContactName,SalesPerson,OfferNo,CreationDate,
+             (ProjectName,ClientName,ContactName,ContactPhone,SalesPerson,OfferNo,CreationDate,
               RevisionNo,BaseName,SourceFile,IngestedAt,OfferTerms)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
-        (project_name, _s(qmeta.get("client")), _s(qmeta.get("contact")),
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+        (project_name, client, _s(qmeta.get("contact")), _s(qmeta.get("phone")),
          _s(qmeta.get("sales")), offer_no, cdate, revno or 0, base_name_val,
          path, now, terms_json),
     )

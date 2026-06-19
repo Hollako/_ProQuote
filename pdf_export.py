@@ -272,12 +272,12 @@ def _items_table(ss, grid: pd.DataFrame, show_costs: bool):
             Paragraph(_sar(row.get("Qty")), ss["CellC"]),
         ]
         if show_costs:
-            cells += [Paragraph(_sar(row.get("Ex Unit Cost $")), ss["CellR"]),
+            cells += [Paragraph(_sar2(row.get("Ex Unit Cost $")), ss["CellR"]),
                       Paragraph(_pct(row.get("Shipping %")), ss["CellR"]),
-                      Paragraph(_sar(row.get("Unit Cost $")), ss["CellR"]),
-                      Paragraph(_sar(row.get("Total Cost $")), ss["CellR"])]
-        cells += [Paragraph(_sar(row.get("U. Price SAR")), ss["CellR"]),
-                  Paragraph(_sar(row.get("T. Price SAR")), ss["CellR"])]
+                      Paragraph(_sar2(row.get("Unit Cost $")), ss["CellR"]),
+                      Paragraph(_sar2(row.get("Total Cost $")), ss["CellR"])]
+        cells += [Paragraph(_sar2(row.get("U. Price SAR")), ss["CellR"]),
+                  Paragraph(_sar2(row.get("T. Price SAR")), ss["CellR"])]
         data.append(cells)
         if r % 2 == 0:
             style.append(("BACKGROUND", (0, len(data) - 1), (-1, len(data) - 1),
@@ -293,11 +293,11 @@ def _totals(ss, s: dict):
     if s.get("discount_sar") and s.get("discount_percent"):
         discount_label = f"Discount ({s['discount_percent']:.2f}%)"
     rows = [
-        ("Subtotal", _sar(s["subtotal_sar"])),
-        (discount_label, _sar(s["discount_sar"])),
-        ("Discounted Subtotal", _sar(s["discounted_subtotal_sar"])),
-        (f"VAT ({int(s['vat_rate']*100)}%)", _sar(s["vat_amount_sar"])),
-        ("Grand Total (SAR)", _sar(s["grand_total_sar"])),
+        ("Subtotal", _sar2(s["subtotal_sar"])),
+        (discount_label, _sar2(s["discount_sar"])),
+        ("Discounted Subtotal", _sar2(s["discounted_subtotal_sar"])),
+        (f"VAT ({int(s['vat_rate']*100)}%)", _sar2(s["vat_amount_sar"])),
+        ("Grand Total (SAR)", _sar2(s["grand_total_sar"])),
     ]
     data = [[Paragraph(lbl, ss["Lbl"] if i < 4 else
             ParagraphStyle("g", parent=ss["Lbl"], textColor=colors.white)),
@@ -447,7 +447,7 @@ def _template2_intro(story, ss, h, notes: dict, company: dict) -> None:
 def _template2_price_cells(row, included: bool):
     if included:
         return "", "Included"
-    return _sar(row.get("U. Price SAR")), _sar(row.get("T. Price SAR"))
+    return _sar2(row.get("U. Price SAR")), _sar2(row.get("T. Price SAR"))
 
 
 def _template2_items_table(ss, grid: pd.DataFrame, summary: dict, show_costs: bool):
@@ -761,7 +761,12 @@ def _fmt_cell(col, val):
     if isinstance(val, bool):
         return "Yes" if val else "No"
     if isinstance(val, (int, float)):
-        return f"{val:.1f}" if "%" in str(col) else f"{val:,.0f}"
+        cs = str(col)
+        if "%" in cs:
+            return f"{val:.1f}"
+        if cs.endswith("SAR"):
+            return f"{val:,.2f}"               # money -> accounting (2 dp)
+        return f"{val:,.0f}"                   # counts / qty
     return str(val if val is not None else "")
 
 
@@ -784,7 +789,7 @@ def _report_table(ss, df, totals):
             if i == 0:
                 trow.append(Paragraph("TOTAL", tcell))
             elif c in totals:
-                trow.append(Paragraph(f"{totals[c]:,.0f}", tcellR))
+                trow.append(Paragraph(_fmt_cell(c, totals[c]), tcellR))
             else:
                 trow.append("")
         data.append(trow)

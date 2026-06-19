@@ -31,12 +31,6 @@ import runtime_env
 import updater
 from version import APP_VERSION
 
-# Streamlit reruns this file, but imported helper modules can stay cached in a
-# long-lived app process. Reload the persistence layer so new DB fields and save
-# signatures are picked up without a manual server restart.
-db = importlib.reload(db)
-repo = importlib.reload(repo)
-
 _LOGO = db.banner_path()                       # per-company banner (follows BOQ_DATA_DIR)
 _COMPANY = repo.get_setting("company_name") or "Company Name"
 st.set_page_config(page_title=f"ProQuote - {_COMPANY}", layout="wide",
@@ -95,22 +89,6 @@ def _run_excel_import(import_root: str):
 st.markdown("""<style>
 .stButton button { font-size: 1.05rem; font-weight: 600; min-height: 2.9rem; }
 .stButton button p { font-size: 1.05rem; }
-div[data-testid="stPopover"] button {
-  font-size: 1.05rem;
-  font-weight: 600;
-  min-height: 2.9rem;
-}
-div[data-testid="stPopover"] button p { font-size: 1.05rem; }
-[class*="st-key-ed_cancel"] button,
-[class*="st-key-ed_cancel_modal_discard"] button {
-  background: #dc2626 !important;
-  border-color: #dc2626 !important;
-  color: #fff !important;
-}
-[class*="st-key-ed_cancel"] button p,
-[class*="st-key-ed_cancel_modal_discard"] button p {
-  color: #fff !important;
-}
 [class*="st-key-offer_tab_"] button {
   min-height: 4.15rem !important;
   border-radius: 8px 8px 0 0 !important;
@@ -216,15 +194,6 @@ div[data-testid="stPopover"] button p { font-size: 1.05rem; }
   border-top: 1px solid #e3e8ef;
   margin: 0.28rem 0 0.42rem 0;
 }
-[class*="price_updated_"] input:disabled {
-  color: #172033 !important;
-  -webkit-text-fill-color: #172033 !important;
-  opacity: 1 !important;
-  font-weight: 500 !important;
-}
-[class*="price_updated_"] label p {
-  color: #172033 !important;
-}
 </style>""", unsafe_allow_html=True)
 
 # Full internal grid (builder always sees costs; the client PDF never shows costs).
@@ -280,86 +249,15 @@ DEFAULT_PROJECT_SHEET_INFO = {
 
 # Which user-role each offer people-field is picked from.
 PEOPLE_ROLES = {"sales": "sales", "presales": "Pre-Sales", "pm": "Project Manager"}
-# The Sales Person picker spans several roles - anyone who may own/sign an offer.
-SALES_PERSON_ROLES = ["sales", "Pre-Sales", "Project Manager", "Top Management"]
-
-
-def _role_label(role) -> str:
-    """Display a role name starting with a capital letter (cosmetic only - the stored
-    role key is unchanged, so permissions / the protected 'owner' logic still work)."""
-    r = str(role or "")
-    return r[:1].upper() + r[1:]
-
-
-def _ps_enabled() -> bool:
-    """Project Sheet (info section + Excel export) is on unless disabled in Settings."""
-    return repo.get_setting("project_sheet_enabled") != "0"
-
-
-@st.fragment
-def _catalog_dedupe_tool():
-    """Find catalogue duplicates (same Model + Description) and delete chosen ones.
-    A fragment, so ticking checkboxes doesn't re-run the whole catalogue page."""
-    if st.button("🔎 Find duplicates", key="cat_find_dups"):
-        st.session_state["cat_dups"] = repo.catalog_duplicates()
-        st.rerun(scope="fragment")
-    dups = st.session_state.get("cat_dups")
-    if dups is None:
-        st.caption("Click **Find duplicates** to scan the catalogue.")
-        return
-    if not dups:
-        st.success("No duplicates found (by Model + Description).")
-        return
-    n_ident = sum(1 for g in dups if g["identical"])
-    st.caption(f"{len(dups)} duplicate group(s) — {n_ident} identical. Identical groups "
-               "pre-select all but the most-quoted copy; review/adjust, then delete.")
-    widths = [0.5, 1.5, 1.3, 1.0, 1.0, 0.6, 1.1, 0.8]
-    to_delete = []
-    for g in dups:
-        badge = "🟢 Identical" if g["identical"] else "🟠 Differs"
-        st.markdown(f"**{badge}** · {g['model'] or '—'} · {g['description'] or '—'}  "
-                    f"({len(g['items'])} copies)")
-        items = sorted(g["items"], key=lambda it: -int(it.get("TimesQuoted") or 0))
-        keep_id = items[0]["ItemID"]                      # default keep = most-quoted
-        hc = st.columns(widths)
-        for col, t in zip(hc, ["Del", "Brand", "Model", "List", "Ex", "Cur", "U.SAR", "Quoted"]):
-            col.caption(t)
-        for it in items:
-            rc = st.columns(widths, vertical_alignment="center")
-            default_del = g["identical"] and it["ItemID"] != keep_id
-            if rc[0].checkbox("del", value=default_del, key=f"dupdel_{it['ItemID']}",
-                              label_visibility="collapsed"):
-                to_delete.append(int(it["ItemID"]))
-            rc[1].write(str(it.get("Brand") or ""))
-            rc[2].write(str(it.get("Model") or ""))
-            rc[3].write(f"{calc._num(it.get('ListPriceUSD')):,.2f}")
-            rc[4].write(f"{calc._num(it.get('ExUnitCostUSD')):,.2f}")
-            rc[5].write(str(it.get("Currency") or ""))
-            rc[6].write(f"{calc._num(it.get('DefaultUPriceSAR')):,.2f}")
-            rc[7].write(str(int(it.get("TimesQuoted") or 0)))
-        st.divider()
-    if st.button(f"🗑️ Delete selected ({len(to_delete)})", type="primary",
-                 key="cat_dup_del", disabled=not to_delete):
-        repo.delete_catalog_items(to_delete)
-        st.session_state.pop("cat_dups", None)
-        st.toast(f"Deleted {len(to_delete)} duplicate item(s).", icon="✅")
-        st.rerun()                                        # app-level: refresh the main grid
 
 
 def _person_select(col, label, role, current, key):
-    """Dropdown of active users holding `role` (a single role name or a list of roles);
-    keeps any legacy stored value selectable. Always exactly one '-' (unassign) entry."""
-    raw = (auth.users_in_roles(role) if isinstance(role, (list, tuple, set))
-           else auth.users_in_role(role))
-    names = []
-    for n in raw:                            # drop blank/placeholder entries and dedupe
-        n = str(n or "").strip()
-        if n and n != "-" and n not in names:
-            names.append(n)
+    """Dropdown of active users holding `role`; keeps any legacy stored value selectable."""
+    names = auth.users_in_role(role)
     cur = (current or "").strip()
     opts = ["-"] + names
-    if cur and cur != "-" and cur not in names:
-        opts = ["-", cur] + names            # preserve a real stored name not in the list
+    if cur and cur not in names:
+        opts = ["-", cur] + names           # preserve a name that isn't a current user
     pick = col.selectbox(label, opts, index=opts.index(cur) if cur in opts else 0, key=key)
     return "" if pick == "-" else pick
 
@@ -378,7 +276,6 @@ def _ensure_state():
         st.session_state.header = {
             **DEFAULT_TERMS,
             "client": "", "project": "", "contact": "", "phone": "",
-            "contractor": "", "region": "",
             "sales": "", "presales": "", "pm": "",
             "offer": _next_offer_no(), "system": "LCS",
             "date": dt.date.today().isoformat(), "margin": 1.60,
@@ -392,7 +289,6 @@ def _new_offer_header(overrides: dict | None = None) -> dict:
     header = {
         **DEFAULT_TERMS,
         "client": "", "project": "", "contact": "", "phone": "",
-        "contractor": "", "region": "",
         "sales": "", "presales": "", "pm": "",
         "offer": _next_offer_no(), "system": "LCS",
         "date": dt.date.today().isoformat(), "margin": 1.60,
@@ -422,8 +318,6 @@ def _prime_new_offer_form(header: dict | None = None, grid: pd.DataFrame | None 
     st.session_state["no_project"] = h.get("project", "")
     st.session_state["no_contact"] = h.get("contact", "")
     st.session_state["no_phone"] = h.get("phone", "")
-    st.session_state["no_contractor"] = h.get("contractor", "")
-    st.session_state["no_region"] = h.get("region", "")
     st.session_state["no_sales"] = h.get("sales", "")
     st.session_state["no_presales"] = h.get("presales", "")
     st.session_state["no_pm"] = h.get("pm", "")
@@ -496,24 +390,6 @@ def _fmt_date(value, default: str = "-") -> str:
     return s or default
 
 
-def _fmt_month_year(value, default: str = "01-2025") -> str:
-    """Show a stored date as MM-YYYY."""
-    text = _text(value)
-    if not text:
-        return default
-    try:
-        if isinstance(value, (dt.datetime, dt.date)):
-            return value.strftime("%m-%Y")
-        return dt.date.fromisoformat(text[:10]).strftime("%m-%Y")
-    except (TypeError, ValueError):
-        parts = text.replace("/", "-").split("-")
-        if len(parts) >= 2 and len(parts[0]) == 2 and len(parts[1]) == 4:
-            return f"{parts[0]}-{parts[1]}"
-        if len(parts) >= 2 and len(parts[0]) == 4:
-            return f"{parts[1].zfill(2)}-{parts[0]}"
-        return default
-
-
 def _ctr(col, text, header: bool = False):
     """Write center-aligned text into a column (header = small grey caption style)."""
     style = ("text-align:center;font-size:0.8rem;color:#808495" if header
@@ -521,230 +397,22 @@ def _ctr(col, text, header: bool = False):
     col.markdown(f"<div style='{style}'>{text}</div>", unsafe_allow_html=True)
 
 
-def _builder_column_order(editor_key: str, host=st, width="content"):
-    # The app owns this preference so hidden columns stay hidden after editor reruns.
-    with host.popover("⚙ Columns", help="Show / hide columns - your choice sticks across edits.",
-                      width=width):
-        st.markdown("<div style='min-width:320px'></div>", unsafe_allow_html=True)
-        cc = st.columns(2)
-        visible = [col for i, col in enumerate(BUILDER_COLS)
-                   if cc[i % 2].checkbox(col, value=True, key=f"{editor_key}_show_{col}")]
-    return tuple(c for c in BUILDER_COLS if c in visible) or tuple(BUILDER_COLS)
-
-
-def _editor_full_height(row_count: int) -> int:
-    return 76 + max(row_count, 1) * 35
-
-
-EDIT_WIDGET_KEYS = (
-    "edit_grid", "edit_key", "edit_pid", "edit_system", "edit_terms", "edit_header",
-    "edit_project_sheet", "edit_discount", "edit_dirty_snapshot", "edit_show_cancel_dialog",
-    "edit_close_after_save", "edit_editor", "ed_option", "ed_discount_percent",
-    "ed_discount_driver", "ed_discount_subtotal", "eh_client", "eh_project", "eh_contact",
-    "eh_phone", "eh_contractor", "eh_region", "eh_sales", "eh_presales", "eh_pm",
-    "ed_subject", "ed_greet", "ed_sys", "ed_scope", "ed_excl", "ed_prereq",
-    "ed_deliv", "ed_valid", "ed_pay", "ed_notes",
-    "ed_ps_job_reference", "ed_ps_sheet_date", "ed_ps_lead_source", "ed_ps_commission",
-    "ed_ps_shipment_by", "ed_ps_downpayment_date", "ed_ps_invoice_to",
-    "ed_ps_delivery_instructions", "ed_ps_salesman_signature", "ed_ps_gm_signature",
-)
-
-
-def _snapshot_value(value):
-    if value is None:
-        return None
-    try:
-        if pd.isna(value):
-            return None
-    except (TypeError, ValueError):
-        pass
-    if isinstance(value, (int, float)):
-        return round(float(value), 6)
-    return str(value).strip()
-
-
-def _grid_snapshot(grid: pd.DataFrame) -> list[dict]:
-    if grid is None:
-        return []
-    df = calc.recompute(grid).reset_index(drop=True).copy()
-    cols = [c for c in BUILDER_COLS + ["LineType", "_ItemID"] if c in df.columns]
-    return [
-        {col: _snapshot_value(row.get(col)) for col in cols}
-        for row in df[cols].to_dict("records")
-    ]
-
-
-def _dict_snapshot(values: dict | None) -> dict:
-    values = values or {}
-    return {key: _snapshot_value(values.get(key)) for key in sorted(values)}
-
-
-def _edit_snapshot() -> dict:
-    return {
-        "grid": _grid_snapshot(st.session_state.get("edit_grid")),
-        "terms": _dict_snapshot(st.session_state.get("edit_terms")),
-        "header": _dict_snapshot(st.session_state.get("edit_header")),
-        "project_sheet": _dict_snapshot(st.session_state.get("edit_project_sheet")),
-        "discount": _snapshot_value(st.session_state.get("edit_discount")),
-        "option": _snapshot_value(st.session_state.get("ed_option")),
-    }
-
-
-def _sync_edit_state_from_widgets():
-    if "edit_header" in st.session_state:
-        header_keys = {
-            "client": "eh_client", "project": "eh_project", "contact": "eh_contact",
-            "phone": "eh_phone", "contractor": "eh_contractor", "region": "eh_region",
-            "sales": "eh_sales", "presales": "eh_presales", "pm": "eh_pm",
-        }
-        for field, key in header_keys.items():
-            if key in st.session_state:
-                st.session_state.edit_header[field] = st.session_state.get(key)
-
-    if "edit_terms" in st.session_state:
-        term_keys = {
-            "subject": "ed_subject", "greeting": "ed_greet", "system_note": "ed_sys",
-            "scope": "ed_scope", "exclusions": "ed_excl", "prerequisites": "ed_prereq",
-            "delivery": "ed_deliv", "validity": "ed_valid", "payment": "ed_pay",
-            "notes": "ed_notes",
-        }
-        for field, key in term_keys.items():
-            if key in st.session_state:
-                st.session_state.edit_terms[field] = st.session_state.get(key)
-
-    if "edit_project_sheet" in st.session_state:
-        ps_keys = {
-            "job_reference": "ed_ps_job_reference", "sheet_date": "ed_ps_sheet_date",
-            "lead_source": "ed_ps_lead_source", "commission": "ed_ps_commission",
-            "shipment_by": "ed_ps_shipment_by", "downpayment_date": "ed_ps_downpayment_date",
-            "invoice_to": "ed_ps_invoice_to",
-            "delivery_instructions": "ed_ps_delivery_instructions",
-            "salesman_signature": "ed_ps_salesman_signature", "gm_signature": "ed_ps_gm_signature",
-        }
-        for field, key in ps_keys.items():
-            if key in st.session_state:
-                st.session_state.edit_project_sheet[field] = st.session_state.get(key)
-
-
-def _sync_new_header_from_widgets():
-    if "header" not in st.session_state:
-        return
-
-    h = st.session_state.header
-    header_keys = {
-        "client": "no_client", "project": "no_project", "contact": "no_contact",
-        "phone": "no_phone", "contractor": "no_contractor", "region": "no_region",
-        "sales": "no_sales", "presales": "no_presales", "pm": "no_pm",
-        "option": "no_option",
-    }
-    for field, key in header_keys.items():
-        if key in st.session_state:
-            h[field] = st.session_state.get(key)
-
-    if "no_offer_type" in st.session_state:
-        selected = st.session_state.get("no_offer_type", "(none)")
-        h["system"] = "" if selected == "(none)" else selected
-    if "no_offer_ov" in st.session_state:
-        h["offer_override"] = (st.session_state.get("no_offer_ov") or "").strip()
-    if "no_offer_lock" in st.session_state or "no_offer_type" in st.session_state:
-        h["offer"] = (
-            st.session_state.get("no_offer_lock")
-            or h.get("offer_override")
-            or repo.make_offer_no(h.get("system", ""))
-        )
-
-    term_keys = {
-        "subject": "no_subject", "greeting": "no_greet", "system_note": "no_sys",
-        "scope": "no_scope", "exclusions": "no_excl", "prerequisites": "no_prereq",
-        "delivery": "no_deliv", "validity": "no_valid", "payment": "no_pay",
-        "notes": "no_notes",
-    }
-    for field, key in term_keys.items():
-        if key in st.session_state:
-            h[field] = st.session_state.get(key)
-
-    ps = h.setdefault("project_sheet", dict(DEFAULT_PROJECT_SHEET_INFO))
-    ps_keys = {
-        "job_reference": "no_ps_job_reference", "sheet_date": "no_ps_sheet_date",
-        "lead_source": "no_ps_lead_source", "commission": "no_ps_commission",
-        "shipment_by": "no_ps_shipment_by", "downpayment_date": "no_ps_downpayment_date",
-        "invoice_to": "no_ps_invoice_to",
-        "delivery_instructions": "no_ps_delivery_instructions",
-        "salesman_signature": "no_ps_salesman_signature", "gm_signature": "no_ps_gm_signature",
-    }
-    for field, key in ps_keys.items():
-        if key in st.session_state:
-            ps[field] = st.session_state.get(key)
-    h["project_sheet"] = ps
-    st.session_state.header = h
-
-
-def _copy_widget_to_state_dict(state_key: str, field: str, widget_key: str):
-    target = st.session_state.get(state_key)
-    if isinstance(target, dict) and widget_key in st.session_state:
-        target[field] = st.session_state.get(widget_key)
-        st.session_state[state_key] = target
-
-
-def _edit_has_unsaved_changes() -> bool:
-    _sync_edit_state_from_widgets()
-    original = st.session_state.get("edit_dirty_snapshot")
-    return bool(original) and _edit_snapshot() != original
-
-
-def _mark_edit_clean():
-    _sync_edit_state_from_widgets()
-    st.session_state.edit_dirty_snapshot = _edit_snapshot()
-    st.session_state.edit_show_cancel_dialog = False
-    st.session_state.edit_close_after_save = False
-
-
-def _close_edit_mode():
-    st.session_state.edit_mode = False
-    for key in EDIT_WIDGET_KEYS + ("pdf_bytes", "project_sheet_bytes", "saved_rev"):
-        st.session_state.pop(key, None)
-
-
-@st.dialog("Unsaved changes", width="small", dismissible=False)
-def _cancel_edit_dialog():
-    _, xcol = st.columns([8, 1])
-    if xcol.button("X", key="ed_cancel_modal_back", width="stretch",
-                   help="Back to editor"):
-        st.session_state.edit_show_cancel_dialog = False
-        st.rerun()
-
-    st.warning("You have unsaved changes in this edit.")
-    st.write("Save this revision before closing, or close the editor without saving.")
-    save_col, close_col = st.columns(2)
-    if save_col.button("💾 Save", type="primary", key="ed_cancel_modal_save",
-                       width="stretch"):
-        st.session_state.pending_save = "this"
-        st.session_state.edit_close_after_save = True
-        st.session_state.edit_show_cancel_dialog = False
-        st.rerun()
-    if close_col.button("X Close without saving", key="ed_cancel_modal_discard",
-                        width="stretch"):
-        _close_edit_mode()
-        st.rerun()
-
-
-def render_editable_grid(state_key: str, editor_key: str, in_fragment: bool = False,
-                         column_order=None):
+def render_editable_grid(state_key: str, editor_key: str, in_fragment: bool = False):
     """Full editable grid (all columns) with live recompute + one auto-rerun on change.
 
     in_fragment: when True the auto-rerun is scoped to the calling st.fragment, so a
     cell edit refreshes only the grid area instead of re-running the whole page."""
     grid = calc.recompute(st.session_state[state_key])
-    colcfg = {c: st.column_config.NumberColumn(c, format="accounting") for c in MONEY_COLS}
+    colcfg = {c: st.column_config.NumberColumn(c, format="%.0f") for c in MONEY_COLS}
     colcfg["Qty"] = st.column_config.NumberColumn("Qty", format="%d", min_value=0)
     colcfg["Cur"] = st.column_config.SelectboxColumn(
         "Cur", options=calc.CURRENCIES, required=False, width="small",
         help="Currency of List Price & Ex Unit Cost. The Unit Cost is converted to "
              "USD automatically (EUR rate from Settings; SAR pegged at 3.75).")
     # List Price & Ex Unit Cost are in the row's chosen currency (drop the misleading $).
-    colcfg["List Price $"] = st.column_config.NumberColumn("List Price", format="accounting")
-    colcfg["Ex Unit Cost $"] = st.column_config.NumberColumn("Ex Unit Cost", format="accounting")
-    colcfg["Unit Cost $"] = st.column_config.NumberColumn("Unit Cost (USD)", format="accounting")
+    colcfg["List Price $"] = st.column_config.NumberColumn("List Price", format="%.0f")
+    colcfg["Ex Unit Cost $"] = st.column_config.NumberColumn("Ex Unit Cost", format="%.0f")
+    colcfg["Unit Cost $"] = st.column_config.NumberColumn("Unit Cost (USD)", format="%.0f")
     colcfg["Shipping %"] = st.column_config.NumberColumn(
         "Shipping %", format="%.2f", min_value=0.0, step=5.0,
         help="Added to Ex Unit Cost. Unit Cost = Ex Unit Cost x (1 + Shipping % / 100), in USD.")
@@ -752,14 +420,17 @@ def render_editable_grid(state_key: str, editor_key: str, in_fragment: bool = Fa
         "Margin x", format="%.2f", min_value=0.0, step=0.05,
         help="Multiplier on landed Unit Cost. U.Price $ = ⌈Unit Cost x Margin⌉. "
              "Set 0 to type U.Price $ manually.")
-    order = column_order if column_order is not None else _builder_column_order(editor_key)
-    display_grid = grid[BUILDER_COLS] if not grid.empty else grid
+    # Sticky column visibility - the choice persists in Session State, so hiding a
+    # column survives the rerun after each edit (the editor's own column menu does not).
+    vis_key = f"{editor_key}_cols"
+    with st.popover("⚙️ Columns", help="Show/hide grid columns - your choice sticks across edits."):
+        visible = st.multiselect("Show columns", BUILDER_COLS, default=BUILDER_COLS, key=vis_key)
+    order = tuple(c for c in BUILDER_COLS if c in visible) or tuple(BUILDER_COLS)
     edited = st.data_editor(
-        display_grid,
+        grid[BUILDER_COLS] if not grid.empty else grid,
         column_config=colcfg, disabled=[c for c in COMPUTED if c in BUILDER_COLS],
         column_order=order,
-        num_rows="dynamic", width="stretch", height=_editor_full_height(len(display_grid)),
-        row_height=35, key=editor_key, hide_index=True,
+        num_rows="dynamic", width="stretch", key=editor_key, hide_index=True,
     ).reset_index(drop=True)
 
     base = st.session_state[state_key].reset_index(drop=True)
@@ -785,303 +456,8 @@ def render_editable_grid(state_key: str, editor_key: str, in_fragment: bool = Fa
     return new_grid
 
 
-@st.fragment
-def _edit_panel(meta):
-    # -------------------- EDIT: all columns -> new revision OR new option --------------------
-    base = meta.get("BaseName") or repo.base_name(meta.get("ProjectName") or "Offer")
-    src_rev = int(meta.get("RevisionNo") or 0)
-    nextrev = repo.next_revision(base)
-    if "edit_terms" not in st.session_state:
-        st.session_state.edit_terms = {**DEFAULT_TERMS, **repo.load_terms(meta)}
-    if "edit_header" not in st.session_state:
-        st.session_state.edit_header = {
-            "client": _text(meta.get("ClientName")), "project": _text(meta.get("ProjectName")),
-            "contact": _text(meta.get("ContactName")), "phone": _text(meta.get("ContactPhone")),
-            "contractor": _text(meta.get("Contractor")), "region": _text(meta.get("Region")),
-            "sales": _text(meta.get("SalesPerson")),
-            "presales": _text(meta.get("PresalesEngineer")),
-            "pm": _text(meta.get("ProjectManager")),
-        }
-    if "edit_project_sheet" not in st.session_state:
-        st.session_state.edit_project_sheet = {
-            **DEFAULT_PROJECT_SHEET_INFO, **repo.load_project_sheet_info(meta)
-        }
-    if "edit_dirty_snapshot" not in st.session_state:
-        st.session_state.edit_dirty_snapshot = _edit_snapshot()
-
-    _sync_edit_state_from_widgets()
-    ea1, ea2, ea3, ea4 = st.columns([1.55, 1.55, 1.45, 0.36], vertical_alignment="center")
-    if ea1.button("💾 Save on this revision", type="primary", width="stretch",
-                  key="ed_save_this_top",
-                  help="Overwrite the current revision/option in place - keeps the same "
-                       "offer #, revision, option and approval."):
-        _sync_edit_state_from_widgets()
-        st.session_state.pending_save = "this"
-        st.rerun()
-    if ea2.button("💾 Save as new revision", width="stretch", key="ed_save_revision_top",
-                  help=f"Create {repo.revision_token(nextrev)} as a changed version."):
-        _sync_edit_state_from_widgets()
-        st.session_state.pending_save = "revision"
-        st.rerun()
-    if ea3.button("💾 Save as new option", width="stretch", key="ed_save_option_top",
-                  help="Needs an Option label (set it in the Totals section below)."):
-        _sync_edit_state_from_widgets()
-        st.session_state.pending_save = "option"
-        st.rerun()
-    if ea4.button("X", key="ed_cancel", width="stretch", help="Close editor"):
-        if _edit_has_unsaved_changes():
-            st.session_state.edit_show_cancel_dialog = True
-        else:
-            _close_edit_mode()
-        st.rerun()
-    if st.session_state.get("edit_show_cancel_dialog"):
-        _cancel_edit_dialog()
-
-    # ---- Editable offer header (client / project / people) ----
-    eh = st.session_state.edit_header
-    with st.expander("✏️ Project Details (client · project · contact · people)", expanded=False):
-        hc1, hc2, hc3 = st.columns(3)
-        eh["client"] = hc1.text_input("Client", eh.get("client", ""), key="eh_client")
-        eh["project"] = hc1.text_input("Project", eh.get("project", ""), key="eh_project")
-        eh["contact"] = hc2.text_input("Contact", eh.get("contact", ""), key="eh_contact")
-        eh["phone"] = hc2.text_input(
-            "Phone", eh.get("phone", ""), key="eh_phone",
-            on_change=_copy_widget_to_state_dict,
-            args=("edit_header", "phone", "eh_phone"))
-        eh["contractor"] = hc3.text_input(
-            "Contractor", eh.get("contractor", ""), key="eh_contractor",
-            on_change=_copy_widget_to_state_dict,
-            args=("edit_header", "contractor", "eh_contractor"))
-        eh["region"] = hc3.text_input(
-            "Region", eh.get("region", ""), key="eh_region",
-            on_change=_copy_widget_to_state_dict,
-            args=("edit_header", "region", "eh_region"))
-        ph1, ph2, ph3 = st.columns(3)
-        eh["sales"] = _person_select(ph1, "Sales Person", SALES_PERSON_ROLES,
-                                     eh.get("sales", ""), "eh_sales")
-        eh["presales"] = _person_select(ph2, "Pre-sales Engineer", PEOPLE_ROLES["presales"],
-                                        eh.get("presales", ""), "eh_presales")
-        eh["pm"] = _person_select(ph3, "Project Manager", PEOPLE_ROLES["pm"],
-                                  eh.get("pm", ""), "eh_pm")
-    st.session_state.edit_header = eh
-
-    terms_form(st.session_state.edit_terms, "ed")
-    edit_header_for_ps = {
-        **st.session_state.edit_terms,
-        "client": eh.get("client"), "project": eh.get("project"),
-        "contact": eh.get("contact"), "phone": eh.get("phone"),
-        "contractor": eh.get("contractor"), "region": eh.get("region"),
-        "sales": eh.get("sales"), "date": meta.get("CreationDate"),
-        "project_sheet": st.session_state.edit_project_sheet,
-    }
-    if _ps_enabled():
-        project_sheet_info_form(edit_header_for_ps, "ed_ps")
-        st.session_state.edit_project_sheet = edit_header_for_ps["project_sheet"]
-    catalogue_add("edit_grid", float(repo.get_setting("default_margin") or 1.6), "ed",
-                  st.session_state.get("edit_system", ""))
-    col_pick, _ = st.columns([0.9, 5.1], vertical_alignment="center")
-    edit_column_order = _builder_column_order("edit_editor", host=col_pick, width="stretch")
-    grid = render_editable_grid("edit_grid", "edit_editor", in_fragment=True,
-                                column_order=edit_column_order)
-
-    st.markdown("##### Totals")
-    edit_calc_grid = calc.recompute(st.session_state.edit_grid)
-    edit_base_summary = calc.summarize(edit_calc_grid, 0)
-    tcol, pcol, ocol = st.columns([1, 1, 2])
-    edit_discount = _discount_inputs(
-        "ed", "edit_discount", edit_base_summary["subtotal_sar"], tcol, pcol)
-    opt_label = ocol.text_input("Option label (e.g. Dynalite, KNX)", key="ed_option",
-                                help="Names this alternative. Required for 'Save as new option'.")
-    s = calc.summarize(edit_calc_grid, edit_discount)
-    m1, m2, m3 = st.columns(3)
-    _subtotal_metric(m1, s)
-    m2.metric(f"VAT {calc.VAT_RATE * 100:g}% (SAR)", f"{s['vat_amount_sar']:,.2f}")
-    m3.metric("Grand Total (SAR)", f"{s['grand_total_sar']:,.2f}")
-    _profit_banner(s)
-
-    edit_terms = st.session_state.get("edit_terms", dict(DEFAULT_TERMS))
-    edit_project_sheet = st.session_state.get("edit_project_sheet", dict(DEFAULT_PROJECT_SHEET_INFO))
-    edit_header = st.session_state.get("edit_header", {})
-
-    def _post_save(npid, nname, nrev):
-        offer_rev = repo.project_meta(npid).get("OfferNo") or nname   # actual saved offer #
-        h = {**edit_terms,
-             "client": edit_header.get("client"), "project": edit_header.get("project") or nname,
-             "contact": edit_header.get("contact"), "phone": edit_header.get("phone", ""),
-             "contractor": edit_header.get("contractor"), "region": edit_header.get("region"),
-             "sales": edit_header.get("sales"), "presales": edit_header.get("presales"),
-             "pm": edit_header.get("pm"),
-             "offer": offer_rev, "date": dt.date.today().isoformat(),
-             "project_sheet": edit_project_sheet}
-        _make_pdf_download(h, calc.recompute(st.session_state.edit_grid), s)
-        st.session_state.saved_rev = (npid, nname, nrev)
-
-    # Execute the save requested from the action row above the grid (the buttons
-    # there only set the flag; the work needs the totals/option computed above).
-    _cur_rev = int(meta.get("RevisionNo") or 0)
-    pending = st.session_state.pop("pending_save", None)
-    close_after_save = bool(st.session_state.pop("edit_close_after_save", False)) if pending else False
-    if pending:
-        _sync_edit_state_from_widgets()
-        edit_terms = st.session_state.get("edit_terms", dict(DEFAULT_TERMS))
-        edit_project_sheet = st.session_state.get("edit_project_sheet", dict(DEFAULT_PROJECT_SHEET_INFO))
-        edit_header = st.session_state.get("edit_header", {})
-    if pending == "this":
-        repo.update_offer(
-            st.session_state.edit_pid, calc.recompute(st.session_state.edit_grid),
-            discount_sar=edit_discount,
-            factors=(s["markup_factor"], None, None),
-            system_suffix=st.session_state.get("edit_system", "LCS"), terms=edit_terms,
-            project_sheet_info=edit_project_sheet, header=edit_header)
-        _post_save(st.session_state.edit_pid,
-                   edit_header.get("project") or meta.get("ProjectName"), _cur_rev)
-        _name = edit_header.get("project") or meta.get("ProjectName")
-        st.toast(f"Updated {_name} in place.", icon="✅")
-        st.success(f"Updated **{_name}** in place.")
-        if close_after_save:
-            _close_edit_mode()
-            st.rerun()
-        _mark_edit_clean()
-    elif pending == "revision":
-        npid, nname, nrev = repo.save_revision(
-            st.session_state.edit_pid, calc.recompute(st.session_state.edit_grid),
-            discount_sar=edit_discount,
-            factors=(s["markup_factor"], None, None),
-            system_suffix=st.session_state.get("edit_system", "LCS"),
-            terms=edit_terms, option_label=opt_label.strip(),
-            project_sheet_info=edit_project_sheet, header=edit_header)
-        _post_save(npid, nname, nrev)
-        st.toast(f"Saved {nname} as ProjectID {npid}.", icon="✅")
-        st.success(f"Saved **{nname}** as ProjectID {npid}.")
-        _mark_edit_clean()
-    elif pending == "option":
-        if not opt_label.strip():
-            st.toast("Enter an Option label first (set it below).", icon="⚠️")
-            st.warning("Enter an Option label first (e.g. Dynalite / KNX).")
-        else:
-            npid, nname, nrev = repo.save_option(
-                st.session_state.edit_pid, calc.recompute(st.session_state.edit_grid),
-                option_label=opt_label.strip(),
-                discount_sar=edit_discount,
-                factors=(s["markup_factor"], None, None),
-                system_suffix=st.session_state.get("edit_system", "LCS"), terms=edit_terms,
-                project_sheet_info=edit_project_sheet, header=edit_header)
-            _post_save(npid, nname, nrev)
-            st.toast(f"Saved option {nname} as ProjectID {npid}.", icon="✅")
-            st.success(f"Saved option **{nname}** as ProjectID {npid}.")
-            _mark_edit_clean()
-    if "pdf_bytes" in st.session_state and st.session_state.get("saved_rev"):
-        fn = f"Quotation_{st.session_state.saved_rev[1]}.pdf".replace(" ", "")
-        st.download_button("⬇️ Download Offer PDF", st.session_state.pdf_bytes,
-                           file_name=fn, mime="application/pdf")
-
-
-@st.fragment
-def _new_project_editor():
-    _sync_new_header_from_widgets()
-    h = st.session_state.header
-    # ---- Add items from catalogue ----
-    _dm = float(repo.get_setting("default_margin") or 1.6)   # default margin from Settings
-    catalogue_add("grid", _dm, "no", st.session_state.header["system"], show_clear=True)
-
-    # ---- Editable grid (builder always shows costs) ----
-    st.caption("Edit **Qty · Ex Unit Cost · Shipping % · Margin x** → prices recalc automatically. "
-               "Locked columns are computed.")
-    grid = render_editable_grid("grid", "editor", in_fragment=True)
-
-    # ---- Discount + totals ----
-    st.markdown("##### Totals")
-    calc_grid = calc.recompute(st.session_state.grid)
-    base_summary = calc.summarize(calc_grid, 0)
-    dcol, pcol, _ = st.columns([1, 1, 2])
-    discount_sar = _discount_inputs("no", "discount", base_summary["subtotal_sar"], dcol, pcol)
-    s = calc.summarize(calc_grid, discount_sar)
-
-    m1, m2, m3 = st.columns(3)
-    _subtotal_metric(m1, s)
-    m2.metric(f"VAT {calc.VAT_RATE * 100:g}% (SAR)", f"{s['vat_amount_sar']:,.2f}")
-    m3.metric("Grand Total (SAR)", f"{s['grand_total_sar']:,.2f}")
-    _profit_banner(s)
-    if admin:
-        a1, a2, a3 = st.columns(3)
-        a1.metric("Total Cost (USD)", f"{s['total_cost_usd']:,.2f}")
-        a2.metric("Cost in SAR", f"{s['cost_sar']:,.2f}")
-        a3.metric("Total Selling (USD)", f"{s['total_sell_usd']:,.2f}")
-
-    # ---- Actions ----
-    st.divider()
-    if st.session_state.get("no_offer_lock"):
-        st.caption(f"Adding options to **{h['offer']}** - build this option, name it, then "
-                   "**Save option**. Use **➕ Add another option** to start the next one, or "
-                   "**🆕 New offer** to begin a fresh offer.")
-    ac1, ac2, ac3, ac4, ac5 = st.columns(5)
-    _optname = (h.get("option") or "").strip()
-    if ac1.button("💾 Save option" if st.session_state.get("no_offer_lock") else "💾 Save offer",
-                  type="primary", width="stretch"):
-        _sync_new_header_from_widgets()
-        h = st.session_state.header
-        _optname = (h.get("option") or "").strip()
-        _locked_now = st.session_state.get("no_offer_lock")
-        _done = st.session_state.get("no_saved_options", [])
-        if st.session_state.grid.empty:
-            st.warning("Grid is empty.")
-        elif _locked_now and not _optname:
-            st.warning("Enter an Option label for this alternative (e.g. KNX).")
-        elif _optname and _optname in _done:
-            st.warning(f"Option '{_optname}' is already saved for this offer.")
-        else:
-            name = (h["project"] or "Untitled") + (f" ({_optname})" if _optname else "")
-            pid = repo.save_offer(
-                name=name, client=h["client"], contact=h["contact"],
-                offer_no=h["offer"], system_suffix=h["system"],
-                grid=calc.recompute(st.session_state.grid),
-                discount_sar=discount_sar,
-                factors=(s["markup_factor"], None, None),
-                sales_person=h.get("sales"), presales_engineer=h.get("presales"),
-                project_manager=h.get("pm"),
-                terms={k: h.get(k) for k in TERMS_KEYS}, option_label=_optname,
-                project_sheet_info=h.get("project_sheet"), phone=h.get("phone"),
-                contractor=h.get("contractor"), region=h.get("region"))
-            st.session_state.no_offer_lock = h["offer"]          # lock # for further options
-            st.session_state.setdefault("no_saved_options", []).append(_optname or "Main")
-            st.success(f"Saved {('option ' + _optname) if _optname else 'offer'} (ProjectID {pid}).")
-
-    if ac2.button("➕ Add another option", width="stretch",
-                  disabled=not st.session_state.get("no_offer_lock")):
-        st.session_state.grid = _empty_grid()
-        st.session_state["_no_reset_option"] = True   # clear option label on next run
-        st.rerun()
-
-    if ac3.button("🆕 New offer", width="stretch"):
-        st.session_state.grid = _empty_grid()
-        st.session_state.no_offer_lock = None
-        st.session_state.no_saved_options = []
-        st.session_state["_no_reset_all"] = True       # clear option label + override
-        st.session_state.pop("pdf_bytes", None)
-        st.session_state.pop("project_sheet_bytes", None)
-        st.rerun()
-
-    if ac4.button("📄 Generate Offer PDF", width="stretch"):
-        _make_pdf_download(h, st.session_state.grid, s)
-
-    if _ps_enabled() and ac5.button("📊 Generate Project Sheet", width="stretch"):
-        _make_project_sheet_download(h, s)
-
-    dl1, dl2 = st.columns(2)
-    if "pdf_bytes" in st.session_state:
-        dl1.download_button("⬇️ Download Offer PDF", st.session_state.pdf_bytes,
-                            file_name=f"Quotation_{h['offer']}{(' '+_optname) if _optname else ''}.pdf",
-                            mime="application/pdf", width="stretch")
-    if _ps_enabled() and "project_sheet_bytes" in st.session_state:
-        dl2.download_button("⬇️ Download Project Sheet", st.session_state.project_sheet_bytes,
-                            file_name=f"Project_Sheet_{_safe_filename(h.get('offer') or h.get('project'))}.xlsx",
-                            mime=("application/vnd.openxmlformats-officedocument."
-                                  "spreadsheetml.sheet"),
-                            width="stretch")
-
-
 def catalogue_add(state_key: str, default_margin: float, kp: str, default_system: str = "",
-                  show_clear: bool = False):
+                  show_clear: bool = False, show_blank: bool = True):
     """Type-ahead catalogue search + add controls writing into st.session_state[state_key]."""
     st.markdown("##### Add item from catalogue")
     term = st.text_input("Search Model / Description / Brand", key=f"{kp}_term",
@@ -1090,24 +466,25 @@ def catalogue_add(state_key: str, default_margin: float, kp: str, default_system
     if not results.empty:
         results = results.assign(_label=results.apply(
             lambda r: f"{r['Model']} - {str(r['Description'])[:48]} ({r['Brand']})  ·x{r['TimesQuoted']}", axis=1))
-        a1, a2, a3, a4, a5, a6 = st.columns(
-            [4.0, 1.0, 0.85, 1.3, 1.3, 0.9], vertical_alignment="bottom")
+        a1, a2, a3, a4, a5 = st.columns([4, 1, 1.4, 1.4, 1.3], vertical_alignment="bottom")
         pick = a1.selectbox("Match", results["_label"].tolist(), key=f"{kp}_pick")
         chosen = results[results["_label"] == pick].iloc[0].to_dict()
-        a2.text_input("Updated On", _fmt_month_year(chosen.get("PriceUpdatedAt")),
-                      disabled=True, key=f"{kp}_price_updated_{chosen.get('ItemID')}")
-        qty = a3.number_input("Qty", min_value=1, value=1, step=1, key=f"{kp}_qty")
-        area = a4.text_input("Area", value=default_system, key=f"{kp}_area")
-        system = a5.text_input("System", value=default_system, key=f"{kp}_system")
-        if a6.button("➕ Add", width="stretch", key=f"{kp}_add"):
+        qty = a2.number_input("Qty", min_value=1, value=1, step=1, key=f"{kp}_qty")
+        area = a3.text_input("Area", value=default_system, key=f"{kp}_area")
+        system = a4.text_input("System", value=default_system, key=f"{kp}_system")
+        if a5.button("➕ Add", width="stretch", key=f"{kp}_add"):
             _add_row_to(state_key, repo.item_to_grid_row(
                 chosen, area=area, system=system, qty=int(qty), default_margin=default_margin))
             st.rerun()
     elif term:
-        st.info("No catalogue match - use the + row in the table to type freely.")
-    if show_clear:
-        bc1, _ = st.columns([1, 5])
-        if bc1.button("🧹 Clear grid", key=f"{kp}_clear", width="stretch"):
+        st.info("No catalogue match - add a blank row below and type freely.")
+    if show_blank or show_clear:
+        bc1, bc2, _ = st.columns([1, 1, 4])
+        if show_blank and bc1.button("➕ Blank row", key=f"{kp}_blank", width="stretch"):
+            _add_row_to(state_key, {**calc.blank_row(system=default_system),
+                                    "Margin x": default_margin, "LineType": "item", "_ItemID": None})
+            st.rerun()
+        if show_clear and bc2.button("🧹 Clear grid", key=f"{kp}_clear", width="stretch"):
             st.session_state[state_key] = _empty_grid()
             st.rerun()
 
@@ -1459,8 +836,8 @@ def _profit_banner(s: dict):
     def _block(label, sar, usd, align):
         return (f"<div style='flex:1;min-width:130px;text-align:{align}'>"
                 f"<div style='{lbl}'>{label}</div>"
-                f"<div style='{big}'>SAR {sar:,.2f}</div>"
-                f"<div style='{small}'>$ {usd:,.2f}</div></div>")
+                f"<div style='{big}'>SAR {sar:,.0f}</div>"
+                f"<div style='{small}'>$ {usd:,.0f}</div></div>")
 
     html = (
         f"<div style='background:{bg};border-radius:8px;padding:14px 24px;margin:2px 0 10px;"
@@ -1497,46 +874,17 @@ def _subtotal_metric(col, s: dict):
     discount = s.get("discount_sar") or 0.0
     if discount:
         col.metric("Subtotal after discount (SAR)",
-                   f"{s['discounted_subtotal_sar']:,.2f}",
-                   delta=f"-{discount:,.2f} discount", delta_color="inverse")
+                   f"{s['discounted_subtotal_sar']:,.0f}",
+                   delta=f"-{discount:,.0f} discount", delta_color="inverse")
     else:
-        col.metric("Subtotal (SAR)", f"{s['subtotal_sar']:,.2f}")
+        col.metric("Subtotal (SAR)", f"{s['subtotal_sar']:,.0f}")
 
 
 def _summary_metrics(s: dict):
     m1, m2, m3 = st.columns(3)
     _subtotal_metric(m1, s)
-    m2.metric(f"VAT {calc.VAT_RATE * 100:g}% (SAR)", f"{s['vat_amount_sar']:,.2f}")
-    m3.metric("Grand Total (SAR)", f"{s['grand_total_sar']:,.2f}")
-
-
-def _project_details_readonly(meta: dict):
-    def _readonly_field(container, label, value):
-        label_html = html.escape(label)
-        value_html = html.escape(_text(value, "-"))
-        container.markdown(
-            "<div style='margin-bottom:0.7rem'>"
-            f"<div style='font-size:0.86rem;font-weight:650;color:#516173;margin-bottom:0.25rem'>{label_html}</div>"
-            "<div style='min-height:2.45rem;border:1px solid #d9e0e8;background:#f8fafc;"
-            "border-radius:8px;padding:0.62rem 0.8rem;color:#182333;font-size:0.98rem;"
-            f"font-weight:550;line-height:1.25'>{value_html}</div>"
-            "</div>",
-            unsafe_allow_html=True,
-        )
-
-    with st.expander("Project Details", expanded=False):
-        c1, c2, c3 = st.columns(3)
-        _readonly_field(c1, "Client", meta.get("ClientName"))
-        _readonly_field(c1, "Project", meta.get("ProjectName"))
-        _readonly_field(c2, "Contact", meta.get("ContactName"))
-        _readonly_field(c2, "Phone", meta.get("ContactPhone"))
-        _readonly_field(c3, "Contractor", meta.get("Contractor"))
-        _readonly_field(c3, "Region", meta.get("Region"))
-
-        p1, p2, p3 = st.columns(3)
-        _readonly_field(p1, "Sales Person", meta.get("SalesPerson"))
-        _readonly_field(p2, "Pre-sales Engineer", meta.get("PresalesEngineer"))
-        _readonly_field(p3, "Project Manager", meta.get("ProjectManager"))
+    m2.metric(f"VAT {calc.VAT_RATE * 100:g}% (SAR)", f"{s['vat_amount_sar']:,.0f}")
+    m3.metric("Grand Total (SAR)", f"{s['grand_total_sar']:,.0f}")
 
 
 def _safe_float(value, default: float = 0.0) -> float:
@@ -1902,7 +1250,7 @@ def _render_finance_tab(project_id: int, grand_total: float):
         remaining = gt - collected
         pct = (collected / gt * 100) if gt else 0.0
         _fin_bubble("Collected", f"SAR {collected:,.2f}",
-                    [f"{pct:.0f}% collected", f"of SAR {gt:,.2f}"],
+                    [f"{pct:.0f}% collected", f"of SAR {gt:,.0f}"],
                     "Remaining / Due", f"SAR {remaining:,.2f}",
                     positive=remaining >= 0)
 
@@ -1924,7 +1272,7 @@ def _render_finance_tab(project_id: int, grand_total: float):
         markup_txt = f"Markup x{markup:.2f}" if markup else "Markup -"
         _fin_bubble("🧾 Cost (POs)", f"SAR {cost_total:,.2f}",
                     [markup_txt, f"Margin {margin_pct:.1f}%",
-                     f"VAT ({calc.VAT_RATE * 100:g}%) SAR {vat:,.2f}"],
+                     f"VAT ({calc.VAT_RATE * 100:g}%) SAR {vat:,.0f}"],
                     "💰 Net Profit", f"SAR {net_profit:,.2f}",
                     positive=net_profit >= 0)
 
@@ -1949,26 +1297,11 @@ def _company_dict():
 
 
 def _excel_bytes(df_map: dict):
-    """df_map: {sheet_name: DataFrame} -> xlsx bytes. Money columns (… SAR) use
-    accounting number format (1,234.00); counts stay whole; % keeps one decimal."""
+    """df_map: {sheet_name: DataFrame} -> xlsx bytes."""
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as w:
         for sheet, d in df_map.items():
-            name = sheet[:31]
-            d.to_excel(w, index=False, sheet_name=name)
-            ws = w.sheets[name]
-            for ci, col in enumerate(d.columns, start=1):
-                cs = str(col)
-                if cs.endswith("SAR"):
-                    fmt = "#,##0.00"
-                elif cs.endswith("%"):
-                    fmt = "0.0"
-                elif cs in ("Qty", "Count"):
-                    fmt = "#,##0"
-                else:
-                    continue
-                for row in range(2, ws.max_row + 1):       # row 1 is the header
-                    ws.cell(row=row, column=ci).number_format = fmt
+            d.to_excel(w, index=False, sheet_name=sheet[:31])
     return buf.getvalue()
 
 
@@ -2009,21 +1342,9 @@ def _render_report_builder(company):
         totals = reports.totals_row(filtered, meta["metrics"])
 
     st.caption(f"{len(result)} row(s)")
-    # Money columns (… SAR) show accounting format; counts stay integers, % keeps 1 dp.
-    rep_cfg = {}
-    for c in result.columns:
-        cs = str(c)
-        if cs.endswith("SAR"):
-            rep_cfg[c] = st.column_config.NumberColumn(cs, format="accounting")
-        elif cs.endswith("%"):
-            rep_cfg[c] = st.column_config.NumberColumn(cs, format="%.1f")
-        elif cs in ("Qty", "Count"):
-            rep_cfg[c] = st.column_config.NumberColumn(cs, format="%d")
-    st.dataframe(result, width="stretch", hide_index=True, column_config=rep_cfg)
+    st.dataframe(result, width="stretch", hide_index=True)
     if totals:
-        def _ft(k, v):
-            return f"{v:,.0f}" if str(k) in ("Qty", "Count") else f"{v:,.2f}"
-        st.markdown("  ·  ".join(f"**{k}:** {_ft(k, v)}" for k, v in totals.items()))
+        st.markdown("  ·  ".join(f"**{k}:** {v:,.0f}" for k, v in totals.items()))
 
     # ---- Exports ----
     sub = [f"Generated {dt.date.today().isoformat()} · {ds_name}"]
@@ -2287,7 +1608,7 @@ if os.path.exists(db.logo_path()):
 elif os.path.exists(_LOGO):
     st.sidebar.image(_LOGO, width="stretch")
 st.sidebar.title(_COMPANY)
-st.sidebar.caption(f"👤 **{USER.get('DisplayName') or USER.get('Username')}** · _{_role_label(ROLE)}_")
+st.sidebar.caption(f"👤 **{USER.get('DisplayName') or USER.get('Username')}** · _{ROLE}_")
 if st.sidebar.button("🔒 Log out", width="stretch"):
     st.session_state.pop("auth_user", None)
     st.rerun()
@@ -2368,46 +1689,126 @@ if mode == "New Project":
         f"font-size:1.2rem;margin:2px 0 12px'>🧾&nbsp;&nbsp;Offer #:&nbsp; <b>{h['offer']}</b>{_extra}</div>",
         unsafe_allow_html=True)
 
-    with st.expander("Project Details", expanded=True):
+    with st.expander("Offer header", expanded=True):
         c1, c2, c3 = st.columns(3)
         h["client"] = c1.text_input("Client", h["client"], key="no_client")
         h["project"] = c1.text_input("Project", h["project"], key="no_project")
         h["contact"] = c2.text_input("Contact", h["contact"], key="no_contact")
-        h["phone"] = c2.text_input(
-            "Phone", h["phone"], key="no_phone",
-            on_change=_copy_widget_to_state_dict,
-            args=("header", "phone", "no_phone"))
-        h["contractor"] = c3.text_input(
-            "Contractor", h.get("contractor", ""), key="no_contractor",
-            on_change=_copy_widget_to_state_dict,
-            args=("header", "contractor", "no_contractor"))
-        h["region"] = c3.text_input(
-            "Region", h.get("region", ""), key="no_region",
-            on_change=_copy_widget_to_state_dict,
-            args=("header", "region", "no_region"))
+        h["phone"] = c2.text_input("Phone", h["phone"], key="no_phone")
         p1, p2, p3 = st.columns(3)
-        h["sales"] = _person_select(p1, "Sales Person", SALES_PERSON_ROLES,
+        h["sales"] = _person_select(p1, "Sales Person", PEOPLE_ROLES["sales"],
                                     h.get("sales", ""), "no_sales")
         h["presales"] = _person_select(p2, "Pre-sales Engineer", PEOPLE_ROLES["presales"],
                                        h.get("presales", ""), "no_presales")
         h["pm"] = _person_select(p3, "Project Manager", PEOPLE_ROLES["pm"],
                                  h.get("pm", ""), "no_pm")
         # "System Offer" drives BOTH the offer-ref type segment and the BOQ system suffix.
-        o1, o2, o3 = st.columns(3)
-        o1.selectbox("System Offer", ["(none)"] + repo.offer_types(), key="no_offer_type",
+        c3.selectbox("System Offer", ["(none)"] + repo.offer_types(), key="no_offer_type",
                      help="The system being quoted (AV, LCS, …). Used in the offer reference "
                           "and as the BOQ system. Manage the list in Settings.")
-        o2.text_input("Offer # (blank = auto)", key="no_offer_ov",
+        c3.text_input("Offer # (blank = auto)", key="no_offer_ov",
                       help="Leave blank to auto-number; type a value to override.")
-        h["option"] = o3.text_input("Option label (optional)", key="no_option",
+        h["option"] = c3.text_input("Option label (optional)", key="no_option",
                                     help="Name this alternative (e.g. Dynalite, KNX). "
                                          "Leave blank for a single-option offer.")
 
     terms_form(st.session_state.header, "no")
-    if _ps_enabled():
-        project_sheet_info_form(st.session_state.header, "no_ps")
+    project_sheet_info_form(st.session_state.header, "no_ps")
 
-    _new_project_editor()
+    # ---- Add items from catalogue ----
+    _dm = float(repo.get_setting("default_margin") or 1.6)   # default margin from Settings
+    catalogue_add("grid", _dm, "no", st.session_state.header["system"], show_clear=True)
+
+    # ---- Editable grid (builder always shows costs) ----
+    st.caption("Edit **Qty · Ex Unit Cost · Shipping % · Margin x** → prices recalc automatically. "
+               "Locked columns are computed.")
+    grid = render_editable_grid("grid", "editor")
+
+    # ---- Discount + totals ----
+    st.markdown("##### Totals")
+    calc_grid = calc.recompute(st.session_state.grid)
+    base_summary = calc.summarize(calc_grid, 0)
+    dcol, pcol, _ = st.columns([1, 1, 2])
+    discount_sar = _discount_inputs("no", "discount", base_summary["subtotal_sar"], dcol, pcol)
+    s = calc.summarize(calc_grid, discount_sar)
+
+    m1, m2, m3 = st.columns(3)
+    _subtotal_metric(m1, s)
+    m2.metric(f"VAT {calc.VAT_RATE * 100:g}% (SAR)", f"{s['vat_amount_sar']:,.0f}")
+    m3.metric("Grand Total (SAR)", f"{s['grand_total_sar']:,.0f}")
+    _profit_banner(s)
+    if admin:
+        a1, a2, a3 = st.columns(3)
+        a1.metric("Total Cost (USD)", f"{s['total_cost_usd']:,.2f}")
+        a2.metric("Cost in SAR", f"{s['cost_sar']:,.0f}")
+        a3.metric("Total Selling (USD)", f"{s['total_sell_usd']:,.2f}")
+
+    # ---- Actions ----
+    st.divider()
+    if st.session_state.get("no_offer_lock"):
+        st.caption(f"Adding options to **{h['offer']}** - build this option, name it, then "
+                   "**Save option**. Use **➕ Add another option** to start the next one, or "
+                   "**🆕 New offer** to begin a fresh offer.")
+    ac1, ac2, ac3, ac4, ac5 = st.columns(5)
+    _optname = (h.get("option") or "").strip()
+    if ac1.button("💾 Save option" if st.session_state.get("no_offer_lock") else "💾 Save offer",
+                  type="primary", width="stretch"):
+        _locked_now = st.session_state.get("no_offer_lock")
+        _done = st.session_state.get("no_saved_options", [])
+        if st.session_state.grid.empty:
+            st.warning("Grid is empty.")
+        elif _locked_now and not _optname:
+            st.warning("Enter an Option label for this alternative (e.g. KNX).")
+        elif _optname and _optname in _done:
+            st.warning(f"Option '{_optname}' is already saved for this offer.")
+        else:
+            name = (h["project"] or "Untitled") + (f" ({_optname})" if _optname else "")
+            pid = repo.save_offer(
+                name=name, client=h["client"], contact=h["contact"],
+                offer_no=h["offer"], system_suffix=h["system"],
+                grid=calc.recompute(st.session_state.grid),
+                discount_sar=discount_sar,
+                factors=(s["markup_factor"], None, None),
+                sales_person=h.get("sales"), presales_engineer=h.get("presales"),
+                project_manager=h.get("pm"),
+                terms={k: h.get(k) for k in TERMS_KEYS}, option_label=_optname,
+                project_sheet_info=h.get("project_sheet"))
+            st.session_state.no_offer_lock = h["offer"]          # lock # for further options
+            st.session_state.setdefault("no_saved_options", []).append(_optname or "Main")
+            st.success(f"Saved {('option ' + _optname) if _optname else 'offer'} (ProjectID {pid}).")
+
+    if ac2.button("➕ Add another option", width="stretch",
+                  disabled=not st.session_state.get("no_offer_lock")):
+        st.session_state.grid = _empty_grid()
+        st.session_state["_no_reset_option"] = True   # clear option label on next run
+        st.rerun()
+
+    if ac3.button("🆕 New offer", width="stretch"):
+        st.session_state.grid = _empty_grid()
+        st.session_state.no_offer_lock = None
+        st.session_state.no_saved_options = []
+        st.session_state["_no_reset_all"] = True       # clear option label + override
+        st.session_state.pop("pdf_bytes", None)
+        st.session_state.pop("project_sheet_bytes", None)
+        st.rerun()
+
+    if ac4.button("📄 Generate Offer PDF", width="stretch"):
+        _make_pdf_download(h, st.session_state.grid, s)
+
+    if ac5.button("📊 Generate Project Sheet", width="stretch"):
+        _make_project_sheet_download(h, s)
+
+    dl1, dl2 = st.columns(2)
+    if "pdf_bytes" in st.session_state:
+        dl1.download_button("⬇️ Download Offer PDF", st.session_state.pdf_bytes,
+                            file_name=f"Quotation_{h['offer']}{(' '+_optname) if _optname else ''}.pdf",
+                            mime="application/pdf", width="stretch")
+    if "project_sheet_bytes" in st.session_state:
+        dl2.download_button("⬇️ Download Project Sheet", st.session_state.project_sheet_bytes,
+                            file_name=f"Project_Sheet_{_safe_filename(h.get('offer') or h.get('project'))}.xlsx",
+                            mime=("application/vnd.openxmlformats-officedocument."
+                                  "spreadsheetml.sheet"),
+                            width="stretch")
 
 
 # ============================ LOAD EXISTING ============================
@@ -2568,7 +1969,7 @@ elif mode == "Load Project":
             _ctr(rc[2], _text(row["OfferNo"]))
             _ctr(rc[3], _fmt_date(row["CreationDate"]))
             try:
-                _ctr(rc[4], f"{repo.offer_grand_total(rid):,.2f}")
+                _ctr(rc[4], f"{repo.offer_grand_total(rid):,.0f}")
             except Exception:
                 _ctr(rc[4], "-")
             _ctr(rc[5], "✅" if row["Approved"] else "")
@@ -2607,7 +2008,6 @@ elif mode == "Load Project":
             else:
                 st.caption(f"Active · {_ttl} - click **Edit** to make a new revision or option.")
 
-            _project_details_readonly(meta)
             active_tab = _offer_tab_selector(pid, bool(meta.get("Approved")))
             if active_tab == "BoQ":
                 _summary_metrics(s)
@@ -2641,14 +2041,17 @@ elif mode == "Load Project":
                     elif apc3.button("📦 Archive", width="stretch"):
                         repo.archive_project(pid)
                         st.rerun()
+                if meta.get("SalesPerson") or meta.get("PresalesEngineer") or meta.get("ProjectManager"):
+                    st.caption(f"👤 Sales: {meta.get('SalesPerson') or '-'}  ·  "
+                               f"Pre-sales Eng.: {meta.get('PresalesEngineer') or '-'}  ·  "
+                               f"Project Mgr: {meta.get('ProjectManager') or '-'}")
                 if admin:                   # gross-profit line (internal cost view) - BoQ tab only
                     _profit_banner(s)
-                cfg = {c: st.column_config.NumberColumn(c, format="accounting") for c in MONEY_COLS}
+                cfg = {c: st.column_config.NumberColumn(c, format="%.0f") for c in MONEY_COLS}
                 cfg["Qty"] = st.column_config.NumberColumn("Qty", format="%d")
                 cfg["Shipping %"] = st.column_config.NumberColumn("Shipping %", format="%.2f")
-                view_grid = disp[[c for c in BUILDER_COLS if c in disp.columns]]
-                st.dataframe(view_grid, width="stretch", hide_index=True, column_config=cfg,
-                             height=_editor_full_height(len(view_grid)), row_height=35)
+                st.dataframe(disp[[c for c in BUILDER_COLS if c in disp.columns]],
+                             width="stretch", hide_index=True, column_config=cfg)
             elif active_tab == "Tracking":
                 _render_tracking_tab(pid, sheet)
             else:
@@ -2667,8 +2070,7 @@ elif mode == "Load Project":
                 st.session_state.edit_terms = {**DEFAULT_TERMS, **repo.load_terms(meta)}
                 st.session_state.edit_header = {
                     "client": _text(meta.get("ClientName")), "project": _text(meta.get("ProjectName")),
-                    "contact": _text(meta.get("ContactName")), "phone": _text(meta.get("ContactPhone")),
-                    "contractor": _text(meta.get("Contractor")), "region": _text(meta.get("Region")),
+                    "contact": _text(meta.get("ContactName")), "phone": "",
                     "sales": _text(meta.get("SalesPerson")),
                     "presales": _text(meta.get("PresalesEngineer")),
                     "pm": _text(meta.get("ProjectManager")),
@@ -2693,9 +2095,6 @@ elif mode == "Load Project":
                 st.session_state["ed_option"] = meta.get("OptionLabel") or ""
                 for k in ("ed_discount_percent", "ed_discount_driver", "ed_discount_subtotal"):
                     st.session_state.pop(k, None)
-                st.session_state.edit_dirty_snapshot = _edit_snapshot()
-                st.session_state.edit_show_cancel_dialog = False
-                st.session_state.edit_close_after_save = False
                 st.session_state.edit_mode = True
                 st.session_state.pop("pdf_bytes", None)
                 st.session_state.pop("project_sheet_bytes", None)
@@ -2714,9 +2113,7 @@ elif mode == "Load Project":
                         "client": _text(meta.get("ClientName")),
                         "project": _text(meta.get("ProjectName")),
                         "contact": _text(meta.get("ContactName")),
-                        "phone": _text(meta.get("ContactPhone")),
-                        "contractor": _text(meta.get("Contractor")),
-                        "region": _text(meta.get("Region")),
+                        "phone": "",
                         "sales": _text(meta.get("SalesPerson")),
                         "presales": _text(meta.get("PresalesEngineer")),
                         "pm": _text(meta.get("ProjectManager")),
@@ -2736,9 +2133,7 @@ elif mode == "Load Project":
             _multi = len(opts) > 1
             _export_header = {**DEFAULT_TERMS, **repo.load_terms(meta),
                               "client": meta.get("ClientName"), "project": meta.get("ProjectName"),
-                              "contact": meta.get("ContactName"), "phone": meta.get("ContactPhone") or "",
-                              "contractor": meta.get("Contractor") or "",
-                              "region": meta.get("Region") or "",
+                              "contact": meta.get("ContactName"), "phone": "",
                               "sales": meta.get("SalesPerson"), "presales": meta.get("PresalesEngineer"),
                               "pm": meta.get("ProjectManager"),
                               "offer": meta.get("OfferNo"), "date": meta.get("CreationDate"),
@@ -2746,7 +2141,7 @@ elif mode == "Load Project":
             if b3.button(f"📄 Generate Offer PDF{f' ({len(opts)} options)' if _multi else ''}",
                          width="stretch"):
                 _make_pdf_download(_export_header, disp, s, options=opts if _multi else None)
-            if _ps_enabled() and b4.button("📊 Generate Project Sheet", width="stretch"):
+            if b4.button("📊 Generate Project Sheet", width="stretch"):
                 _make_project_sheet_download(_export_header, s)
             dl1, dl2 = st.columns(2)
             if "pdf_bytes" in st.session_state and not st.session_state.get("saved_rev"):
@@ -2754,8 +2149,7 @@ elif mode == "Load Project":
                     "⬇️ Download Offer PDF", st.session_state.pdf_bytes,
                     file_name=f"Quotation_{meta.get('OfferNo') or meta.get('ProjectName')}.pdf",
                     mime="application/pdf", width="stretch")
-            if (_ps_enabled() and "project_sheet_bytes" in st.session_state
-                    and not st.session_state.get("saved_rev")):
+            if "project_sheet_bytes" in st.session_state and not st.session_state.get("saved_rev"):
                 dl2.download_button(
                     "⬇️ Download Project Sheet", st.session_state.project_sheet_bytes,
                     file_name=f"Project_Sheet_{_safe_filename(meta.get('OfferNo') or meta.get('ProjectName'))}.xlsx",
@@ -2786,7 +2180,167 @@ elif mode == "Load Project":
                     st.success(f"Deleted {n} entr{'y' if n == 1 else 'ies'}.")
                     st.rerun()
         else:
-            _edit_panel(meta)
+            # -------------------- EDIT: all columns -> new revision OR new option --------------------
+            base = meta.get("BaseName") or repo.base_name(meta.get("ProjectName") or "Offer")
+            src_rev = int(meta.get("RevisionNo") or 0)
+            nextrev = repo.next_revision(base)
+            st.info(f"✏️ Editing **{meta.get('ProjectName')}**. Save as a **new revision** "
+                    f"(→ {repo.revision_token(nextrev)}) - a changed version - or as **another option** of the "
+                    f"current revision ({repo.revision_token(src_rev) if src_rev else 'Original'}) - an "
+                    "alternative like Dynalite vs KNX. Loaded lines have Margin x = 0 (prices kept); "
+                    "set a margin to re-price a line.")
+            if "edit_terms" not in st.session_state:
+                st.session_state.edit_terms = {**DEFAULT_TERMS, **repo.load_terms(meta)}
+            if "edit_header" not in st.session_state:
+                st.session_state.edit_header = {
+                    "client": _text(meta.get("ClientName")), "project": _text(meta.get("ProjectName")),
+                    "contact": _text(meta.get("ContactName")), "phone": "",
+                    "sales": _text(meta.get("SalesPerson")),
+                    "presales": _text(meta.get("PresalesEngineer")),
+                    "pm": _text(meta.get("ProjectManager")),
+                }
+            if "edit_project_sheet" not in st.session_state:
+                st.session_state.edit_project_sheet = {
+                    **DEFAULT_PROJECT_SHEET_INFO, **repo.load_project_sheet_info(meta)
+                }
+
+            # ---- Editable offer header (client / project / people) ----
+            eh = st.session_state.edit_header
+            with st.expander("✏️ Offer header (client · project · contact · people)", expanded=False):
+                hc1, hc2 = st.columns(2)
+                eh["client"] = hc1.text_input("Client", eh.get("client", ""), key="eh_client")
+                eh["project"] = hc1.text_input("Project", eh.get("project", ""), key="eh_project")
+                eh["contact"] = hc2.text_input("Contact", eh.get("contact", ""), key="eh_contact")
+                eh["phone"] = hc2.text_input("Phone", eh.get("phone", ""), key="eh_phone")
+                ph1, ph2, ph3 = st.columns(3)
+                eh["sales"] = _person_select(ph1, "Sales Person", PEOPLE_ROLES["sales"],
+                                             eh.get("sales", ""), "eh_sales")
+                eh["presales"] = _person_select(ph2, "Pre-sales Engineer", PEOPLE_ROLES["presales"],
+                                                eh.get("presales", ""), "eh_presales")
+                eh["pm"] = _person_select(ph3, "Project Manager", PEOPLE_ROLES["pm"],
+                                          eh.get("pm", ""), "eh_pm")
+            st.session_state.edit_header = eh
+
+            terms_form(st.session_state.edit_terms, "ed")
+            edit_header_for_ps = {
+                **st.session_state.edit_terms,
+                "client": eh.get("client"), "project": eh.get("project"),
+                "contact": eh.get("contact"), "phone": eh.get("phone"),
+                "sales": eh.get("sales"), "date": meta.get("CreationDate"),
+                "project_sheet": st.session_state.edit_project_sheet,
+            }
+            project_sheet_info_form(edit_header_for_ps, "ed_ps")
+            st.session_state.edit_project_sheet = edit_header_for_ps["project_sheet"]
+            catalogue_add("edit_grid", float(repo.get_setting("default_margin") or 1.6), "ed",
+                          st.session_state.get("edit_system", ""), show_blank=False)
+            # Action row above the BoQ table: blank row + save/cancel. A save needs the
+            # totals/discount/option computed below the grid, so each save button only
+            # flags its intent here; the actual save runs after the grid (bottom of block).
+            ea_b, ea1, ea2, ea3, ea4 = st.columns([0.9, 1.5, 1.5, 1.4, 1.0])
+            if ea_b.button("➕ Blank row", key="ed_blank", width="stretch",
+                           help="Add an empty row to the grid below."):
+                _add_row_to("edit_grid", {**calc.blank_row(system=st.session_state.get("edit_system", "")),
+                                          "Margin x": float(repo.get_setting("default_margin") or 1.6),
+                                          "LineType": "item", "_ItemID": None})
+                st.rerun()
+            if ea1.button("💾 Save on this revision", type="primary", width="stretch",
+                          help="Overwrite the current revision/option in place - keeps the same "
+                               "offer #, revision, option and approval."):
+                st.session_state.pending_save = "this"
+                st.rerun()
+            if ea2.button("💾 Save as new revision", width="stretch"):
+                st.session_state.pending_save = "revision"
+                st.rerun()
+            if ea3.button("💾 Save as new option", width="stretch",
+                          help="Needs an Option label (set it in the Totals section below)."):
+                st.session_state.pending_save = "option"
+                st.rerun()
+            if ea4.button("✖ Cancel edit", width="stretch"):
+                st.session_state.edit_mode = False
+                for k in ("pdf_bytes", "project_sheet_bytes", "edit_terms", "edit_header",
+                          "edit_project_sheet", "ed_option",
+                          "ed_discount_percent", "ed_discount_driver", "ed_discount_subtotal"):
+                    st.session_state.pop(k, None)
+                st.rerun()
+            grid = render_editable_grid("edit_grid", "edit_editor")
+
+            st.markdown("##### Totals")
+            edit_calc_grid = calc.recompute(st.session_state.edit_grid)
+            edit_base_summary = calc.summarize(edit_calc_grid, 0)
+            tcol, pcol, ocol = st.columns([1, 1, 2])
+            edit_discount = _discount_inputs(
+                "ed", "edit_discount", edit_base_summary["subtotal_sar"], tcol, pcol)
+            opt_label = ocol.text_input("Option label (e.g. Dynalite, KNX)", key="ed_option",
+                                        help="Names this alternative. Required for 'Save as new option'.")
+            s = calc.summarize(edit_calc_grid, edit_discount)
+            m1, m2, m3 = st.columns(3)
+            _subtotal_metric(m1, s)
+            m2.metric(f"VAT {calc.VAT_RATE * 100:g}% (SAR)", f"{s['vat_amount_sar']:,.0f}")
+            m3.metric("Grand Total (SAR)", f"{s['grand_total_sar']:,.0f}")
+            _profit_banner(s)
+
+            edit_terms = st.session_state.get("edit_terms", dict(DEFAULT_TERMS))
+            edit_project_sheet = st.session_state.get("edit_project_sheet", dict(DEFAULT_PROJECT_SHEET_INFO))
+            edit_header = st.session_state.get("edit_header", {})
+
+            def _post_save(npid, nname, nrev):
+                offer_rev = repo.project_meta(npid).get("OfferNo") or nname   # actual saved offer #
+                h = {**edit_terms,
+                     "client": edit_header.get("client"), "project": edit_header.get("project") or nname,
+                     "contact": edit_header.get("contact"), "phone": edit_header.get("phone", ""),
+                     "sales": edit_header.get("sales"), "presales": edit_header.get("presales"),
+                     "pm": edit_header.get("pm"),
+                     "offer": offer_rev, "date": dt.date.today().isoformat(),
+                     "project_sheet": edit_project_sheet}
+                _make_pdf_download(h, calc.recompute(st.session_state.edit_grid), s)
+                st.session_state.saved_rev = (npid, nname, nrev)
+
+            # Execute the save requested from the action row above the grid (the buttons
+            # there only set the flag; the work needs the totals/option computed above).
+            _cur_rev = int(meta.get("RevisionNo") or 0)
+            pending = st.session_state.pop("pending_save", None)
+            if pending == "this":
+                repo.update_offer(
+                    st.session_state.edit_pid, calc.recompute(st.session_state.edit_grid),
+                    discount_sar=edit_discount,
+                    factors=(s["markup_factor"], None, None),
+                    system_suffix=st.session_state.get("edit_system", "LCS"), terms=edit_terms,
+                    project_sheet_info=edit_project_sheet, header=edit_header)
+                _post_save(st.session_state.edit_pid,
+                           edit_header.get("project") or meta.get("ProjectName"), _cur_rev)
+                _name = edit_header.get("project") or meta.get("ProjectName")
+                st.toast(f"Updated {_name} in place.", icon="✅")
+                st.success(f"Updated **{_name}** in place.")
+            elif pending == "revision":
+                npid, nname, nrev = repo.save_revision(
+                    st.session_state.edit_pid, calc.recompute(st.session_state.edit_grid),
+                    discount_sar=edit_discount,
+                    factors=(s["markup_factor"], None, None),
+                    system_suffix=st.session_state.get("edit_system", "LCS"),
+                    terms=edit_terms, option_label=opt_label.strip(),
+                    project_sheet_info=edit_project_sheet, header=edit_header)
+                _post_save(npid, nname, nrev)
+                st.toast(f"Saved {nname} as ProjectID {npid}.", icon="✅")
+                st.success(f"Saved **{nname}** as ProjectID {npid}.")
+            elif pending == "option":
+                if not opt_label.strip():
+                    st.toast("Enter an Option label first (set it below).", icon="⚠️")
+                    st.warning("Enter an Option label first (e.g. Dynalite / KNX).")
+                else:
+                    npid, nname, nrev = repo.save_option(
+                        st.session_state.edit_pid, calc.recompute(st.session_state.edit_grid),
+                        option_label=opt_label.strip(),
+                        discount_sar=edit_discount,
+                        factors=(s["markup_factor"], None, None),
+                        system_suffix=st.session_state.get("edit_system", "LCS"), terms=edit_terms,
+                        project_sheet_info=edit_project_sheet, header=edit_header)
+                    _post_save(npid, nname, nrev)
+                    st.toast(f"Saved option {nname} as ProjectID {npid}.", icon="✅")
+                    st.success(f"Saved option **{nname}** as ProjectID {npid}.")
+            if "pdf_bytes" in st.session_state and st.session_state.get("saved_rev"):
+                fn = f"Quotation_{st.session_state.saved_rev[1]}.pdf".replace(" ", "")
+                st.download_button("⬇️ Download Offer PDF", st.session_state.pdf_bytes,
+                                   file_name=fn, mime="application/pdf")
 
 
 # ============================ REPORTS ============================
@@ -2848,8 +2402,7 @@ elif mode == "Catalogue":
         rename = {"ListPriceUSD": "List Price $", "ExUnitCostUSD": "Ex Unit Cost $",
                   "Currency": "Cur",
                   "ShippingPercent": "Shipping %", "UnitCostUSD": "Unit Cost $", "DefaultUPriceUSD": "Default U.Price $",
-                  "DefaultUPriceSAR": "Default U.Price SAR", "PriceUpdatedAt": "Price Updated",
-                  "TimesQuoted": "Times Quoted"}
+                  "DefaultUPriceSAR": "Default U.Price SAR", "TimesQuoted": "Times Quoted"}
         edit_cols = list(repo.CATALOG_EDITABLE.keys())
         money_cols = [c for c in edit_cols if c != "Shipping %"]
         disp = res.rename(columns=rename).copy()
@@ -2860,22 +2413,16 @@ elif mode == "Catalogue":
             disp[c] = disp[c].map(lambda v: calc.roundup(v, 0))
         if "Shipping %" in disp.columns:
             disp["Shipping %"] = disp["Shipping %"].map(lambda v: calc.shipping_percent(v))
-        if "Price Updated" not in disp.columns:
-            disp["Price Updated"] = "01-2025"
-        else:
-            disp["Price Updated"] = disp["Price Updated"].map(_fmt_month_year)
-        base_cols = ["Brand", "Model", "Description", "Cur"] + edit_cols + ["Price Updated", "Times Quoted"]
-        colcfg = {c: st.column_config.NumberColumn(c, format="accounting", min_value=0.0)
+        base_cols = ["Brand", "Model", "Description", "Cur"] + edit_cols + ["Times Quoted"]
+        colcfg = {c: st.column_config.NumberColumn(c, format="%.0f", min_value=0.0)
                   for c in money_cols}
         colcfg["Cur"] = st.column_config.SelectboxColumn(
             "Cur", options=calc.CURRENCIES, required=False,
             help="Currency of List Price & Ex Unit Cost. Unit Cost (USD) recomputes when changed.")
-        colcfg["List Price $"] = st.column_config.NumberColumn("List Price", format="accounting", min_value=0.0)
-        colcfg["Ex Unit Cost $"] = st.column_config.NumberColumn("Ex Unit Cost", format="accounting", min_value=0.0)
-        colcfg["Unit Cost $"] = st.column_config.NumberColumn("Unit Cost (USD)", format="accounting", min_value=0.0)
+        colcfg["List Price $"] = st.column_config.NumberColumn("List Price", format="%.0f", min_value=0.0)
+        colcfg["Ex Unit Cost $"] = st.column_config.NumberColumn("Ex Unit Cost", format="%.0f", min_value=0.0)
+        colcfg["Unit Cost $"] = st.column_config.NumberColumn("Unit Cost (USD)", format="%.0f", min_value=0.0)
         colcfg["Shipping %"] = st.column_config.NumberColumn("Shipping %", format="%.2f", min_value=0.0, step=5.0)
-        colcfg["Price Updated"] = st.column_config.TextColumn(
-            "Updated On", width="small", alignment="center")
         colcfg["Times Quoted"] = st.column_config.NumberColumn("Times Quoted", format="%d")
         if not _cat_edit:                              # read-only catalogue
             st.dataframe(disp[base_cols], width="stretch", hide_index=True,
@@ -2886,7 +2433,7 @@ elif mode == "Catalogue":
             edited = st.data_editor(
                 disp[["Del"] + base_cols], column_config=colcfg, num_rows="fixed", hide_index=True,
                 width="stretch", key=f"cat_editor::{term}",
-                disabled=["Brand", "Model", "Description", "Price Updated", "Times Quoted"])
+                disabled=["Brand", "Model", "Description", "Times Quoted"])
             del_ids = [int(res.iloc[i]["ItemID"]) for i in range(len(edited))
                        if bool(edited.iloc[i]["Del"])]
             b1, b2 = st.columns(2)
@@ -2913,6 +2460,7 @@ elif mode == "Catalogue":
                 n = repo.delete_catalog_items(del_ids)
                 st.success(f"Deleted {n} item(s).")
                 st.rerun()
+
 
 # ============================ SETTINGS ============================
 elif mode == "Settings":
@@ -3120,12 +2668,6 @@ elif mode == "Settings":
                 "C.R. Number",
                 repo.get_setting("company_cr_number") or "",
             )
-            st.divider()
-            ps_enabled = st.checkbox(
-                "Enable Project Sheet (information section + export)",
-                value=repo.get_setting("project_sheet_enabled") != "0",
-                help="When off, the Project Sheet info form and its Excel export are hidden "
-                     "everywhere (New Project, Edit and the offer view).")
             saved_company = st.form_submit_button("Save company settings", type="primary")
             if saved_company:
                 repo.set_setting("company_name", company_name.strip() or "Company Name")
@@ -3134,7 +2676,6 @@ elif mode == "Settings":
                 repo.set_setting("company_vat_number", company_vat_number.strip())
                 repo.set_setting("company_cr_number", company_cr_number.strip())
                 repo.set_setting("company_brand_color", brand_color)
-                repo.set_setting("project_sheet_enabled", "1" if ps_enabled else "0")
                 st.success("Company settings saved. (Page title updates on next reload.)")
 
     with tab_images_pdf:
@@ -3637,38 +3178,6 @@ elif mode == "Settings":
                 except Exception as exc:
                     st.error(f"Restore failed: {exc}")
 
-            st.divider()
-            st.markdown("##### Catalogue only")
-            st.caption("Back up or restore just the catalogue (item list), independent of "
-                       "the full database backup above.")
-            _cat_all = repo.catalog_all()
-            st.download_button(
-                "⬇️ Backup catalogue (.xlsx)",
-                _excel_bytes({"Catalogue": _cat_all.drop(columns=["ItemID"], errors="ignore")}),
-                file_name=f"catalogue_backup_{dt.date.today().isoformat()}.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                disabled=_cat_all.empty, width="stretch")
-            st.markdown("**Restore catalogue** — replaces the entire catalogue with an uploaded backup.")
-            _cat_up = st.file_uploader("Catalogue backup (.xlsx)", type=["xlsx"], key="cat_restore_up")
-            _cat_ok = st.checkbox("I understand this replaces the current catalogue "
-                                  "(a full-database safety backup is made first).", key="cat_restore_ok")
-            if st.button("♻️ Restore catalogue", type="primary",
-                         disabled=not (_cat_up is not None and _cat_ok), width="stretch"):
-                try:
-                    _newdf = pd.read_excel(_cat_up)
-                    db_backup.create_backup("before-catalogue-restore")
-                    n = repo.replace_catalog(_newdf)
-                    st.success(f"Catalogue restored — {n} item(s). (Safety backup created.)")
-                    st.rerun()
-                except Exception as e:
-                    st.error(f"Restore failed: {e}")
-
-            st.divider()
-            st.markdown("##### Cleanup catalogue items")
-            st.caption("Find duplicate catalogue items with the same Model + Description, "
-                       "then review and delete selected copies.")
-            _catalog_dedupe_tool()
-
     with tab_updates:
         st.markdown("##### Software updates")
         gh_owner = repo.get_setting("github_owner") or "Hollako"
@@ -3727,15 +3236,14 @@ elif mode == "Users":
                 uc3, uc4, uc5 = st.columns(3)
                 np1 = uc3.text_input("Password", type="password")
                 np2 = uc4.text_input("Confirm", type="password")
-                nrole = uc5.selectbox("Role", roles, index=roles.index(_default_role),
-                                      format_func=_role_label)
+                nrole = uc5.selectbox("Role", roles, index=roles.index(_default_role))
                 if st.form_submit_button("➕ Create user", type="primary"):
                     if not nu.strip() or not np1:
                         st.warning("Username and password are required.")
                     elif np1 != np2:
                         st.warning("Passwords don't match.")
                     elif auth.create_user(nu, np1, ndn, nrole):
-                        st.success(f"Created user '{nu}' ({_role_label(nrole)}).")
+                        st.success(f"Created user '{nu}' ({nrole}).")
                         st.rerun()
                     else:
                         st.warning("Username already exists.")
@@ -3753,8 +3261,7 @@ elif mode == "Users":
                 cc[1].write(u.get("DisplayName") or "")
                 r_idx = roles.index(u["Role"]) if u["Role"] in roles else 0
                 new_role = cc[2].selectbox("Role", roles, key=f"role_{uid}",
-                                           index=r_idx, label_visibility="collapsed",
-                                           format_func=_role_label)
+                                           index=r_idx, label_visibility="collapsed")
                 active = cc[3].toggle("On", value=bool(u["Active"]), key=f"act_{uid}",
                                       label_visibility="collapsed")
                 if (new_role != u["Role"] or active != bool(u["Active"])):
@@ -3783,12 +3290,12 @@ elif mode == "Users":
     # ---------------------- ROLES & PERMISSIONS TAB --------------------
     with tab_roles:
         st.caption("Tick what each role is allowed to do, then **Save**. "
-                   "The **Owner** always has full access and can't be changed.")
+                   "The **owner** always has full access and can't be changed.")
         roles = auth.list_roles()
         rows = []
         for role in roles:
             perms = auth.role_perms(role)
-            row = {"Role": _role_label(role)}
+            row = {"Role": role}
             for k, label in auth.PERMISSIONS:
                 row[label] = (k in perms)
             rows.append(row)
@@ -3802,8 +3309,8 @@ elif mode == "Users":
                                 disabled=["Role"], key="role_matrix")
 
         if st.button("💾 Save role permissions", type="primary"):
-            for i, (_, r) in enumerate(edited.iterrows()):
-                role = roles[i]                       # actual key (the matrix shows a capitalized label)
+            for _, r in edited.iterrows():
+                role = r["Role"]
                 if role == auth.PROTECTED_ROLE:
                     continue
                 granted = {auth.LABEL_TO_PERM[lbl] for _, lbl in auth.PERMISSIONS if bool(r[lbl])}
@@ -3830,8 +3337,7 @@ elif mode == "Users":
             deletable = [r for r in roles if r != auth.PROTECTED_ROLE]
             drc1, drc2 = st.columns([3, 1.4], vertical_alignment="bottom")
             drole = drc1.selectbox("Role to delete", deletable, key="del_role",
-                                   label_visibility="collapsed",
-                                   format_func=_role_label) if deletable else None
+                                   label_visibility="collapsed") if deletable else None
             if drc2.button("Delete", width="stretch", disabled=not deletable):
                 in_use = auth.role_user_count(drole)
                 if in_use:

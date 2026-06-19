@@ -161,7 +161,12 @@ def recompute(df: pd.DataFrame) -> pd.DataFrame:
         else:
             uprice = roundup(_num(r.get("U. Price $")), 0)    # manual / from catalogue
 
-        usar = u_price_sar_from_usd(uprice) if uprice > 0 else roundup_to(_num(r.get("U. Price SAR")), SAR_ROUND_TO)
+        if uprice > 0:
+            usar = u_price_sar_from_usd(uprice)          # normal: SAR derived from the dollar price
+        elif unit > 0 or margin > 0:
+            usar = 0.0                                   # priced at 0 against a real cost/margin -> SAR follows to 0
+        else:
+            usar = roundup_to(_num(r.get("U. Price SAR")), SAR_ROUND_TO)  # SAR-only line (no USD basis) -> keep it
 
         # Every monetary value is rounded UP to a whole number.
         ship_l.append(ship)

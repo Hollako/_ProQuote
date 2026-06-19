@@ -35,11 +35,15 @@ LABEL_TO_PERM = {v: k for k, v in PERMISSIONS}
 PROTECTED_ROLE = "owner"
 
 # Seeded once into the DB on first run; afterwards the matrix is edited in the UI.
-_DEFAULT_ROLE_ORDER = ["owner", "admin", "Project Manager", "Pre-Sales",
+_DEFAULT_ROLE_ORDER = ["owner", "admin", "Top Management", "Project Manager", "Pre-Sales",
                        "sales", "procurement", "viewer"]
+# Roles introduced after the first release - added to existing DBs by a one-time,
+# flag-guarded top-up in ensure_roles_seeded (so deleting them later doesn't resurrect them).
+_LATER_ROLES = ("Top Management",)
 DEFAULT_ROLE_PERMS = {
     "owner": set(ALL_PERMS),
     "admin": set(ALL_PERMS) - {"users"},
+    "Top Management": set(ALL_PERMS) - {"users", "delete"},
     "Project Manager": {"new_offer", "load", "catalogue", "edit", "approve", "archive",
                         "tracking", "finance", "reports", "view_costs"},
     "Pre-Sales": {"new_offer", "load", "catalogue", "catalogue_edit", "edit", "view_costs"},
@@ -51,18 +55,32 @@ DEFAULT_ROLE_PERMS = {
 
 # ---------- configurable roles (DB-backed matrix) ----------
 
+def _seed_role(c, role) -> None:
+    c.execute("INSERT OR IGNORE INTO Roles(Role) VALUES(?)", (role,))
+    for p in DEFAULT_ROLE_PERMS.get(role, set()):
+        c.execute("INSERT OR IGNORE INTO RolePerms(Role,Permission) VALUES(?,?)", (role, p))
+
+
 def ensure_roles_seeded() -> None:
-    """Populate Roles/RolePerms with the defaults the first time only."""
+    """Seed the default roles on first run; afterwards apply one-time, flag-guarded
+    top-ups so roles added in later versions appear on existing databases too -
+    without resurrecting a role the user has since deleted."""
     with dbmod.connect() as c:
         try:
-            if c.execute("SELECT COUNT(*) FROM Roles").fetchone()[0]:
-                return
+            first_run = c.execute("SELECT COUNT(*) FROM Roles").fetchone()[0] == 0
         except Exception:
             return
-        for role in _DEFAULT_ROLE_ORDER:
-            c.execute("INSERT OR IGNORE INTO Roles(Role) VALUES(?)", (role,))
-            for p in DEFAULT_ROLE_PERMS.get(role, set()):
-                c.execute("INSERT OR IGNORE INTO RolePerms(Role,Permission) VALUES(?,?)", (role, p))
+        if first_run:
+            for role in _DEFAULT_ROLE_ORDER:
+                _seed_role(c, role)
+        # One-time top-ups (also marked done on first run, so they never re-add).
+        for role in _LATER_ROLES:
+            flag = f"seeded_role::{role}"
+            if c.execute("SELECT 1 FROM Settings WHERE key=?", (flag,)).fetchone():
+                continue
+            if not first_run:
+                _seed_role(c, role)
+            c.execute("INSERT OR REPLACE INTO Settings(key,value) VALUES(?,?)", (flag, "1"))
         c.commit()
 
 
@@ -133,7 +151,29 @@ def users_in_role(role: str) -> list[str]:
         rows = c.execute(
             "SELECT DisplayName, Username FROM Users WHERE Role=? AND Active=1 "
             "ORDER BY DisplayName, Username", (role,)).fetchall()
-    return [(r["DisplayName"] or r["Username"]) for r in rows]
+    return [((r["DisplayName"] or "").strip() or r["Username"]) for r in rows]
+
+
+def users_in_roles(roles) -> list[str]:
+    """Display names of active users holding ANY of `roles` (case-insensitive, deduped).
+
+    Used for the Sales Person picker, which spans several roles.
+    """
+    wanted = {str(r).strip().lower() for r in (roles or []) if str(r).strip()}
+    if not wanted:
+        return []
+    with dbmod.connect() as c:
+        rows = c.execute(
+            "SELECT DisplayName, Username, Role FROM Users WHERE Active=1 "
+            "ORDER BY DisplayName, Username").fetchall()
+    seen, out = set(), []
+    for r in rows:
+        if str(r["Role"] or "").strip().lower() in wanted:
+            name = (r["DisplayName"] or "").strip() or r["Username"]
+            if name not in seen:
+                seen.add(name)
+                out.append(name)
+    return out
 
 
 # ---------- password hashing ----------

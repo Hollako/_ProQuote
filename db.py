@@ -72,6 +72,9 @@ CREATE TABLE IF NOT EXISTS Projects_Master (
     ProjectName      TEXT,
     ClientName       TEXT,
     ContactName      TEXT,
+    ContactPhone     TEXT,
+    Contractor       TEXT,
+    Region           TEXT,
     SalesPerson      TEXT,            -- sales person who worked on the offer
     PresalesEngineer TEXT,            -- pre-sales engineer who worked on the offer
     ProjectManager   TEXT,            -- project manager assigned to the offer
@@ -119,6 +122,7 @@ CREATE TABLE IF NOT EXISTS Items_Catalog (
     UnitCostUSD      REAL,
     DefaultUPriceUSD REAL,
     DefaultUPriceSAR REAL,
+    PriceUpdatedAt   TEXT DEFAULT '2025-01-01',
     TimesQuoted      INTEGER DEFAULT 0,
     LastSeenFile     TEXT,
     LastSeenAt       TEXT,
@@ -229,6 +233,9 @@ def connect(db_path: str = DB_PATH) -> sqlite3.Connection:
 MIGRATIONS = {
     "Projects_Master": {
         "SalesPerson": "TEXT",
+        "ContactPhone": "TEXT",
+        "Contractor": "TEXT",
+        "Region": "TEXT",
         "PresalesEngineer": "TEXT",
         "ProjectManager": "TEXT",
         "RevisionNo": "INTEGER DEFAULT 0",
@@ -258,6 +265,7 @@ MIGRATIONS = {
     "Items_Catalog": {
         "ShippingPercent": "REAL",
         "Currency": "TEXT DEFAULT 'USD'",
+        "PriceUpdatedAt": "TEXT DEFAULT '2025-01-01'",
     },
 }
 
@@ -302,11 +310,23 @@ def _backfill_tracking_quantities(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
+def _backfill_catalog_price_dates(conn: sqlite3.Connection) -> None:
+    existing = {r["name"] for r in conn.execute("PRAGMA table_info(Items_Catalog)")}
+    if "PriceUpdatedAt" not in existing:
+        return
+    conn.execute(
+        "UPDATE Items_Catalog SET PriceUpdatedAt='2025-01-01' "
+        "WHERE PriceUpdatedAt IS NULL OR TRIM(PriceUpdatedAt)=''"
+    )
+    conn.commit()
+
+
 def init_db(db_path: str = DB_PATH) -> sqlite3.Connection:
     conn = connect(db_path)
     conn.executescript(SCHEMA)
     _migrate(conn)
     _backfill_tracking_quantities(conn)
+    _backfill_catalog_price_dates(conn)
     conn.commit()
     return conn
 
