@@ -213,6 +213,7 @@ CREATE TABLE IF NOT EXISTS Finance_Purchases (
 
 CREATE INDEX IF NOT EXISTS idx_catalog_model ON Items_Catalog(Model);
 CREATE INDEX IF NOT EXISTS idx_catalog_desc  ON Items_Catalog(Description);
+CREATE INDEX IF NOT EXISTS idx_projects_offer_no ON Projects_Master(OfferNo);
 CREATE INDEX IF NOT EXISTS idx_projects_archived ON Projects_Master(Archived);
 CREATE INDEX IF NOT EXISTS idx_sheets_project ON Project_Sheets(ProjectID);
 CREATE INDEX IF NOT EXISTS idx_lines_project ON Project_BoQ_Lines(ProjectID);

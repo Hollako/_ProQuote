@@ -239,8 +239,21 @@ def latest_offer_number(otype="", when=None) -> int:
     """Highest number used within this series (ignoring -Rev suffixes)."""
     before, after, _ = _number_slot(_fill_template(otype, when))
     rx = re.compile("^" + re.escape(before) + r"(\d+)" + re.escape(after) + "$")
+    where = ["OfferNo IS NOT NULL"]
+    params = []
+    if before:
+        # Use the OfferNo index to narrow to this series before parsing revisions.
+        upper = before[:-1] + chr(ord(before[-1]) + 1)
+        where.append("OfferNo >= ? AND OfferNo < ?")
+        params.extend([before, upper])
+    elif after:
+        where.append("OfferNo LIKE ?")
+        params.append(f"%{after}%")
     with _conn() as c:
-        rows = c.execute("SELECT OfferNo FROM Projects_Master WHERE OfferNo IS NOT NULL").fetchall()
+        rows = c.execute(
+            "SELECT OfferNo FROM Projects_Master WHERE " + " AND ".join(where),
+            params,
+        ).fetchall()
     nums = [int(m.group(1)) for r in rows if (m := rx.match(base_name(r["OfferNo"])))]
     return max(nums) if nums else 0
 
@@ -849,12 +862,36 @@ def list_approved_offers() -> list[dict]:
             "ORDER BY ApprovedAt DESC, ProjectID DESC")]
 
 
+def offer_grand_totals(project_ids: list[int]) -> dict[int, float]:
+    """Grand totals for many offers using one aggregate query."""
+    ids = list(dict.fromkeys(int(pid) for pid in project_ids if pid is not None))
+    if not ids:
+        return {}
+    qs = ",".join("?" * len(ids))
+    with _conn() as c:
+        rows = c.execute(
+            f"""SELECT p.ProjectID,
+                       IFNULL(p.DiscountAmount,0) AS DiscountAmount,
+                       IFNULL(SUM(l.TPriceSAR),0) AS SubtotalSAR
+                FROM Projects_Master p
+                LEFT JOIN Project_BoQ_Lines l
+                  ON l.ProjectID = p.ProjectID
+                 AND IFNULL(l.LineType,'item') NOT IN ('spare','discount')
+                WHERE p.ProjectID IN ({qs})
+                GROUP BY p.ProjectID, p.DiscountAmount""",
+            ids,
+        ).fetchall()
+    out = {}
+    for r in rows:
+        subtotal = float(r["SubtotalSAR"] or 0)
+        discount = min(abs(float(r["DiscountAmount"] or 0)), subtotal)
+        out[int(r["ProjectID"])] = round((subtotal - discount) * (1 + calc.VAT_RATE), 2)
+    return out
+
+
 def offer_grand_total(project_id: int) -> float:
     """Grand Total (SAR, incl. VAT & discount) of an offer - the finance baseline."""
-    meta = project_meta(project_id)
-    grid = load_project_grid(project_id)
-    s = calc.summarize(grid, meta.get("DiscountAmount") or 0)
-    return float(s["grand_total_sar"])
+    return offer_grand_totals([project_id]).get(int(project_id), 0.0)
 
 
 def get_finance(project_id: int) -> tuple[list[dict], list[dict]]:

@@ -1086,8 +1086,8 @@ def catalogue_add(state_key: str, default_margin: float, kp: str, default_system
     """Type-ahead catalogue search + add controls writing into st.session_state[state_key]."""
     st.markdown("##### Add item from catalogue")
     term = st.text_input("Search Model / Description / Brand", key=f"{kp}_term",
-                         placeholder="e.g. PDEG, keypad, Dynalite…")
-    results = repo.search_catalog(term, limit=20)
+                         placeholder="e.g. PDEG, keypad, Dynalite…").strip()
+    results = repo.search_catalog(term, limit=20) if term else pd.DataFrame()
     if not results.empty:
         results = results.assign(_label=results.apply(
             lambda r: f"{r['Model']} - {str(r['Description'])[:48]} ({r['Brand']})  ·x{r['TimesQuoted']}", axis=1))
@@ -2460,6 +2460,25 @@ elif mode == "Load Project":
     if st.session_state.pop("_del_reset", False):        # clear delete confirm widgets
         st.session_state.pop("del_confirm", None)
         st.session_state.pop("del_scope", None)
+
+    sc1, sc2 = st.columns([2, 1])
+    q_name = _text(sc1.text_input("Search by name", key="load_search_name")).lower()
+    q_offer = _text(sc2.text_input("Search by offer #", key="load_search_offer")).lower()
+    query_key = f"{q_name}\0{q_offer}"
+    if st.session_state.get("load_query") != query_key:
+        st.session_state.load_query = query_key
+        st.session_state.pop("view_pid", None)
+        st.session_state.pop("load_fam", None)
+        st.session_state.pop("pdf_bytes", None)
+        st.session_state.pop("project_sheet_bytes", None)
+        st.session_state.edit_mode = False
+
+    if not q_name and not q_offer:
+        st.session_state.pop("view_pid", None)
+        st.session_state.pop("load_fam", None)
+        st.info("Search by project name, client name, or offer number.")
+        st.stop()
+
     projects = repo.list_projects()
     if projects.empty:
         st.info("No projects ingested yet. Run `python ingest.py`.")
@@ -2494,24 +2513,6 @@ elif mode == "Load Project":
                 parts.append(", ".join(f["offer_nos"][:3]))
             parts.append(f"{f['n_rev']} rev. - {f['n_opt']} opt.")
             return ("✅ " if f["approved"] else "") + " · ".join(parts)
-
-        sc1, sc2 = st.columns([2, 1])
-        q_name = _text(sc1.text_input("Search by name", key="load_search_name")).lower()
-        q_offer = _text(sc2.text_input("Search by offer #", key="load_search_offer")).lower()
-        query_key = f"{q_name}\0{q_offer}"
-        if st.session_state.get("load_query") != query_key:
-            st.session_state.load_query = query_key
-            st.session_state.pop("view_pid", None)
-            st.session_state.pop("load_fam", None)
-            st.session_state.pop("pdf_bytes", None)
-            st.session_state.pop("project_sheet_bytes", None)
-            st.session_state.edit_mode = False
-
-        if not q_name and not q_offer:
-            st.session_state.pop("view_pid", None)
-            st.session_state.pop("load_fam", None)
-            st.info("Search by project name, client name, or offer number.")
-            st.stop()
 
         matches = [
             f for f in fams
@@ -2595,33 +2596,43 @@ elif mode == "Load Project":
         if st.session_state.get("view_pid") not in rev_ids:
             st.session_state.view_pid = default_id
 
-        # Revisions & options, each with its own View button.
+        # Revisions grouped first, then the options inside each revision.
         st.markdown("**Revisions & options**")
-        widths = [1.0, 1.2, 1.8, 1.0, 1.3, 0.5, 1.0, 0.9]
-        hc = st.columns(widths)
-        for col, t in zip(hc, ["Revision", "Option", "Offer #", "Date", "Grand Total (SAR)",
-                               "✓", "Status", ""]):
-            _ctr(col, t, header=True)
-        for _, row in shown.iterrows():
-            rid = int(row["ProjectID"])
-            rn = int(row["RevisionNo"]) if pd.notna(row["RevisionNo"]) else 0
-            sel = (rid == int(st.session_state.view_pid))
-            rc = st.columns(widths, vertical_alignment="center")
-            _ctr(rc[0], ("▶ " if sel else "") + (repo.revision_token(rn) if rn > 0 else "Original"))
-            _ctr(rc[1], _text(row["OptionLabel"], "-"))
-            _ctr(rc[2], _text(row["OfferNo"]))
-            _ctr(rc[3], _fmt_date(row["CreationDate"]))
-            try:
-                _ctr(rc[4], f"{repo.offer_grand_total(rid):,.2f}")
-            except Exception:
-                _ctr(rc[4], "-")
-            _ctr(rc[5], "✅" if row["Approved"] else "")
-            _ctr(rc[6], "📦 Archived" if row["Archived"] else "Active")
-            if rc[7].button("View", key=f"view_{rid}", disabled=sel, width="stretch"):
-                st.session_state.view_pid = rid
-                st.session_state.pop("pdf_bytes", None)
-                st.session_state.pop("project_sheet_bytes", None)
-                st.rerun()
+        widths = [0.35, 1.45, 1.8, 1.0, 1.3, 0.5, 1.0, 0.9]
+        shown_opts = shown.copy()
+        shown_opts["_rev_sort"] = shown_opts["RevisionNo"].fillna(0).astype(int)
+        totals_by_pid = repo.offer_grand_totals(shown_opts["ProjectID"].tolist())
+        for rn, rev_grp in shown_opts.groupby("_rev_sort", sort=True):
+            rev_label = repo.revision_token(rn) if rn > 0 else "Original"
+            opt_count = len(rev_grp)
+            approved_in_rev = bool(rev_grp["Approved"].fillna(0).max())
+            st.markdown(
+                f"<div style='font-weight:800;margin:14px 0 4px'>{html.escape(rev_label)}"
+                f"<span style='font-size:.85rem;font-weight:600;color:#6b7280'>"
+                f" · {opt_count} option{'s' if opt_count != 1 else ''}"
+                f"{' · approved' if approved_in_rev else ''}</span></div>",
+                unsafe_allow_html=True,
+            )
+            hc = st.columns(widths)
+            for col, t in zip(hc, ["", "Option", "Offer #", "Date", "Grand Total (SAR)",
+                                   "✓", "Status", ""]):
+                _ctr(col, t, header=True)
+            for _, row in rev_grp.iterrows():
+                rid = int(row["ProjectID"])
+                sel = (rid == int(st.session_state.view_pid))
+                rc = st.columns(widths, vertical_alignment="center")
+                _ctr(rc[0], "▶" if sel else "")
+                _ctr(rc[1], _text(row["OptionLabel"], "Main"))
+                _ctr(rc[2], _text(row["OfferNo"]))
+                _ctr(rc[3], _fmt_date(row["CreationDate"]))
+                _ctr(rc[4], f"{totals_by_pid.get(rid, 0):,.2f}")
+                _ctr(rc[5], "✅" if row["Approved"] else "")
+                _ctr(rc[6], "📦 Archived" if row["Archived"] else "Active")
+                if rc[7].button("View", key=f"view_{rid}", disabled=sel, width="stretch"):
+                    st.session_state.view_pid = rid
+                    st.session_state.pop("pdf_bytes", None)
+                    st.session_state.pop("project_sheet_bytes", None)
+                    st.rerun()
 
         pid = int(st.session_state.view_pid)
         systems = repo.list_systems(pid)
@@ -3703,13 +3714,25 @@ elif mode == "Settings":
             st.markdown("##### Catalogue only")
             st.caption("Back up or restore just the catalogue (item list), independent of "
                        "the full database backup above.")
-            _cat_all = repo.catalog_all()
-            st.download_button(
-                "⬇️ Backup catalogue (.zip)",
-                _catalogue_zip_bytes(_cat_all),
-                file_name=f"catalogue_backup_{dt.date.today().isoformat()}.zip",
-                mime="application/zip",
-                disabled=_cat_all.empty, width="stretch")
+            if st.button("Prepare catalogue backup (.zip)", width="stretch", key="prep_cat_backup"):
+                _cat_all = repo.catalog_all()
+                if _cat_all.empty:
+                    st.warning("Catalogue is empty.")
+                else:
+                    st.session_state["catalogue_backup_zip"] = _catalogue_zip_bytes(_cat_all)
+                    st.session_state["catalogue_backup_name"] = f"catalogue_backup_{dt.date.today().isoformat()}.zip"
+                    st.success(f"Catalogue backup ready - {_cat_all.shape[0]:,} item(s).")
+            if st.session_state.get("catalogue_backup_zip"):
+                st.download_button(
+                    "⬇️ Download prepared catalogue backup",
+                    st.session_state["catalogue_backup_zip"],
+                    file_name=st.session_state.get(
+                        "catalogue_backup_name",
+                        f"catalogue_backup_{dt.date.today().isoformat()}.zip",
+                    ),
+                    mime="application/zip",
+                    width="stretch",
+                )
             st.markdown("**Restore catalogue** — replaces the entire catalogue with an uploaded backup.")
             _cat_up = st.file_uploader("Catalogue backup (.zip)", type=["zip"], key="cat_restore_up")
             _cat_ok = st.checkbox("I understand this replaces the current catalogue "
