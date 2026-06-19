@@ -688,6 +688,20 @@ def family_key(offer_no, project_name) -> str:
     return base_name(off).lower() if off else base_name(project_name).lower()
 
 
+def db_counts() -> dict:
+    """Lightweight sidebar counts without loading big catalogue/report tables."""
+    with _conn() as c:
+        rows = c.execute(
+            "SELECT OfferNo,ProjectName FROM Projects_Master"
+        ).fetchall()
+        ncat = c.execute("SELECT COUNT(*) FROM Items_Catalog").fetchone()[0]
+    return {
+        "project_records": len(rows),
+        "project_families": len({family_key(r["OfferNo"], r["ProjectName"]) for r in rows}),
+        "catalogue_items": int(ncat or 0),
+    }
+
+
 def approve_offer(project_id: int) -> int:
     """Approve this revision+option. Every OTHER entry in the same offer family
     (losing revisions and options) is auto-archived. Returns # auto-archived."""

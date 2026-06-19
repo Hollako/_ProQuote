@@ -28,25 +28,38 @@ def _month(series: pd.Series) -> pd.Series:
 
 def offers_df(include_archived: bool = False) -> pd.DataFrame:
     """One row per offer/revision/option with totals and profit."""
-    sql = """
+    where = "" if include_archived else "WHERE IFNULL(p.Archived,0)=0"
+    sql = f"""
+        WITH first_sheets AS (
+            SELECT ProjectID, MIN(SheetID) AS SheetID
+            FROM Project_Sheets
+            GROUP BY ProjectID
+        ),
+        line_totals AS (
+            SELECT ProjectID,
+                   IFNULL(SUM(TPriceSAR),0) AS SubtotalSAR,
+                   IFNULL(SUM(TotalCostUSD),0) AS TotalCostUSD
+            FROM Project_BoQ_Lines
+            WHERE LineType='item'
+            GROUP BY ProjectID
+        )
         SELECT p.ProjectID, p.ProjectName, p.ClientName, p.SalesPerson, p.PresalesEngineer,
                p.ProjectManager, p.OfferNo, p.CreationDate, p.RevisionNo, p.OptionLabel,
                IFNULL(p.Approved,0) AS Approved, IFNULL(p.Archived,0) AS Archived,
                IFNULL(p.DiscountAmount,0) AS DiscountAmount,
-               (SELECT s.SystemSuffix FROM Project_Sheets s
-                  WHERE s.ProjectID = p.ProjectID LIMIT 1) AS System,
-               (SELECT IFNULL(SUM(l.TPriceSAR),0) FROM Project_BoQ_Lines l
-                  WHERE l.ProjectID = p.ProjectID AND l.LineType='item') AS SubtotalSAR,
-               (SELECT IFNULL(SUM(l.TotalCostUSD),0) FROM Project_BoQ_Lines l
-                  WHERE l.ProjectID = p.ProjectID AND l.LineType='item') AS TotalCostUSD
+               s.SystemSuffix AS System,
+               IFNULL(lt.SubtotalSAR,0) AS SubtotalSAR,
+               IFNULL(lt.TotalCostUSD,0) AS TotalCostUSD
         FROM Projects_Master p
+        LEFT JOIN first_sheets fs ON fs.ProjectID = p.ProjectID
+        LEFT JOIN Project_Sheets s ON s.SheetID = fs.SheetID
+        LEFT JOIN line_totals lt ON lt.ProjectID = p.ProjectID
+        {where}
     """
     with _conn() as c:
         df = pd.DataFrame([dict(r) for r in c.execute(sql)])
     if df.empty:
         return df
-    if not include_archived:
-        df = df[df["Archived"] == 0]
     sub = df["SubtotalSAR"].astype(float)
     disc = df["DiscountAmount"].abs().clip(upper=sub)
     discounted = sub - disc
@@ -69,7 +82,8 @@ def offers_df(include_archived: bool = False) -> pd.DataFrame:
 
 def lines_df(include_archived: bool = False) -> pd.DataFrame:
     """One row per BoQ item line with its project meta and line metrics."""
-    sql = """
+    archived_filter = "" if include_archived else "AND IFNULL(p.Archived,0)=0"
+    sql = f"""
         SELECT p.ProjectName, p.ClientName, p.SalesPerson, p.PresalesEngineer, p.ProjectManager,
                p.OfferNo, p.CreationDate, IFNULL(p.Approved,0) AS Approved,
                IFNULL(p.Archived,0) AS Archived,
@@ -79,13 +93,12 @@ def lines_df(include_archived: bool = False) -> pd.DataFrame:
         FROM Project_BoQ_Lines l
         JOIN Projects_Master p ON p.ProjectID = l.ProjectID
         WHERE l.LineType = 'item'
+          {archived_filter}
     """
     with _conn() as c:
         df = pd.DataFrame([dict(r) for r in c.execute(sql)])
     if df.empty:
         return df
-    if not include_archived:
-        df = df[df["Archived"] == 0]
     cost_sar = df["TotalCostUSD"].astype(float) * calc.SAR_PER_USD
     df["Cost SAR"] = cost_sar.round(0)
     df["Total Price SAR"] = df["TPriceSAR"].round(0)

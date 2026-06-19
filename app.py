@@ -14,6 +14,7 @@ import io
 import html
 import importlib
 import inspect
+import zipfile
 import datetime as dt
 
 import pandas as pd
@@ -1972,10 +1973,69 @@ def _excel_bytes(df_map: dict):
     return buf.getvalue()
 
 
+def _catalogue_zip_bytes(catalogue_df: pd.DataFrame) -> bytes:
+    excel = _excel_bytes({"Catalogue": catalogue_df.drop(columns=["ItemID"], errors="ignore")})
+    manifest = (
+        "ProQuote catalogue backup\n"
+        "Contains catalogue.xlsx. Restore from Settings > Backup & Restore.\n"
+    )
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_STORED) as zf:
+        zf.writestr("catalogue.xlsx", excel)
+        zf.writestr("catalogue-backup.txt", manifest)
+    return buf.getvalue()
+
+
+def _catalogue_df_from_zip(uploaded_bytes: bytes) -> pd.DataFrame:
+    if not uploaded_bytes:
+        raise ValueError("Uploaded catalogue backup is empty.")
+    try:
+        with zipfile.ZipFile(io.BytesIO(uploaded_bytes)) as zf:
+            names = [
+                info.filename
+                for info in zf.infolist()
+                if not info.is_dir() and info.filename.lower().endswith(".xlsx")
+            ]
+            if not names:
+                raise ValueError("Catalogue backup ZIP does not contain an .xlsx file.")
+            preferred = "catalogue.xlsx" if "catalogue.xlsx" in names else names[0]
+            with zf.open(preferred) as src:
+                return pd.read_excel(io.BytesIO(src.read()))
+    except zipfile.BadZipFile as exc:
+        raise ValueError("Not a valid catalogue ZIP backup.") from exc
+
+
+def _db_cache_stamp():
+    """Cache key that changes when SQLite data changes, including WAL writes."""
+    stamp = []
+    for path in (db.DB_PATH, f"{db.DB_PATH}-wal"):
+        try:
+            s = os.stat(path)
+            stamp.append((s.st_mtime_ns, s.st_size))
+        except OSError:
+            stamp.append((0, 0))
+    return tuple(stamp)
+
+
+@st.cache_data(show_spinner=False, max_entries=12)
+def _cached_report_dataset(ds_name: str, include_archived: bool, db_stamp):
+    return reports.DATASETS[ds_name]["builder"](include_archived=include_archived)
+
+
+@st.cache_data(show_spinner=False, max_entries=12)
+def _cached_offers_df(include_archived: bool, db_stamp):
+    return reports.offers_df(include_archived=include_archived)
+
+
+@st.cache_data(show_spinner=False, max_entries=12)
+def _cached_finance_df(include_archived: bool, db_stamp):
+    return reports.finance_df(include_archived=include_archived)
+
+
 def _render_report_builder(company):
     ds_name = st.selectbox("Dataset", list(reports.DATASETS), key="rep_ds")
     meta = reports.DATASETS[ds_name]
-    df = meta["builder"](include_archived=False)
+    df = _cached_report_dataset(ds_name, False, _db_cache_stamp())
     if df.empty:
         st.info("No data available for this dataset yet.")
         return
@@ -2068,8 +2128,9 @@ def _render_dashboard(company):
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    offers = reports.offers_df(include_archived=False)
-    fin = reports.finance_df(include_archived=False)
+    stamp = _db_cache_stamp()
+    offers = _cached_offers_df(False, stamp)
+    fin = _cached_finance_df(False, stamp)
     if offers.empty:
         st.info("No offers yet — nothing to chart.")
         return
@@ -2318,23 +2379,6 @@ try:
     calc.VAT_RATE = float(repo.get_setting("vat_percent") or 15) / 100
 except (TypeError, ValueError):
     pass
-
-# DB stats — "Projects" counts distinct offer families (revisions/options count once).
-try:
-    _projs = repo.list_projects()
-    _nrows = len(_projs)
-    if _nrows:
-        _nfam = _projs.apply(
-            lambda r: repo.family_key(r.get("OfferNo"), r.get("ProjectName")), axis=1).nunique()
-    else:
-        _nfam = 0
-    ncat = len(repo.search_catalog("", limit=100000))
-    st.sidebar.metric("Projects in DB", _nfam)
-    st.sidebar.caption(f"{_nrows} records incl. revisions & options")
-    st.sidebar.metric("Catalogue items", ncat)
-except Exception as e:
-    st.sidebar.error(f"DB: {e}")
-
 
 # ============================ NEW OFFER ============================
 if mode == "New Project":
@@ -2842,8 +2886,17 @@ elif mode == "Catalogue":
                "**Del** to remove items. Brand / Model / Description are read-only here - "
                "use **Add new item** above to create one.")
     term = st.text_input("Search", placeholder="Model / Description / Brand")
-    res = repo.search_catalog(term, limit=100000).reset_index(drop=True)
-    st.caption(f"{len(res)} item(s)" + ("" if term.strip() else " (full catalogue) — type to filter"))
+    term = term.strip()
+    if not term:
+        st.info("Search by model, description, or brand.")
+        res = pd.DataFrame()
+    else:
+        _cat_limit = 300
+        res = repo.search_catalog(term, limit=_cat_limit).reset_index(drop=True)
+        st.caption(
+            f"{len(res)} item(s)"
+            + (f" shown - refine the search for more specific results" if len(res) >= _cat_limit else "")
+        )
     if not res.empty:
         rename = {"ListPriceUSD": "List Price $", "ExUnitCostUSD": "Ex Unit Cost $",
                   "Currency": "Cur",
@@ -2929,7 +2982,7 @@ elif mode == "Settings":
         "Offer & Pricing",
         "Images & PDF",
         "Data Tools",
-        "Backups",
+        "Backup & Restore",
         "Updates",
     ])
 
@@ -3565,10 +3618,19 @@ elif mode == "Settings":
                 st.rerun()
 
     with tab_backup:
-        st.markdown("##### Backup and restore")
+        st.markdown("##### Backup & Restore")
         st.caption(
             "Backups are `.zip` files that include the database and branding images from `assets/`."
         )
+        try:
+            _counts = repo.db_counts()
+            db1, db2 = st.columns(2)
+            db1.metric("Projects in DB", _counts["project_families"])
+            db1.caption(f"{_counts['project_records']} records incl. revisions & options")
+            db2.metric("Catalogue items", _counts["catalogue_items"])
+        except Exception as e:
+            st.error(f"DB: {e}")
+        st.divider()
 
         if not owner:
             st.info("Only the owner role can create, download, or restore backups.")
@@ -3643,19 +3705,19 @@ elif mode == "Settings":
                        "the full database backup above.")
             _cat_all = repo.catalog_all()
             st.download_button(
-                "⬇️ Backup catalogue (.xlsx)",
-                _excel_bytes({"Catalogue": _cat_all.drop(columns=["ItemID"], errors="ignore")}),
-                file_name=f"catalogue_backup_{dt.date.today().isoformat()}.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                "⬇️ Backup catalogue (.zip)",
+                _catalogue_zip_bytes(_cat_all),
+                file_name=f"catalogue_backup_{dt.date.today().isoformat()}.zip",
+                mime="application/zip",
                 disabled=_cat_all.empty, width="stretch")
             st.markdown("**Restore catalogue** — replaces the entire catalogue with an uploaded backup.")
-            _cat_up = st.file_uploader("Catalogue backup (.xlsx)", type=["xlsx"], key="cat_restore_up")
+            _cat_up = st.file_uploader("Catalogue backup (.zip)", type=["zip"], key="cat_restore_up")
             _cat_ok = st.checkbox("I understand this replaces the current catalogue "
                                   "(a full-database safety backup is made first).", key="cat_restore_ok")
             if st.button("♻️ Restore catalogue", type="primary",
                          disabled=not (_cat_up is not None and _cat_ok), width="stretch"):
                 try:
-                    _newdf = pd.read_excel(_cat_up)
+                    _newdf = _catalogue_df_from_zip(_cat_up.getvalue())
                     db_backup.create_backup("before-catalogue-restore")
                     n = repo.replace_catalog(_newdf)
                     st.success(f"Catalogue restored — {n} item(s). (Safety backup created.)")
