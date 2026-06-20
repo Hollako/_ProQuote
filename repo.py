@@ -134,11 +134,13 @@ def base_name(name) -> str:
 # ---------- Settings (key/value) ----------
 
 DEFAULT_SETTINGS = {
-    # Template variables: *TYPE* (System Offer), *YY*/*YYYY* (year). A run of x's
+    # Template variables: *TYPE* (configured System abbreviation), *YY*/*YYYY* (year). A run of x's
     # marks the auto-number slot; its length is the zero-padding.
     "offer_template": "OFR-*TYPE*-*YY*-xxx",
     "offer_number_pad": "3",
     "offer_types": "AV, LCS, ELV, CCTV, PAVA, ACC, BGM, Smart Home, Networking",
+    "systems": "",
+    "regions": "[]",
     "default_margin": "1.6",
     "revision_format": "Rev.x",     # run of x's = number (length = zero-padding)
     "revision_separator": "-",      # between offer # and revision token
@@ -201,9 +203,111 @@ def offer_types() -> list[str]:
     return [t.strip() for t in (raw or "").split(",") if t.strip()]
 
 
+def systems() -> list[dict]:
+    """Managed systems as [{name, abbreviation}], with legacy type fallback."""
+    raw = get_setting("systems") or ""
+    if raw:
+        try:
+            parsed = json.loads(raw)
+            values = parsed if isinstance(parsed, list) else []
+        except (TypeError, ValueError):
+            values = []
+    else:
+        # Existing installations used a comma-separated list of abbreviations only.
+        values = [{"name": value, "abbreviation": value} for value in offer_types()]
+
+    seen_names, seen_codes, result = set(), set(), []
+    for value in values:
+        if not isinstance(value, dict):
+            continue
+        name = _str(value.get("name")).strip()
+        code = _str(value.get("abbreviation") or value.get("code")).strip()
+        name_key, code_key = name.casefold(), code.casefold()
+        if not name or not code or name_key in seen_names or code_key in seen_codes:
+            continue
+        seen_names.add(name_key)
+        seen_codes.add(code_key)
+        result.append({"name": name, "abbreviation": code})
+    return result
+
+
+def set_systems(values) -> None:
+    """Save ordered system names and offer-number abbreviations."""
+    seen_names, seen_codes, cleaned = set(), set(), []
+    for value in values or []:
+        if not isinstance(value, dict):
+            continue
+        name = _str(value.get("name")).strip()
+        code = _str(value.get("abbreviation") or value.get("code")).strip()
+        name_key, code_key = name.casefold(), code.casefold()
+        if not name or not code or name_key in seen_names or code_key in seen_codes:
+            continue
+        seen_names.add(name_key)
+        seen_codes.add(code_key)
+        cleaned.append({"name": name, "abbreviation": code})
+    set_setting("systems", json.dumps(cleaned, ensure_ascii=False))
+    # Keep the former setting synchronized for older app versions/profile exports.
+    set_setting("offer_types", ", ".join(item["abbreviation"] for item in cleaned))
+
+
+def system_names() -> list[str]:
+    return [item["name"] for item in systems()]
+
+
+def system_abbreviation(value) -> str:
+    """Resolve a full system name or legacy code to the configured abbreviation."""
+    clean = _str(value).strip()
+    folded = clean.casefold()
+    for item in systems():
+        if folded in (item["name"].casefold(), item["abbreviation"].casefold()):
+            return item["abbreviation"]
+    return clean
+
+
+def system_name(value) -> str:
+    """Resolve a full system name or legacy code to the configured display name."""
+    clean = _str(value).strip()
+    folded = clean.casefold()
+    for item in systems():
+        if folded in (item["name"].casefold(), item["abbreviation"].casefold()):
+            return item["name"]
+    return clean
+
+
+def regions() -> list[str]:
+    """Ordered, case-insensitively deduplicated project-region list."""
+    raw = get_setting("regions") or "[]"
+    try:
+        parsed = json.loads(raw)
+        values = parsed if isinstance(parsed, list) else []
+    except (TypeError, ValueError):
+        # Compatibility with any manually entered legacy comma/newline value.
+        values = re.split(r"[\r\n,]+", _str(raw))
+    seen, result = set(), []
+    for value in values:
+        clean = _str(value).strip()
+        folded = clean.casefold()
+        if clean and folded not in seen:
+            seen.add(folded)
+            result.append(clean)
+    return result
+
+
+def set_regions(values) -> None:
+    """Save the ordered region list, dropping blanks and duplicate spellings."""
+    seen, cleaned = set(), []
+    for value in values or []:
+        clean = _str(value).strip()
+        folded = clean.casefold()
+        if clean and folded not in seen:
+            seen.add(folded)
+            cleaned.append(clean)
+    set_setting("regions", json.dumps(cleaned, ensure_ascii=False))
+
+
 # ---------- Offer reference numbers (template-based) ----------
 # Template = a pattern with variables:
-#   *TYPE*  -> the System Offer (AV, LCS, ...); omit it for a fixed prefix
+#   *TYPE*  -> the selected System abbreviation (AV, LCS, ...); omit it for a fixed prefix
 #   *YY*    -> 2-digit year      *YYYY* -> 4-digit year
 #   xxxx    -> the auto-number slot; the run length is the zero-padding
 # e.g. "LG-*TYPE*-*YY*/xxxx" -> "LG-AV-26/0053".  When *TYPE* is empty, an
@@ -223,8 +327,9 @@ def _fill_template(otype, when=None) -> str:
     """Substitute *TYPE* / *YY* / *YYYY*; leaves the x-run number slot in place."""
     yy, yyyy = _year_strs(when)
     t = offer_template()
-    if (otype or "").strip():
-        t = re.sub(r"\*type\*", otype.strip(), t, flags=re.I)
+    abbreviation = system_abbreviation(otype)
+    if abbreviation:
+        t = re.sub(r"\*type\*", abbreviation, t, flags=re.I)
     else:
         t = re.sub(r"\*type\*[-/_.:\s]?", "", t, flags=re.I)   # drop type + a trailing sep
     t = re.sub(r"\*yyyy\*", yyyy, t, flags=re.I)
@@ -253,8 +358,8 @@ def series_key(otype, when=None) -> str:
     return f"{before}\x00{after}".lower()
 
 
-def latest_offer_number(otype="", when=None) -> int:
-    """Highest number used within this series (ignoring -Rev suffixes)."""
+def used_offer_numbers(otype="", when=None) -> set[int]:
+    """Numbers already used within this series (ignoring revision suffixes)."""
     before, after, _ = _number_slot(_fill_template(otype, when))
     rx = re.compile("^" + re.escape(before) + r"(\d+)" + re.escape(after) + "$")
     where = ["OfferNo IS NOT NULL"]
@@ -272,7 +377,12 @@ def latest_offer_number(otype="", when=None) -> int:
             "SELECT OfferNo FROM Projects_Master WHERE " + " AND ".join(where),
             params,
         ).fetchall()
-    nums = [int(m.group(1)) for r in rows if (m := rx.match(base_name(r["OfferNo"])))]
+    return {int(m.group(1)) for r in rows if (m := rx.match(base_name(r["OfferNo"])))}
+
+
+def latest_offer_number(otype="", when=None) -> int:
+    """Highest number used within this series (ignoring revision suffixes)."""
+    nums = used_offer_numbers(otype, when)
     return max(nums) if nums else 0
 
 
@@ -292,14 +402,24 @@ def clear_series_start(otype, when=None) -> None:
 
 
 def next_offer_number(otype="", when=None) -> int:
-    """Next number for this series, honoring a forced start floor."""
-    nxt = latest_offer_number(otype, when) + 1
+    """Next unused number, honoring a forced series restart when configured.
+
+    Without a forced start, numbering continues after the historical maximum. With
+    one, higher imported/history numbers do not override it; we scan upward from the
+    requested start and skip only exact numbers that already exist.
+    """
+    used = used_offer_numbers(otype, when)
     start = get_series_start(series_key(otype, when))
-    return max(nxt, start) if start else nxt
+    if not start:
+        return (max(used) if used else 0) + 1
+    candidate = max(int(start), 1)
+    while candidate in used:
+        candidate += 1
+    return candidate
 
 
 def make_offer_no(otype="", when=None) -> str:
-    """Full next offer reference for a System Offer type (template rendered)."""
+    """Full next offer reference using the selected System's abbreviation."""
     return build_offer_no(otype, next_offer_number(otype, when), when)
 
 
@@ -797,8 +917,9 @@ def item_to_grid_row(item: dict, area="", system="", qty=1, default_margin=0.0) 
 def list_projects() -> pd.DataFrame:
     with _conn() as c:
         rows = c.execute(
-            """SELECT ProjectID,ProjectName,ClientName,OfferNo,CreationDate,
-                      ConversionFactor,Approved,RevisionNo,BaseName,OptionLabel,Archived
+            """SELECT ProjectID,ProjectName,ClientName,SalesPerson,PresalesEngineer,
+                      ProjectManager,OfferNo,CreationDate,ConversionFactor,Approved,
+                      RevisionNo,BaseName,OptionLabel,Archived
                FROM Projects_Master ORDER BY CreationDate DESC, ProjectID DESC"""
         ).fetchall()
     return pd.DataFrame([dict(r) for r in rows])

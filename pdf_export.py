@@ -12,6 +12,7 @@ import datetime as dt
 
 import os
 import math
+import unicodedata
 import pandas as pd
 from reportlab.lib import colors
 from reportlab.lib.pagesizes import A4
@@ -19,6 +20,9 @@ from reportlab.lib.units import mm
 from reportlab.lib.utils import ImageReader
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.enums import TA_RIGHT, TA_LEFT, TA_CENTER
+from reportlab.lib.fonts import addMapping
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.platypus import (
     SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer, HRFlowable, Image, PageBreak,
     LongTable,
@@ -35,10 +39,78 @@ ACCENT = colors.HexColor("#62B22F")     # green accent rule
 GREY = colors.HexColor("#6B7280")
 LINE = colors.HexColor("#D1D5DB")
 
+UNICODE_FONT = "ProQuoteSans"
+UNICODE_FONT_BOLD = "ProQuoteSans-Bold"
+_UNICODE_FONTS_READY = False
+
+
+def _register_unicode_fonts() -> tuple[str, str]:
+    """Register a bundled Unicode font with Arabic shaping support."""
+    global _UNICODE_FONTS_READY
+    if _UNICODE_FONTS_READY:
+        return UNICODE_FONT, UNICODE_FONT_BOLD
+
+    try:
+        from matplotlib import get_data_path
+
+        font_dir = os.path.join(get_data_path(), "fonts", "ttf")
+        regular_path = os.path.join(font_dir, "DejaVuSans.ttf")
+        bold_path = os.path.join(font_dir, "DejaVuSans-Bold.ttf")
+        if not (os.path.exists(regular_path) and os.path.exists(bold_path)):
+            raise FileNotFoundError("DejaVu Sans fonts were not found")
+
+        registered = pdfmetrics.getRegisteredFontNames()
+        if UNICODE_FONT not in registered:
+            pdfmetrics.registerFont(TTFont(UNICODE_FONT, regular_path, shapable=True))
+        if UNICODE_FONT_BOLD not in registered:
+            pdfmetrics.registerFont(TTFont(UNICODE_FONT_BOLD, bold_path, shapable=True))
+        addMapping(UNICODE_FONT, 0, 0, UNICODE_FONT)
+        addMapping(UNICODE_FONT, 1, 0, UNICODE_FONT_BOLD)
+        _UNICODE_FONTS_READY = True
+        return UNICODE_FONT, UNICODE_FONT_BOLD
+    except (ImportError, OSError, ValueError):
+        # Keep PDF export available if the optional Unicode stack is damaged.
+        return "Helvetica", "Helvetica-Bold"
+
+
+def _has_rtl_text(text: str) -> bool:
+    return any(unicodedata.bidirectional(char) in {"R", "AL", "AN"} for char in str(text or ""))
+
+
+def _rtl_visual(text: str) -> str:
+    """Convert logical Arabic text to connected glyphs in visual PDF order."""
+    try:
+        import arabic_reshaper
+        from bidi.algorithm import get_display
+
+        return get_display(arabic_reshaper.reshape(str(text or "")))
+    except ImportError:
+        return str(text or "")
+
+
+def _rtl_visual_lines(text: str, font_name: str, font_size: float, max_w: float) -> list[str]:
+    """Wrap in logical order first, then convert each Arabic line to visual order."""
+    words = str(text or "").split()
+    if not words:
+        return [""]
+    logical_lines = []
+    current = ""
+    for word in words:
+        candidate = f"{current} {word}".strip()
+        visual_candidate = _rtl_visual(candidate)
+        if current and pdfmetrics.stringWidth(visual_candidate, font_name, font_size) > max_w:
+            logical_lines.append(current)
+            current = word
+        else:
+            current = candidate
+    if current:
+        logical_lines.append(current)
+    return [_rtl_visual(line) for line in logical_lines]
+
 
 def _tint(hex_color, factor=0.90):
     """A light tint of a colour (blended toward white) for row/block backgrounds."""
-    c = colors.HexColor(hex_color)
+    c = hex_color if isinstance(hex_color, colors.Color) else colors.HexColor(hex_color)
     return colors.Color(c.red + (1 - c.red) * factor,
                         c.green + (1 - c.green) * factor,
                         c.blue + (1 - c.blue) * factor)
@@ -173,6 +245,41 @@ def _draw_fit_image(canvas, path: str, x: float, y: float, max_w: float, max_h: 
         ix = x + (max_w - w) / 2
     iy = y + (max_h - h) / 2
     canvas.drawImage(path, ix, iy, width=w, height=h, preserveAspectRatio=True, mask="auto")
+
+
+def _draw_slot_text(canvas, text: str, x: float, y: float, max_w: float, max_h: float,
+                    align: int, font_size: float, leading: float, color,
+                    style_name: str) -> None:
+    """Draw mixed LTR/RTL slot text while preserving explicit line breaks."""
+    font_name, _ = _register_unicode_fonts()
+    lines = str(text or "").replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    paragraphs = []
+    total_h = 0.0
+    rendered_lines = []
+    for line in lines:
+        if _has_rtl_text(line):
+            rendered_lines.extend(_rtl_visual_lines(line, font_name, font_size, max_w))
+        else:
+            rendered_lines.append(line)
+
+    for index, line in enumerate(rendered_lines):
+        style = ParagraphStyle(
+            f"{style_name}_{index}",
+            fontName=font_name,
+            fontSize=font_size,
+            leading=leading,
+            textColor=color,
+            alignment=align,
+        )
+        paragraph = Paragraph(_rt(line) if line else "&#160;", style)
+        _, used_h = paragraph.wrap(max_w, max_h)
+        paragraphs.append((paragraph, used_h))
+        total_h += used_h
+
+    cursor_y = y + max(0, (max_h - total_h) / 2) + total_h
+    for paragraph, used_h in paragraphs:
+        cursor_y -= used_h
+        paragraph.drawOn(canvas, x, cursor_y)
 
 
 def _header(story, ss, h, company):
@@ -569,6 +676,326 @@ def _template2_signature(story, ss, h, company):
     story.append(Paragraph(_rt(company.get("name") or ""), ss["T2Body"]))
 
 
+# ----------------------- Template 3: compact Excel-style offer -----------------------
+
+_ONES = ["Zero", "One", "Two", "Three", "Four", "Five", "Six", "Seven", "Eight",
+         "Nine", "Ten", "Eleven", "Twelve", "Thirteen", "Fourteen", "Fifteen",
+         "Sixteen", "Seventeen", "Eighteen", "Nineteen"]
+_TENS = ["", "", "Twenty", "Thirty", "Forty", "Fifty", "Sixty", "Seventy", "Eighty", "Ninety"]
+
+
+def _integer_words(value: int) -> str:
+    value = int(value)
+    if value < 20:
+        return _ONES[value]
+    if value < 100:
+        return _TENS[value // 10] + (("-" + _ONES[value % 10]) if value % 10 else "")
+    if value < 1_000:
+        return (_ONES[value // 100] + " Hundred" +
+                ((" " + _integer_words(value % 100)) if value % 100 else ""))
+    for scale, label in ((1_000_000_000_000, "Trillion"), (1_000_000_000, "Billion"),
+                         (1_000_000, "Million"), (1_000, "Thousand")):
+        if value >= scale:
+            remainder = value % scale
+            return (_integer_words(value // scale) + f" {label}" +
+                    ((" " + _integer_words(remainder)) if remainder else ""))
+    return str(value)
+
+
+def _amount_words_sar(value) -> str:
+    try:
+        amount = max(float(value or 0), 0)
+    except (TypeError, ValueError):
+        amount = 0
+    riyals = int(math.floor(amount + 1e-9))
+    halalas = int(round((amount - riyals) * 100))
+    if halalas >= 100:
+        riyals += 1
+        halalas = 0
+    text = f"Saudi Riyal {_integer_words(riyals)}"
+    if halalas:
+        text += f" and {_integer_words(halalas)} Halalas"
+    return text + " ONLY."
+
+
+def _template3_styles(ss):
+    ss.add(ParagraphStyle("T3Title", fontName="Helvetica-Bold", fontSize=13,
+                          textColor=BRAND, leading=15))
+    ss.add(ParagraphStyle("T3Band", fontName="Helvetica-Bold", fontSize=6.8,
+                          textColor=colors.white, leading=8))
+    ss.add(ParagraphStyle("T3MetaL", fontName="Helvetica", fontSize=6.6,
+                          textColor=colors.HexColor("#5B616B"), leading=8.2))
+    ss.add(ParagraphStyle("T3MetaR", fontName="Helvetica", fontSize=6.6,
+                          textColor=colors.HexColor("#5B616B"), leading=8.2, alignment=TA_RIGHT))
+    ss.add(ParagraphStyle("T3Body", fontName="Helvetica", fontSize=7.2,
+                          textColor=colors.HexColor("#4B5563"), leading=9.2))
+    ss.add(ParagraphStyle("T3TableH", fontName="Helvetica-Bold", fontSize=6.1,
+                          textColor=colors.white, leading=7.2, alignment=TA_CENTER))
+    ss.add(ParagraphStyle("T3Cell", fontName="Helvetica", fontSize=6.1,
+                          textColor=colors.black, leading=7.2))
+    ss.add(ParagraphStyle("T3CellC", parent=ss["T3Cell"], alignment=TA_CENTER))
+    ss.add(ParagraphStyle("T3CellR", parent=ss["T3Cell"], alignment=TA_RIGHT))
+    ss.add(ParagraphStyle("T3Group", fontName="Helvetica-Bold", fontSize=6.2,
+                          textColor=colors.black, leading=7.2))
+    ss.add(ParagraphStyle("T3NoteH", fontName="Helvetica-Bold", fontSize=6.2,
+                          textColor=colors.white, leading=7.3))
+    ss.add(ParagraphStyle("T3Note", fontName="Helvetica", fontSize=6.1,
+                          textColor=colors.black, leading=7.4))
+    ss.add(ParagraphStyle("T3Total", fontName="Helvetica", fontSize=6.8,
+                          textColor=colors.HexColor("#5B616B"), leading=8.5, alignment=TA_RIGHT))
+    ss.add(ParagraphStyle("T3TotalR", fontName="Helvetica", fontSize=6.8,
+                          textColor=colors.HexColor("#5B616B"), leading=8.5, alignment=TA_RIGHT))
+    ss.add(ParagraphStyle("T3Grand", fontName="Helvetica", fontSize=10.5,
+                          textColor=colors.HexColor("#5B616B"), leading=12, alignment=TA_RIGHT))
+    ss.add(ParagraphStyle("T3GrandR", fontName="Helvetica", fontSize=11.5,
+                          textColor=colors.HexColor("#4B5563"), leading=12, alignment=TA_RIGHT))
+    ss.add(ParagraphStyle("T3Amount", fontName="Helvetica", fontSize=7.8,
+                          textColor=colors.HexColor("#6B7280"), leading=10))
+
+
+def _template3_intro(story, ss, h, option_label=""):
+    title = h.get("title") or "Quotation"
+    if option_label:
+        title = f"{title} - {option_label}"
+    story.append(Paragraph(_rt(title), ss["T3Title"]))
+    story.append(Spacer(1, 4))
+    band = Table([[Paragraph("Billed to", ss["T3Band"])]], colWidths=[196 * mm])
+    band.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, -1), BRAND),
+        ("LEFTPADDING", (0, 0), (-1, -1), 3),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 3),
+        ("TOPPADDING", (0, 0), (-1, -1), 2),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 2),
+    ]))
+    story.append(band)
+    story.append(Spacer(1, 4))
+
+    left_rows = [
+        [Paragraph("Client Name", ss["T3MetaL"]), Paragraph(_rt(h.get("client") or ""), ss["T3MetaL"])],
+        [Paragraph("Project Name", ss["T3MetaL"]), Paragraph(_rt(h.get("project") or ""), ss["T3MetaL"])],
+        ["", ""],
+        [Paragraph("Contact", ss["T3MetaL"]), Paragraph(_rt(h.get("contact") or ""), ss["T3MetaL"])],
+        [Paragraph("Phone", ss["T3MetaL"]), Paragraph(_rt(h.get("phone") or ""), ss["T3MetaL"])],
+    ]
+    left = Table(left_rows, colWidths=[16 * mm, 100 * mm])
+    left.setStyle(TableStyle([
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ("LEFTPADDING", (0, 0), (-1, -1), 0), ("RIGHTPADDING", (0, 0), (-1, -1), 1),
+        ("TOPPADDING", (0, 0), (-1, -1), 0), ("BOTTOMPADDING", (0, 0), (-1, -1), 1),
+    ]))
+    date_text = _display_date(h.get("date")).replace(",", ", ", 1)
+    right_rows = [
+        [Paragraph(f"Date:  {_rt(date_text)}", ss["T3MetaR"])],
+        [Spacer(1, 19)],
+        [Paragraph(f"Offer #  {_rt(h.get('offer') or '')}", ss["T3MetaR"])],
+    ]
+    right = Table(right_rows, colWidths=[80 * mm])
+    right.setStyle(TableStyle([
+        ("RIGHTPADDING", (0, 0), (-1, -1), 0), ("LEFTPADDING", (0, 0), (-1, -1), 0),
+        ("TOPPADDING", (0, 0), (-1, -1), 0), ("BOTTOMPADDING", (0, 0), (-1, -1), 0),
+    ]))
+    meta = Table([[left, right]], colWidths=[116 * mm, 80 * mm])
+    meta.setStyle(TableStyle([
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ("LEFTPADDING", (0, 0), (-1, -1), 0), ("RIGHTPADDING", (0, 0), (-1, -1), 0),
+        ("TOPPADDING", (0, 0), (-1, -1), 0), ("BOTTOMPADDING", (0, 0), (-1, -1), 0),
+    ]))
+    story.append(meta)
+    story.append(Spacer(1, 8))
+
+
+def _template3_intro_text(story, ss, h, notes):
+    greeting = str(h.get("greeting") or "").strip()
+    if greeting:
+        _template2_add_text(story, greeting, ss["T3Body"], blank_space=5)
+        story.append(Spacer(1, 4))
+    free_notes = str(notes.get("Notes") or "").strip()
+    if free_notes:
+        _template2_add_text(story, free_notes, ss["T3Body"], blank_space=3)
+        story.append(Spacer(1, 4))
+    combined = f"{greeting}\n{free_notes}".lower()
+    if "we look forward" not in combined:
+        story.append(Paragraph(
+            "We look forward for your favorable reply, meanwhile we remain at your disposal "
+            "for any further information that you may need.", ss["T3Body"]))
+        story.append(Spacer(1, 7))
+
+
+def _template3_items_table(ss, grid: pd.DataFrame):
+    light = colors.HexColor("#C5D9F1")
+    headers = ["System", "Description", "Brand", "Model", "Qty.",
+               "Unit Price (SAR)", "Total Price (SAR)"]
+    widths = [17, 70, 19, 23, 8, 25, 34]
+    data = [
+        [Paragraph(_rt(value), ss["T3TableH"]) for value in headers],
+        [""] * len(headers),
+    ]
+    row_heights = [None, 1.2 * mm]
+    style = [
+        ("BACKGROUND", (0, 0), (-1, 0), BRAND),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("LEFTPADDING", (0, 0), (-1, -1), 2), ("RIGHTPADDING", (0, 0), (-1, -1), 2),
+        ("TOPPADDING", (0, 0), (-1, 0), 3), ("BOTTOMPADDING", (0, 0), (-1, 0), 3),
+        ("BOX", (0, 0), (-1, 0), 0.3, colors.white),
+        ("BACKGROUND", (0, 1), (-1, 1), colors.white),
+        ("LEFTPADDING", (0, 1), (-1, 1), 0), ("RIGHTPADDING", (0, 1), (-1, 1), 0),
+        ("TOPPADDING", (0, 1), (-1, 1), 0), ("BOTTOMPADDING", (0, 1), (-1, 1), 0),
+    ]
+    # Vertical separators belong to the navy header only. The light-blue body
+    # intentionally uses horizontal row separators without an inner column grid.
+    for column in range(1, len(headers)):
+        style.append(("LINEBEFORE", (column, 0), (column, 0), 0.3, colors.white))
+
+    rows = [
+        row for _, row in grid.iterrows()
+        if str(row.get("LineType", "item")).lower() != "discount"
+    ]
+    groups = []
+    for row in rows:
+        area = str(row.get("Area") or "").strip()
+        system = str(row.get("System") or "").strip()
+        label = area or system
+        key = label.casefold()
+        if not groups or groups[-1]["key"] != key:
+            groups.append({"key": key, "label": label, "rows": []})
+        groups[-1]["rows"].append(row)
+
+    for group in groups:
+        body_start = len(data)
+        if group["label"]:
+            data.append([Paragraph(_rt(group["label"]), ss["T3Group"])] + [""] * 6)
+            row_heights.append(None)
+            group_row = len(data) - 1
+            style += [
+                ("BACKGROUND", (0, group_row), (-1, group_row), light),
+                ("TOPPADDING", (0, group_row), (-1, group_row), 2),
+                ("BOTTOMPADDING", (0, group_row), (-1, group_row), 3.25),
+            ]
+
+        item_start = len(data)
+        for row in group["rows"]:
+            included = str(row.get("LineType", "item")).lower() in {"service", "included"}
+            unit_price, total_price = _template2_price_cells(row, included)
+            data.append([
+                "",
+                Paragraph(_rt(row.get("Description") or ""), ss["T3Cell"]),
+                Paragraph(_rt(row.get("Brand") or ""), ss["T3CellC"]),
+                Paragraph(_rt(row.get("Model") or ""), ss["T3CellC"]),
+                Paragraph(_sar(row.get("Qty")), ss["T3CellC"]),
+                Paragraph(unit_price, ss["T3CellR"]),
+                Paragraph(total_price, ss["T3CellR"]),
+            ])
+            row_heights.append(None)
+            rr = len(data) - 1
+            style += [
+                ("BACKGROUND", (0, rr), (-1, rr), light),
+                ("LINEBELOW", (1, rr), (-1, rr), 0.3, colors.white),
+                ("TOPPADDING", (0, rr), (-1, rr), 2.25),
+                ("BOTTOMPADDING", (0, rr), (-1, rr), 2.25),
+            ]
+
+        item_end = len(data) - 1
+        if item_end >= item_start:
+            style += [
+                ("LINEABOVE", (1, item_start), (-1, item_start), 0.3, colors.white),
+                ("LINEBEFORE", (1, item_start), (1, item_end), 0.3, colors.white),
+            ]
+
+        body_end = item_end
+        if body_end >= body_start:
+            style += [
+                ("BOX", (0, body_start), (-1, body_end), 0.3, colors.white),
+                ("LINEBELOW", (0, body_end), (0, body_end), 0.3, light),
+            ]
+
+    table = LongTable(
+        data,
+        colWidths=[value * mm for value in widths],
+        rowHeights=row_heights,
+        repeatRows=2,
+    )
+    table.setStyle(TableStyle(style))
+    return table
+
+
+def _template3_notes_totals(ss, notes: dict, summary: dict):
+    light = colors.HexColor("#C5D9F1")
+    notes_data = [[Paragraph("Special notes and Instructions", ss["T3NoteH"])] ]
+    notes_style = [
+        ("BACKGROUND", (0, 0), (-1, 0), BRAND),
+        ("LEFTPADDING", (0, 0), (-1, -1), 2), ("RIGHTPADDING", (0, 0), (-1, -1), 2),
+        ("TOPPADDING", (0, 0), (-1, 0), 2), ("BOTTOMPADDING", (0, 0), (-1, 0), 2),
+    ]
+    order = ["Scope", "System", "Exclusions", "Pre-requirements",
+             "Payment Terms", "Validity", "Delivery"]
+    for label in order:
+        value = str(notes.get(label) or "").strip()
+        if not value:
+            continue
+        notes_data.append([Paragraph(
+            f'<b><u width="0.35">{_rt(label)}</u></b><br/>{_rt(value)}',
+            ss["T3Note"],
+        )])
+        rr = len(notes_data) - 1
+        notes_style += [
+            ("BACKGROUND", (0, rr), (-1, rr), light),
+            ("LINEBELOW", (0, rr), (-1, rr), 0.3, colors.white),
+            ("TOPPADDING", (0, rr), (-1, rr), 1.5),
+            ("BOTTOMPADDING", (0, rr), (-1, rr), 1.5),
+        ]
+    notes_table = Table(notes_data, colWidths=[136 * mm])
+    notes_table.setStyle(TableStyle(notes_style))
+
+    total_rows = [
+        [Paragraph("Subtotal", ss["T3Total"]), Paragraph(_sar2(summary.get("subtotal_sar")), ss["T3TotalR"])],
+    ]
+    if summary.get("discount_sar"):
+        total_rows.append([
+            Paragraph("Discount", ss["T3Total"]),
+            Paragraph(_sar2(summary.get("discount_sar")), ss["T3TotalR"]),
+        ])
+        total_rows.append([
+            Paragraph("After Discount", ss["T3Total"]),
+            Paragraph(_sar2(summary.get("discounted_subtotal_sar")), ss["T3TotalR"]),
+        ])
+    total_rows += [
+        [Paragraph("Vat Rate", ss["T3Total"]),
+         Paragraph(f"{float(summary.get('vat_rate') or 0) * 100:g}%", ss["T3TotalR"])],
+        [Paragraph("VAT Amount", ss["T3Total"]),
+         Paragraph(_sar2(summary.get("vat_amount_sar")), ss["T3TotalR"])],
+        [Spacer(1, 5), ""],
+        [Paragraph("Grand Total  SAR", ss["T3Grand"]),
+         Paragraph(_sar2(summary.get("grand_total_sar")), ss["T3GrandR"])],
+    ]
+    totals_table = Table(total_rows, colWidths=[34 * mm, 26 * mm])
+    totals_table.setStyle(TableStyle([
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("LEFTPADDING", (0, 0), (-1, -1), 1), ("RIGHTPADDING", (0, 0), (-1, -1), 1),
+        ("TOPPADDING", (0, 0), (-1, -1), 1.5), ("BOTTOMPADDING", (0, 0), (-1, -1), 1.5),
+    ]))
+    outer = Table([[notes_table, totals_table]], colWidths=[136 * mm, 60 * mm])
+    outer.setStyle(TableStyle([
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ("LEFTPADDING", (0, 0), (-1, -1), 0), ("RIGHTPADDING", (0, 0), (-1, -1), 0),
+        ("TOPPADDING", (0, 0), (-1, -1), 0), ("BOTTOMPADDING", (0, 0), (-1, -1), 0),
+    ]))
+    return outer
+
+
+def _template3_page(story, ss, h, notes, opt, company, option_label=""):
+    _template3_intro(story, ss, h, option_label)
+    _template3_intro_text(story, ss, h, notes)
+    story.append(_template3_items_table(ss, opt["grid"]))
+    story.append(Spacer(1, 5))
+    story.append(_template3_notes_totals(ss, notes, opt["summary"]))
+    story.append(Spacer(1, 14))
+    story.append(Paragraph(_rt(_amount_words_sar(opt["summary"].get("grand_total_sar"))),
+                           ss["T3Amount"]))
+    story.append(Spacer(1, 8))
+    story.append(Paragraph("Sincerely your,", ss["T3Amount"]))
+    story.append(Paragraph(_rt(company.get("name") or ""), ss["T3Amount"]))
+
+
 def generate_options_pdf(out_path, header: dict, options: list,
                          notes: dict | None = None, company: dict | None = None,
                          show_costs: bool = False, template: str = "template1") -> str:
@@ -591,8 +1018,11 @@ def generate_options_pdf(out_path, header: dict, options: list,
     ss = _styles()
     template_key = str(template or "template1").strip().lower().replace(" ", "")
     is_template2 = template_key in {"2", "template2", "template-2"}
+    is_template3 = template_key in {"3", "template3", "template-3"}
     if is_template2:
         _template2_styles(ss)
+    elif is_template3:
+        _template3_styles(ss)
     notes = notes or {}
     options = options or []
     page_w, page_h = A4
@@ -632,12 +1062,20 @@ def generate_options_pdf(out_path, header: dict, options: list,
         footer_h = 22 * mm
     bottom_margin = max(13 * mm, footer_h + 7 * mm)
 
+    body_margin = 7 * mm if is_template3 else 17 * mm
     doc = SimpleDocTemplate(out_path, pagesize=A4,
-                            leftMargin=17 * mm, rightMargin=17 * mm,
+                            leftMargin=body_margin, rightMargin=body_margin,
                             topMargin=top_margin, bottomMargin=bottom_margin,
                             title=f"Quotation {header.get('offer','')}")
     story = []
-    if is_template2:
+    if is_template3:
+        multi = len(options) > 1
+        for i, opt in enumerate(options):
+            if i > 0:
+                story.append(PageBreak())
+            label = opt.get("label") or f"Option {i + 1}"
+            _template3_page(story, ss, header, notes, opt, company, label if multi else "")
+    elif is_template2:
         _template2_intro(story, ss, header, notes, company)
         multi = len(options) > 1
         for i, opt in enumerate(options):
@@ -693,17 +1131,10 @@ def generate_options_pdf(out_path, header: dict, options: list,
                 if has_image:
                     _draw_fit_image(canvas, image_path, x, page_h - 13 * mm, col_w, 8 * mm, align=align)
                 if text:
-                    style = ParagraphStyle(
-                        f"header_{align}",
-                        fontName="Helvetica",
-                        fontSize=8,
-                        leading=9,
-                        textColor=BRAND,
-                        alignment=align_map[align],
+                    _draw_slot_text(
+                        canvas, text, x, bottom_y + 5 * mm, col_w, 8 * mm,
+                        align_map[align], 8, 9, BRAND, f"header_{align}",
                     )
-                    p = Paragraph(_rt(text), style)
-                    _, used_h = p.wrap(col_w, 10 * mm)
-                    p.drawOn(canvas, x, bottom_y + 5 * mm + max(0, (8 * mm - used_h) / 2))
 
         if os.path.exists(full_footer):
             canvas.drawImage(full_footer, 0, 0, width=page_w, height=footer_h,
@@ -728,17 +1159,10 @@ def generate_options_pdf(out_path, header: dict, options: list,
                 if has_image:
                     _draw_fit_image(canvas, image_path, x, 13 * mm, col_w, 8 * mm, align=align)
                 if text:
-                    style = ParagraphStyle(
-                        f"footer_{align}",
-                        fontName="Helvetica",
-                        fontSize=7,
-                        leading=8,
-                        textColor=GREY,
-                        alignment=align_map[align],
+                    _draw_slot_text(
+                        canvas, text, x, 5 * mm, col_w, 8 * mm,
+                        align_map[align], 7, 8, GREY, f"footer_{align}",
                     )
-                    p = Paragraph(_rt(text), style)
-                    _, used_h = p.wrap(col_w, 10 * mm)
-                    p.drawOn(canvas, x, 5 * mm + max(0, (8 * mm - used_h) / 2))
         canvas.restoreState()
 
     doc.build(story, onFirstPage=_decorate, onLaterPages=_decorate)

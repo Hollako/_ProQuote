@@ -403,6 +403,54 @@ def _person_select(col, label, role, current, key):
     return "" if pick == "-" else pick
 
 
+def _region_select(col, current, key):
+    """Managed Region dropdown that keeps legacy stored values selectable."""
+    regions = repo.regions()
+    cur = _text(current).strip()
+    widget_cur = _text(st.session_state.get(key)).strip()
+    options = [""] + regions
+    for legacy in (cur, widget_cur):
+        if legacy and legacy not in options:
+            options.append(legacy)
+    selected = widget_cur if widget_cur in options else (cur if cur in options else "")
+    return col.selectbox(
+        "Region",
+        options,
+        index=options.index(selected),
+        key=key,
+        format_func=lambda value: value or "-",
+        help="Manage this dropdown in Settings → Company Details → Project regions.",
+    )
+
+
+def _system_select(col, current, key):
+    """Full-name System dropdown; the configured abbreviation is shown alongside it."""
+    names = repo.system_names()
+    cur = repo.system_name(current)
+    widget_cur = repo.system_name(st.session_state.get(key))
+    options = [""] + names
+    for legacy in (cur, widget_cur):
+        if legacy and legacy not in options:
+            options.append(legacy)
+    selected = widget_cur if widget_cur in options else (cur if cur in options else "")
+
+    def _label(name):
+        if not name:
+            return "-"
+        abbreviation = repo.system_abbreviation(name)
+        return f"{name} - {abbreviation}" if abbreviation and abbreviation != name else name
+
+    return col.selectbox(
+        "System",
+        options,
+        index=options.index(selected),
+        key=key,
+        format_func=_label,
+        help=("The full system name is stored on the project; its abbreviation replaces "
+              "*TYPE* in the Offer #. Manage systems in Settings → Company Details."),
+    )
+
+
 def _report_filter_options(df, column):
     """Return data values plus everyone currently assignable as Sales."""
     values = {
@@ -423,11 +471,32 @@ def _report_filter_label(column):
     return "Assigned as Sales" if column == "Sales Person" else column
 
 
+def _project_person_filter_options(projects, column, active_names=()):
+    """Stored project assignees plus active users valid for that people field."""
+    values = {
+        str(value).strip()
+        for value in projects[column].dropna().unique()
+        if str(value).strip() and str(value).strip() != "-"
+    }
+    values.update(
+        str(name).strip()
+        for name in active_names
+        if str(name).strip() and str(name).strip() != "-"
+    )
+    return sorted(values, key=str.casefold)
+
+
 def _empty_grid() -> pd.DataFrame:
     df = pd.DataFrame([calc.blank_row()])
     df["LineType"] = "item"
     df["_ItemID"] = None
     return df.iloc[0:0]
+
+
+def _default_system():
+    names = repo.system_names()
+    legacy_default = repo.system_name("LCS")
+    return legacy_default if legacy_default in names else (names[0] if names else "")
 
 
 def _ensure_state():
@@ -440,7 +509,7 @@ def _ensure_state():
             "contractor": "", "region": "",
             "sales": "", "presales": "", "pm": "",
             "option": "",
-            "offer": _next_offer_no(), "system": "LCS",
+            "offer": _next_offer_no(), "system": _default_system(),
             "date": dt.date.today().isoformat(), "margin": 1.60,
             "project_sheet": dict(DEFAULT_PROJECT_SHEET_INFO),
         }
@@ -454,7 +523,7 @@ def _new_offer_header(overrides: dict | None = None) -> dict:
         "client": "", "project": "", "contact": "", "phone": "",
         "contractor": "", "region": "",
         "sales": "", "presales": "", "pm": "",
-        "offer": _next_offer_no(), "system": "LCS",
+        "offer": _next_offer_no(), "system": _default_system(),
         "date": dt.date.today().isoformat(), "margin": 1.60,
         "project_sheet": dict(DEFAULT_PROJECT_SHEET_INFO),
     }
@@ -490,12 +559,11 @@ def _prime_new_offer_form(header: dict | None = None, grid: pd.DataFrame | None 
     st.session_state["no_offer_ov"] = ""
     st.session_state["no_option"] = h.get("option", "")
 
-    offer_types = repo.offer_types()
-    system = h.get("system") or ""
-    st.session_state["no_offer_type"] = system if system in offer_types else "(none)"
+    system = repo.system_name(h.get("system"))
+    st.session_state["no_offer_type"] = system
 
     term_keys = {
-        "subject": "no_subject", "greeting": "no_greet", "system_note": "no_sys",
+        "subject": "no_subject", "greeting": "no_greet",
         "scope": "no_scope", "exclusions": "no_excl", "prerequisites": "no_prereq",
         "delivery": "no_deliv", "validity": "no_valid", "payment": "no_pay",
         "notes": "no_notes",
@@ -602,8 +670,8 @@ EDIT_WIDGET_KEYS = (
     "edit_close_after_save", "pending_close_edit", "pending_save", "pending_option_label",
     "edit_editor", "ed_option", "ed_discount_percent",
     "ed_discount_driver", "ed_discount_subtotal", "eh_client", "eh_project", "eh_contact",
-    "eh_phone", "eh_contractor", "eh_region", "eh_sales", "eh_presales", "eh_pm",
-    "ed_subject", "ed_greet", "ed_sys", "ed_scope", "ed_excl", "ed_prereq",
+    "eh_phone", "eh_contractor", "eh_region", "eh_system", "eh_sales", "eh_presales", "eh_pm",
+    "ed_subject", "ed_greet", "ed_scope", "ed_excl", "ed_prereq",
     "ed_deliv", "ed_valid", "ed_pay", "ed_notes",
     "ed_ps_job_reference", "ed_ps_sheet_date", "ed_ps_lead_source", "ed_ps_commission",
     "ed_ps_shipment_by", "ed_ps_downpayment_date", "ed_ps_invoice_to",
@@ -643,6 +711,7 @@ def _dict_snapshot(values: dict | None) -> dict:
 def _edit_snapshot() -> dict:
     return {
         "grid": _grid_snapshot(st.session_state.get("edit_grid")),
+        "system": _snapshot_value(st.session_state.get("edit_system")),
         "terms": _dict_snapshot(st.session_state.get("edit_terms")),
         "header": _dict_snapshot(st.session_state.get("edit_header")),
         "project_sheet": _dict_snapshot(st.session_state.get("edit_project_sheet")),
@@ -662,9 +731,12 @@ def _sync_edit_state_from_widgets():
             if key in st.session_state:
                 st.session_state.edit_header[field] = st.session_state.get(key)
 
+    if "eh_system" in st.session_state:
+        st.session_state.edit_system = st.session_state.get("eh_system") or ""
+
     if "edit_terms" in st.session_state:
         term_keys = {
-            "subject": "ed_subject", "greeting": "ed_greet", "system_note": "ed_sys",
+            "subject": "ed_subject", "greeting": "ed_greet",
             "scope": "ed_scope", "exclusions": "ed_excl", "prerequisites": "ed_prereq",
             "delivery": "ed_deliv", "validity": "ed_valid", "payment": "ed_pay",
             "notes": "ed_notes",
@@ -672,6 +744,7 @@ def _sync_edit_state_from_widgets():
         for field, key in term_keys.items():
             if key in st.session_state:
                 st.session_state.edit_terms[field] = st.session_state.get(key)
+        st.session_state.edit_terms["system_note"] = st.session_state.get("edit_system", "")
 
     if "edit_project_sheet" in st.session_state:
         ps_keys = {
@@ -711,8 +784,7 @@ def _sync_new_header_from_widgets():
             h[field] = st.session_state.get(key)
 
     if "no_offer_type" in st.session_state:
-        selected = st.session_state.get("no_offer_type", "(none)")
-        h["system"] = "" if selected == "(none)" else selected
+        h["system"] = st.session_state.get("no_offer_type") or ""
     if "no_offer_ov" in st.session_state:
         h["offer_override"] = (st.session_state.get("no_offer_ov") or "").strip()
     if "no_offer_lock" in st.session_state or "no_offer_type" in st.session_state:
@@ -723,7 +795,7 @@ def _sync_new_header_from_widgets():
         )
 
     term_keys = {
-        "subject": "no_subject", "greeting": "no_greet", "system_note": "no_sys",
+        "subject": "no_subject", "greeting": "no_greet",
         "scope": "no_scope", "exclusions": "no_excl", "prerequisites": "no_prereq",
         "delivery": "no_deliv", "validity": "no_valid", "payment": "no_pay",
         "notes": "no_notes",
@@ -731,6 +803,7 @@ def _sync_new_header_from_widgets():
     for field, key in term_keys.items():
         if key in st.session_state:
             h[field] = st.session_state.get(key)
+    h["system_note"] = h.get("system", "")
 
     ps = h.setdefault("project_sheet", dict(DEFAULT_PROJECT_SHEET_INFO))
     ps_keys = {
@@ -930,9 +1003,9 @@ def _edit_panel(meta):
     if st.session_state.get("edit_show_cancel_dialog"):
         _cancel_edit_dialog()
 
-    # ---- Editable offer header (client / project / people) ----
+    # ---- Editable offer header (client / project / system / people) ----
     eh = st.session_state.edit_header
-    with st.expander("✏️ Project Details (client · project · contact · people)", expanded=False):
+    with st.expander("✏️ Project Details (client · project · system · people)", expanded=False):
         hc1, hc2, hc3 = st.columns(3)
         eh["client"] = hc1.text_input("Client", eh.get("client", ""), key="eh_client")
         eh["project"] = hc1.text_input("Project", eh.get("project", ""), key="eh_project")
@@ -945,10 +1018,7 @@ def _edit_panel(meta):
             "Contractor", eh.get("contractor", ""), key="eh_contractor",
             on_change=_copy_widget_to_state_dict,
             args=("edit_header", "contractor", "eh_contractor"))
-        eh["region"] = hc3.text_input(
-            "Region", eh.get("region", ""), key="eh_region",
-            on_change=_copy_widget_to_state_dict,
-            args=("edit_header", "region", "eh_region"))
+        eh["region"] = _region_select(hc3, eh.get("region", ""), "eh_region")
         ph1, ph2, ph3 = st.columns(3)
         eh["sales"] = _person_select(ph1, "Sales Person", SALES_PERSON_ROLES,
                                      eh.get("sales", ""), "eh_sales")
@@ -956,6 +1026,11 @@ def _edit_panel(meta):
                                         eh.get("presales", ""), "eh_presales")
         eh["pm"] = _person_select(ph3, "Project Manager", PEOPLE_ROLES["pm"],
                                   eh.get("pm", ""), "eh_pm")
+        sy1, sy2 = st.columns([1, 2], vertical_alignment="bottom")
+        st.session_state.edit_system = _system_select(
+            sy1, st.session_state.get("edit_system", ""), "eh_system")
+        st.session_state.edit_terms["system_note"] = st.session_state.edit_system
+        sy2.caption("Changing the System updates the BOQ system; the existing Offer # stays unchanged.")
     st.session_state.edit_header = eh
 
     terms_form(st.session_state.edit_terms, "ed")
@@ -1007,7 +1082,7 @@ def _edit_panel(meta):
              "contact": edit_header.get("contact"), "phone": edit_header.get("phone", ""),
              "contractor": edit_header.get("contractor"), "region": edit_header.get("region"),
              "sales": edit_header.get("sales"), "presales": edit_header.get("presales"),
-             "pm": edit_header.get("pm"),
+             "pm": edit_header.get("pm"), "system": st.session_state.get("edit_system", ""),
              "offer": offer_rev, "date": dt.date.today().isoformat(),
              "project_sheet": edit_project_sheet}
         st.session_state.saved_export_header = h
@@ -1033,7 +1108,7 @@ def _edit_panel(meta):
             st.session_state.edit_pid, calc.recompute(st.session_state.edit_grid),
             discount_sar=edit_discount,
             factors=(s["markup_factor"], None, None),
-            system_suffix=st.session_state.get("edit_system", "LCS"), terms=edit_terms,
+            system_suffix=st.session_state.get("edit_system") or _default_system(), terms=edit_terms,
             project_sheet_info=edit_project_sheet, header=edit_header,
             option_label=pending_option_label)
         saved_option_label = _text(
@@ -1056,7 +1131,7 @@ def _edit_panel(meta):
             st.session_state.edit_pid, calc.recompute(st.session_state.edit_grid),
             discount_sar=edit_discount,
             factors=(s["markup_factor"], None, None),
-            system_suffix=st.session_state.get("edit_system", "LCS"),
+            system_suffix=st.session_state.get("edit_system") or _default_system(),
             terms=edit_terms, option_label=pending_option_label,
             project_sheet_info=edit_project_sheet, header=edit_header)
         saved_option_label = _text(repo.project_meta(npid).get("OptionLabel"))
@@ -1077,7 +1152,7 @@ def _edit_panel(meta):
                 option_label=pending_option_label,
                 discount_sar=edit_discount,
                 factors=(s["markup_factor"], None, None),
-                system_suffix=st.session_state.get("edit_system", "LCS"), terms=edit_terms,
+                system_suffix=st.session_state.get("edit_system") or _default_system(), terms=edit_terms,
                 project_sheet_info=edit_project_sheet, header=edit_header)
             saved_option_label = _text(repo.project_meta(npid).get("OptionLabel"))
             _post_save(npid, nname, nrev)
@@ -1104,11 +1179,17 @@ def _edit_panel(meta):
                 st.session_state.saved_export_grid,
                 st.session_state.saved_export_summary,
             )
+        fn = f"Quotation_{st.session_state.saved_rev[1]}.pdf".replace(" ", "")
         if "pdf_bytes" in st.session_state:
-            fn = f"Quotation_{st.session_state.saved_rev[1]}.pdf".replace(" ", "")
             download_col.download_button(
-                "⬇️ Download Offer PDF", st.session_state.pdf_bytes,
-                file_name=fn, mime="application/pdf", width="stretch")
+                "⬇️ Download PDF",
+                st.session_state.pdf_bytes,
+                file_name=fn,
+                mime="application/pdf",
+                width="stretch",
+            )
+        else:
+            download_col.button("⬇️ Download PDF", disabled=True, width="stretch")
 
 
 @st.fragment
@@ -1157,7 +1238,7 @@ def _new_project_editor():
         st.caption(f"Adding options to **{h['offer']}** - build this option, name it, then "
                    "**Save option**. Use **➕ Add another option** to start the next one, or "
                    "**🆕 New offer** to begin a fresh offer.")
-    ac1, ac2, ac3, ac4, ac5 = st.columns(5)
+    ac1, ac2, ac3, ac4, ac5, ac6 = st.columns([1.05, 1.1, 0.9, 1.05, 0.9, 1.05])
     _optname = (h.get("option") or "").strip()
     if ac1.button("💾 Save option" if st.session_state.get("no_offer_lock") else "💾 Save offer",
                   type="primary", width="stretch"):
@@ -1212,16 +1293,20 @@ def _new_project_editor():
     if ac4.button("📄 Generate Offer PDF", width="stretch"):
         _make_pdf_download(h, st.session_state.grid, s)
 
-    if _ps_enabled() and ac5.button("📊 Generate Project Sheet", width="stretch"):
+    _pdf_name = f"Quotation_{h['offer']}{(' '+_optname) if _optname else ''}.pdf"
+    if "pdf_bytes" in st.session_state:
+        ac5.download_button(
+            "⬇️ Download PDF", st.session_state.pdf_bytes,
+            file_name=_pdf_name, mime="application/pdf", width="stretch")
+    else:
+        ac5.button("⬇️ Download PDF", disabled=True, width="stretch")
+
+    if _ps_enabled() and ac6.button("📊 Generate Project Sheet", width="stretch"):
         _make_project_sheet_download(h, s)
 
-    dl1, dl2 = st.columns(2)
-    if "pdf_bytes" in st.session_state:
-        dl1.download_button("⬇️ Download Offer PDF", st.session_state.pdf_bytes,
-                            file_name=f"Quotation_{h['offer']}{(' '+_optname) if _optname else ''}.pdf",
-                            mime="application/pdf", width="stretch")
+    dl1, _ = st.columns(2)
     if _ps_enabled() and "project_sheet_bytes" in st.session_state:
-        dl2.download_button("⬇️ Download Project Sheet", st.session_state.project_sheet_bytes,
+        dl1.download_button("⬇️ Download Project Sheet", st.session_state.project_sheet_bytes,
                             file_name=f"Project_Sheet_{_safe_filename(h.get('offer') or h.get('project'))}.xlsx",
                             mime=("application/vnd.openxmlformats-officedocument."
                                   "spreadsheetml.sheet"),
@@ -1267,10 +1352,7 @@ def terms_form(store: dict, kp: str):
             key=f"{kp}_subject", placeholder="e.g. Low Current Systems Offer")
         store["greeting"] = st.text_area("Greeting", store.get("greeting", ""),
             key=f"{kp}_greet", height=80)
-        c1, c2 = st.columns(2)
-        store["system_note"] = c1.text_input("System", store.get("system_note", ""),
-            key=f"{kp}_sys", placeholder="e.g. Smart System as per the above detailed BOQ.")
-        store["scope"] = c2.text_input("Scope", store.get("scope", ""), key=f"{kp}_scope")
+        store["scope"] = st.text_input("Scope", store.get("scope", ""), key=f"{kp}_scope")
         store["exclusions"] = st.text_area("Exclusions", store.get("exclusions", ""),
             key=f"{kp}_excl", height=70)
         store["prerequisites"] = st.text_area("Pre-requirements", store.get("prerequisites", ""),
@@ -1358,7 +1440,7 @@ def _make_pdf_download(h, grid, summary, options=None):
     if "template" not in inspect.signature(pdf_export.generate_quotation_pdf).parameters:
         pdf_export = importlib.reload(pdf_export)
     notes = {
-        "System": h.get("system_note"), "Scope": h.get("scope"),
+        "System": h.get("system") or h.get("system_note"), "Scope": h.get("scope"),
         "Exclusions": h.get("exclusions"), "Pre-requirements": h.get("prerequisites"),
         "Delivery": h.get("delivery"), "Payment Terms": h.get("payment"),
         "Validity": h.get("validity"), "Notes": h.get("notes"),
@@ -1396,7 +1478,10 @@ def _make_pdf_download(h, grid, summary, options=None):
     with open(tmp, "rb") as f:
         st.session_state.pdf_bytes = f.read()
     n = len(options) if options else 1
-    st.toast(f"PDF ready ({n} option{'s' if n > 1 else ''}) - use the download button.", icon="📄")
+    st.toast(
+        f"PDF ready ({n} option{'s' if n > 1 else ''}) - click Download PDF.",
+        icon="📄",
+    )
 
 
 def _project_sheet_bytes(h: dict, s: dict) -> bytes:
@@ -1658,7 +1743,7 @@ def _summary_metrics(s: dict):
     m3.metric("Grand Total (SAR)", f"{s['grand_total_sar']:,.2f}")
 
 
-def _project_details_readonly(meta: dict):
+def _project_details_readonly(meta: dict, system=""):
     def _readonly_field(container, label, value):
         label_html = html.escape(label)
         value_html = html.escape(_text(value, "-"))
@@ -1680,6 +1765,7 @@ def _project_details_readonly(meta: dict):
         _readonly_field(c2, "Phone", meta.get("ContactPhone"))
         _readonly_field(c3, "Contractor", meta.get("Contractor"))
         _readonly_field(c3, "Region", meta.get("Region"))
+        _readonly_field(c3, "System", repo.system_name(system))
 
         p1, p2, p3 = st.columns(3)
         _readonly_field(p1, "Sales Person", meta.get("SalesPerson"))
@@ -2201,6 +2287,7 @@ def _cached_project_index(db_stamp):
         sort_key = (rev, bool(option), option)
         group = groups.setdefault(fam, {
             "fam": fam, "offer_nos": set(), "project_names": set(),
+            "sales_people": set(), "presales_people": set(), "project_managers": set(),
             "revision_counts": {}, "approved": False, "date": "",
             "rep_sort": None, "base": "", "client": "",
         })
@@ -2210,6 +2297,15 @@ def _cached_project_index(db_stamp):
             group["offer_nos"].add(offer_no)
         if project_name:
             group["project_names"].add(project_name)
+        sales_person = _text(row.SalesPerson).strip()
+        presales_person = _text(row.PresalesEngineer).strip()
+        project_manager = _text(row.ProjectManager).strip()
+        if sales_person:
+            group["sales_people"].add(sales_person)
+        if presales_person:
+            group["presales_people"].add(presales_person)
+        if project_manager:
+            group["project_managers"].add(project_manager)
         group["revision_counts"][rev] = group["revision_counts"].get(rev, 0) + 1
         group["approved"] = group["approved"] or bool(row.Approved or 0)
         group["date"] = max(group["date"], _text(row.CreationDate))
@@ -2232,6 +2328,9 @@ def _cached_project_index(db_stamp):
             "project_label": project_label,
             "name_search": " ".join([base, client] + project_names).lower(),
             "offer_search": " ".join(offer_nos).lower(),
+            "sales_people": group["sales_people"],
+            "presales_people": group["presales_people"],
+            "project_managers": group["project_managers"],
             "n_rev": len(group["revision_counts"]),
             "n_opt": max(group["revision_counts"].values()),
             "approved": group["approved"],
@@ -2806,10 +2905,11 @@ if mode == "New Project":
     st.subheader("New Project")
     h = st.session_state.header
 
-    # Live offer reference (from the System Offer + override below) - shown as a top bar.
+    # Live offer reference (from the System abbreviation + override below) - shown as a top bar.
     # Once the first option is saved, the offer # is "locked" so further options share it.
-    _sel = st.session_state.get("no_offer_type", "(none)")
-    _otype = "" if _sel == "(none)" else _sel
+    _otype = (st.session_state.get("no_offer_type")
+              if "no_offer_type" in st.session_state
+              else repo.system_name(h.get("system"))) or ""
     _ov = (st.session_state.get("no_offer_ov") or "").strip()
     h["system"] = _otype
     h["offer_override"] = _ov
@@ -2836,10 +2936,7 @@ if mode == "New Project":
             "Contractor", h.get("contractor", ""), key="no_contractor",
             on_change=_copy_widget_to_state_dict,
             args=("header", "contractor", "no_contractor"))
-        h["region"] = c3.text_input(
-            "Region", h.get("region", ""), key="no_region",
-            on_change=_copy_widget_to_state_dict,
-            args=("header", "region", "no_region"))
+        h["region"] = _region_select(c3, h.get("region", ""), "no_region")
         p1, p2, p3 = st.columns(3)
         h["sales"] = _person_select(p1, "Sales Person", SALES_PERSON_ROLES,
                                     h.get("sales", ""), "no_sales")
@@ -2847,11 +2944,9 @@ if mode == "New Project":
                                        h.get("presales", ""), "no_presales")
         h["pm"] = _person_select(p3, "Project Manager", PEOPLE_ROLES["pm"],
                                  h.get("pm", ""), "no_pm")
-        # "System Offer" drives BOTH the offer-ref type segment and the BOQ system suffix.
+        # System name is stored on the project; its abbreviation drives *TYPE* in Offer #.
         o1, o2 = st.columns(2)
-        o1.selectbox("System Offer", ["(none)"] + repo.offer_types(), key="no_offer_type",
-                     help="The system being quoted (AV, LCS, …). Used in the offer reference "
-                          "and as the BOQ system. Manage the list in Settings.")
+        h["system"] = _system_select(o1, h.get("system", ""), "no_offer_type")
         o2.text_input("Offer # (blank = auto)", key="no_offer_ov",
                       help="Leave blank to auto-number; type a value to override.")
 
@@ -2869,32 +2964,98 @@ elif mode == "Load Project":
         st.session_state.pop("del_confirm", None)
         st.session_state.pop("del_scope", None)
 
-    sc1, sc2 = st.columns([2, 1])
-    q_name = _text(sc1.text_input("Search by name", key="load_search_name")).lower()
-    q_offer = _text(sc2.text_input("Search by offer #", key="load_search_offer")).lower()
-    query_key = f"{q_name}\0{q_offer}"
-    if st.session_state.get("load_query") != query_key:
-        st.session_state.load_query = query_key
-        st.session_state.pop("view_pid", None)
-        st.session_state.pop("load_fam", None)
-        st.session_state.pop("pdf_bytes", None)
-        st.session_state.pop("project_sheet_bytes", None)
-        st.session_state.edit_mode = False
-
-    if not q_name and not q_offer:
-        st.session_state.pop("view_pid", None)
-        st.session_state.pop("load_fam", None)
-        st.info("Search by project name, client name, or offer number.")
-        st.stop()
-
     projects, fams = _cached_project_index(_db_cache_stamp())
     if projects.empty:
         st.info("No projects ingested yet. Run `python ingest.py`.")
     else:
+        viewing_fam = st.session_state.get("load_fam")
+        if not viewing_fam:
+            restore = st.session_state.pop("_load_restore_search", None)
+            if restore:
+                st.session_state["load_search_name"] = restore.get("name", "")
+                st.session_state["load_search_offer"] = restore.get("offer", "")
+                st.session_state["load_filter_sales"] = restore.get("sales", [])
+                st.session_state["load_filter_presales"] = restore.get("presales", [])
+                st.session_state["load_filter_pm"] = restore.get("pm", [])
+
+            sc1, sc2 = st.columns([2, 1])
+            raw_name = sc1.text_input("Search by name", key="load_search_name")
+            raw_offer = sc2.text_input("Search by offer #", key="load_search_offer")
+            pc1, pc2, pc3 = st.columns(3)
+            q_sales = pc1.multiselect(
+                "Assigned as Sales",
+                _project_person_filter_options(
+                    projects, "SalesPerson", auth.users_in_roles(SALES_PERSON_ROLES)),
+                key="load_filter_sales",
+            )
+            q_presales = pc2.multiselect(
+                "Pre-sales Engineer",
+                _project_person_filter_options(
+                    projects, "PresalesEngineer", auth.users_in_role(PEOPLE_ROLES["presales"])),
+                key="load_filter_presales",
+            )
+            q_pm = pc3.multiselect(
+                "Project Manager",
+                _project_person_filter_options(
+                    projects, "ProjectManager", auth.users_in_role(PEOPLE_ROLES["pm"])),
+                key="load_filter_pm",
+            )
+            search_snapshot = {
+                "name": _text(raw_name),
+                "offer": _text(raw_offer),
+                "sales": list(q_sales),
+                "presales": list(q_presales),
+                "pm": list(q_pm),
+            }
+            st.session_state["load_search_snapshot"] = search_snapshot
+            q_name = search_snapshot["name"].lower()
+            q_offer = search_snapshot["offer"].lower()
+
+            query_key = repr((q_name, q_offer, tuple(q_sales), tuple(q_presales), tuple(q_pm)))
+            if st.session_state.get("load_query") != query_key:
+                st.session_state.load_query = query_key
+                st.session_state.pop("view_pid", None)
+                st.session_state.pop("pdf_bytes", None)
+                st.session_state.pop("project_sheet_bytes", None)
+                st.session_state.edit_mode = False
+        else:
+            search_snapshot = st.session_state.get("load_search_snapshot") or {
+                "name": _text(st.session_state.get("load_search_name")),
+                "offer": _text(st.session_state.get("load_search_offer")),
+                "sales": list(st.session_state.get("load_filter_sales", [])),
+                "presales": list(st.session_state.get("load_filter_presales", [])),
+                "pm": list(st.session_state.get("load_filter_pm", [])),
+            }
+            st.session_state["load_search_snapshot"] = search_snapshot
+            q_name = search_snapshot["name"].lower()
+            q_offer = search_snapshot["offer"].lower()
+            q_sales = search_snapshot["sales"]
+            q_presales = search_snapshot["presales"]
+            q_pm = search_snapshot["pm"]
+            # Keep the hidden widget values alive across project-detail reruns so Back
+            # restores the exact search even after edits, exports, or approval actions.
+            st.session_state["load_search_name"] = search_snapshot["name"]
+            st.session_state["load_search_offer"] = search_snapshot["offer"]
+            st.session_state["load_filter_sales"] = list(q_sales)
+            st.session_state["load_filter_presales"] = list(q_presales)
+            st.session_state["load_filter_pm"] = list(q_pm)
+
+        if not viewing_fam and not (q_name or q_offer or q_sales or q_presales or q_pm):
+            st.session_state.pop("view_pid", None)
+            st.session_state.pop("load_fam", None)
+            st.info(
+                "Search by project/client name, offer number, Assigned as Sales, "
+                "Pre-sales Engineer, or Project Manager."
+            )
+            st.stop()
+
         matches = [
             f for f in fams
             if (not q_name or q_name in f["name_search"])
             and (not q_offer or q_offer in f["offer_search"])
+            and (not q_sales or bool(set(q_sales) & f["sales_people"]))
+            and (not q_presales or bool(set(q_presales) & f["presales_people"]))
+            and (not q_pm or bool(set(q_pm) & f["project_managers"]))
         ]
         if not matches:
             st.session_state.pop("view_pid", None)
@@ -2942,7 +3103,9 @@ elif mode == "Load Project":
         # ---- An offer is open: show a Back button + only this offer ----
         _sel_f = next((f for f in matches if f["fam"] == current_fam), None)
         bcol1, bcol2 = st.columns([1.3, 4], vertical_alignment="center")
-        if bcol1.button("← Back to results", width="stretch"):
+        if bcol1.button("← Back to Results", width="stretch"):
+            st.session_state["_load_restore_search"] = dict(
+                st.session_state.get("load_search_snapshot") or {})
             for k in ("load_fam", "view_pid", "pdf_bytes", "project_sheet_bytes"):
                 st.session_state.pop(k, None)
             st.session_state.edit_mode = False
@@ -3036,7 +3199,8 @@ elif mode == "Load Project":
                 st.markdown(f"#### 📄 {_subj}")
 
             view_actions = st.container()
-            _project_details_readonly(meta)
+            _project_details_readonly(
+                meta, repo.base_name(sheet or "").replace("BOQ", "").strip())
             active_tab = _offer_tab_selector(pid, bool(meta.get("Approved")))
             if active_tab == "BoQ":
                 _summary_metrics(s)
@@ -3086,7 +3250,7 @@ elif mode == "Load Project":
                 _render_finance_tab(pid, s["grand_total_sar"])
 
             with view_actions:
-                b1, b2, b3, b4 = st.columns(4)
+                b1, b2, b3, b4, b5 = st.columns([1.35, 0.95, 1.1, 0.85, 1.05])
             if can("edit") and b1.button("✏️ Edit / new revision or option", type="primary",
                                           width="stretch"):
                 eg = grid.copy()
@@ -3094,9 +3258,12 @@ elif mode == "Load Project":
                 st.session_state.edit_grid = calc.recompute(eg)
                 st.session_state.edit_key = cur_key
                 st.session_state.edit_pid = pid
-                st.session_state.edit_system = repo.base_name(sheet or "").replace("BOQ", "").strip() or "LCS"
+                _loaded_system = (repo.base_name(sheet or "").replace("BOQ", "").strip()
+                                  or _default_system())
+                st.session_state.edit_system = repo.system_name(_loaded_system)
                 st.session_state.edit_discount = abs(float(meta.get("DiscountAmount") or 0))
                 st.session_state.edit_terms = {**DEFAULT_TERMS, **repo.load_terms(meta)}
+                st.session_state.edit_terms["system_note"] = st.session_state.edit_system
                 st.session_state.edit_header = {
                     "client": _text(meta.get("ClientName")), "project": _text(meta.get("ProjectName")),
                     "contact": _text(meta.get("ContactName")), "phone": _text(meta.get("ContactPhone")),
@@ -3143,7 +3310,9 @@ elif mode == "Load Project":
                     st.warning("This offer has no lines to duplicate.")
                 else:
                     dg["Margin x"] = 0.0   # preserve copied selling prices until user re-prices
-                    system_suffix = repo.base_name(sheet or "").replace("BOQ", "").strip() or "LCS"
+                    system_suffix = repo.system_name(
+                        repo.base_name(sheet or "").replace("BOQ", "").strip()
+                        or _default_system())
                     copied_terms = repo.load_terms(meta)
                     copied_header = {
                         **copied_terms,
@@ -3182,6 +3351,8 @@ elif mode == "Load Project":
                         "region": meta.get("Region") or "",
                         "sales": meta.get("SalesPerson"), "presales": meta.get("PresalesEngineer"),
                         "pm": meta.get("ProjectManager"),
+                        "system": repo.system_name(
+                            repo.base_name(sheet or "").replace("BOQ", "").strip()),
                         "offer": meta.get("OfferNo"), "date": meta.get("CreationDate"),
                         "project_sheet": repo.load_project_sheet_info(meta)}
 
@@ -3189,17 +3360,19 @@ elif mode == "Load Project":
                          width="stretch"):
                 opts = revision_options(pid)
                 _make_pdf_download(_export_header(), disp, s, options=opts if len(opts) > 1 else None)
-            if _ps_enabled() and b4.button("📊 Generate Project Sheet", width="stretch"):
-                _make_project_sheet_download(_export_header(), s)
-            dl1, dl2 = st.columns(2)
+            _pdf_name = f"Quotation_{meta.get('OfferNo') or meta.get('ProjectName')}.pdf"
             if "pdf_bytes" in st.session_state and not st.session_state.get("saved_rev"):
-                dl1.download_button(
-                    "⬇️ Download Offer PDF", st.session_state.pdf_bytes,
-                    file_name=f"Quotation_{meta.get('OfferNo') or meta.get('ProjectName')}.pdf",
-                    mime="application/pdf", width="stretch")
+                b4.download_button(
+                    "⬇️ Download PDF", st.session_state.pdf_bytes,
+                    file_name=_pdf_name, mime="application/pdf", width="stretch")
+            else:
+                b4.button("⬇️ Download PDF", disabled=True, width="stretch")
+            if _ps_enabled() and b5.button("📊 Generate Project Sheet", width="stretch"):
+                _make_project_sheet_download(_export_header(), s)
+            dl1, _ = st.columns(2)
             if (_ps_enabled() and "project_sheet_bytes" in st.session_state
                     and not st.session_state.get("saved_rev")):
-                dl2.download_button(
+                dl1.download_button(
                     "⬇️ Download Project Sheet", st.session_state.project_sheet_bytes,
                     file_name=f"Project_Sheet_{_safe_filename(meta.get('OfferNo') or meta.get('ProjectName'))}.xlsx",
                     mime=("application/vnd.openxmlformats-officedocument."
@@ -3433,13 +3606,13 @@ elif mode == "Settings":
                 "Offer # template",
                 repo.get_setting("offer_template"),
                 help=(
-                    "Variables: *TYPE* = System Offer (AV, LCS...), *YY* = 2-digit year, "
+                    "Variables: *TYPE* = the selected System abbreviation, *YY* = 2-digit year, "
                     "*YYYY* = 4-digit year, and a run of x's = the auto-number "
                     "(its length is the zero-padding). e.g. LG-*TYPE*-*YY*/xxxx -> "
                     "LG-AV-26/0053. Omit *TYPE* for a fixed prefix (e.g. SWS-*YY*-xxxx)."
                 ),
             )
-            c1, c2, c3 = st.columns(3)
+            c1, c2 = st.columns(2)
             pad = c1.number_input(
                 "Fallback digits (no x-run)",
                 min_value=1,
@@ -3447,15 +3620,7 @@ elif mode == "Settings":
                 value=int(repo.get_setting("offer_number_pad") or 3),
                 help="Padding used only when the template has no x's.",
             )
-            types = c2.text_input(
-                "System Offer types (comma-separated)",
-                repo.get_setting("offer_types"),
-                help=(
-                    "Shown as the 'System Offer' dropdown on a new offer. "
-                    "Pick '(none)' there to skip the *TYPE* segment."
-                ),
-            )
-            dmargin = c3.number_input(
+            dmargin = c2.number_input(
                 "Default margin x",
                 min_value=0.0,
                 step=0.05,
@@ -3527,7 +3692,6 @@ elif mode == "Settings":
             if saved_offer:
                 repo.set_setting("offer_template", template.strip())
                 repo.set_setting("offer_number_pad", int(pad))
-                repo.set_setting("offer_types", types.strip())
                 repo.set_setting("default_margin", float(dmargin))
                 repo.set_setting("revision_format", rev_fmt.strip() or "Rev.x")
                 repo.set_setting("revision_separator", sep_opts[rev_sep_lbl])
@@ -3541,12 +3705,13 @@ elif mode == "Settings":
             "Numbering is **per series** - each rendered template (type + year) keeps its own "
             "counter, so LG-AV-26/... and LG-LC-26/... don't conflict."
         )
-        ex_type = (repo.offer_types() or ["AV"])[0]
-        _ex = repo.make_offer_no(ex_type)
+        ex_system = (repo.system_names() or [""])[0]
+        ex_code = repo.system_abbreviation(ex_system)
+        _ex = repo.make_offer_no(ex_system)
         st.write("Next offer # examples:")
         st.code(
-            f"no type      :  {repo.make_offer_no('')}\n"
-            f"type {ex_type:<6}  :  {_ex}\n"
+            f"no system    :  {repo.make_offer_no('')}\n"
+            f"system {ex_system} ({ex_code})  :  {_ex}\n"
             f"revision     :  {_ex}{repo.revision_separator()}{repo.revision_token(1)}"
             f"   /   {_ex}{repo.revision_separator()}{repo.revision_token(2)}"
         )
@@ -3554,12 +3719,18 @@ elif mode == "Settings":
         st.divider()
         st.markdown("##### Reset / force a starting number")
         st.caption(
-            "Force a series to begin at a chosen number; numbering then continues "
-            "incrementing from there. (Numbers at or below the current next have no effect "
-            "- it never reuses an existing number.)"
+            "Force a series to restart from a chosen number. Higher historical/imported "
+            "numbers will not override the restart; any exact numbers already used are "
+            "skipped to prevent duplicate Offer references."
         )
         rc1, rc2, rc3 = st.columns([2, 1, 1])
-        rsel = rc1.selectbox("Series (System Offer)", ["(none)"] + repo.offer_types(), key="reset_series")
+        _reset_systems = repo.system_names()
+        _legacy_reset_system = _text(st.session_state.get("reset_series"))
+        if (_legacy_reset_system and _legacy_reset_system != "(none)"
+                and _legacy_reset_system not in _reset_systems):
+            _reset_systems.append(_legacy_reset_system)
+        rsel = rc1.selectbox(
+            "Series (System)", ["(none)"] + _reset_systems, key="reset_series")
         r_otype = "" if rsel == "(none)" else rsel
         r_next = repo.next_offer_number(r_otype)
         r_floor = repo.get_series_start(repo.series_key(r_otype))
@@ -3576,7 +3747,8 @@ elif mode == "Settings":
         )
         if rc3.button("Apply", key="reset_series_apply", width="stretch"):
             repo.set_series_start(r_otype, int(start_at))
-            st.success(f"This series will start at {int(start_at)}, then continue incrementing.")
+            st.success(
+                f"This series will use the first available number from {int(start_at)} onward.")
             st.rerun()
         if r_floor and rc3.button("Clear", key="reset_series_clear", width="stretch"):
             repo.clear_series_start(r_otype)
@@ -3628,12 +3800,94 @@ elif mode == "Settings":
                 repo.set_setting("project_sheet_enabled", "1" if ps_enabled else "0")
                 st.success("Company settings saved. (Page title updates on next reload.)")
 
+        st.divider()
+        st.markdown("##### Project systems")
+        st.caption(
+            "The full **System** name appears in Project Details and the BOQ. Its "
+            "**Abbreviation** replaces `*TYPE*` in the Offer # template. Add, edit, delete, "
+            "or reorder rows here."
+        )
+        if "*type*" not in (repo.get_setting("offer_template") or "").lower():
+            st.warning(
+                "Your current Offer # template does not contain `*TYPE*`, so System "
+                "abbreviations will not appear yet. Add `*TYPE*` under Settings → "
+                "Offer & Pricing → Offer # template (for example `LG-*TYPE*-*YY*-xxx`)."
+            )
+        _systems_saved = st.session_state.pop("_systems_saved", None)
+        if _systems_saved is not None:
+            st.success(f"Saved {_systems_saved} system(s).")
+        _systems_generation = int(st.session_state.get("_systems_editor_generation", 0))
+        with st.form("settings_systems_form"):
+            systems_df = pd.DataFrame(repo.systems(), columns=["name", "abbreviation"]).rename(
+                columns={"name": "System", "abbreviation": "Abbreviation"})
+            edited_systems = st.data_editor(
+                systems_df,
+                num_rows="dynamic",
+                hide_index=True,
+                width="stretch",
+                key=f"settings_systems_editor::{_systems_generation}",
+                column_config={
+                    "System": st.column_config.TextColumn(
+                        "System", help="Full name shown in Project Details, e.g. Lighting Control."),
+                    "Abbreviation": st.column_config.TextColumn(
+                        "Abbreviation", help="Inserted at *TYPE* in Offer #, e.g. LC or LCS."),
+                },
+            )
+            save_systems = st.form_submit_button("Save systems", type="primary")
+            if save_systems:
+                system_rows, partial = [], False
+                for _, row in edited_systems.iterrows():
+                    name = _text(row.get("System")).strip()
+                    abbreviation = _text(row.get("Abbreviation")).strip()
+                    if not name and not abbreviation:
+                        continue
+                    if not name or not abbreviation:
+                        partial = True
+                        continue
+                    system_rows.append({"name": name, "abbreviation": abbreviation})
+                name_keys = [row["name"].casefold() for row in system_rows]
+                code_keys = [row["abbreviation"].casefold() for row in system_rows]
+                if partial:
+                    st.warning("Every system row needs both a System name and an Abbreviation.")
+                elif len(name_keys) != len(set(name_keys)):
+                    st.warning("System names must be unique.")
+                elif len(code_keys) != len(set(code_keys)):
+                    st.warning("System abbreviations must be unique.")
+                else:
+                    repo.set_systems(system_rows)
+                    st.session_state["_systems_saved"] = len(system_rows)
+                    st.session_state["_systems_editor_generation"] = _systems_generation + 1
+                    st.rerun()
+
+        st.divider()
+        st.markdown("##### Project regions")
+        st.caption(
+            "These values appear in the Region dropdown for New Project and Edit Project. "
+            "Enter one region per line; reorder the lines to reorder the dropdown. Removing "
+            "a region does not change it on older saved projects."
+        )
+        _regions_saved = st.session_state.pop("_regions_saved", None)
+        if _regions_saved is not None:
+            st.success(f"Saved {_regions_saved} region(s).")
+        with st.form("settings_regions_form"):
+            region_lines = st.text_area(
+                "Regions (one per line)",
+                value="\n".join(repo.regions()),
+                height=180,
+                placeholder="Riyadh\nJeddah\nDammam",
+            )
+            if st.form_submit_button("Save regions", type="primary"):
+                repo.set_regions(region_lines.splitlines())
+                st.session_state["_regions_saved"] = len(repo.regions())
+                st.rerun()
+
     with tab_images_pdf:
         st.markdown("##### PDF body template")
         with st.form("settings_pdf_form"):
             pdf_body_options = {
                 "Template 1 - current ProQuote layout": "template1",
                 "Template 2 - proposal page + BOQ table": "template2",
+                "Template 3 - compact billed-to offer + integrated totals": "template3",
             }
             current_pdf_body_template = repo.get_setting("pdf_body_template") or "template1"
             current_pdf_body_label = next(
