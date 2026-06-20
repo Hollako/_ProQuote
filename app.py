@@ -132,8 +132,29 @@ st.markdown("""<style>
 .main .block-container {
   padding-top: 2.5rem !important;
 }
-.stButton button { font-size: 1.05rem; font-weight: 600; min-height: 2.9rem; }
-.stButton button p { font-size: 1.05rem; }
+.stButton button,
+.stDownloadButton button {
+  font-size: 1.05rem;
+  font-weight: 600;
+  min-height: 2.9rem;
+}
+.stDownloadButton,
+.stDownloadButton > div { width: 100%; }
+.stDownloadButton button {
+  width: 100%;
+  height: 2.9rem;
+  max-height: 2.9rem;
+  box-sizing: border-box;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.stButton button p,
+.stDownloadButton button p {
+  font-size: 1.05rem;
+  line-height: 1.2;
+  margin: 0;
+}
 div[data-testid="stPopover"] button {
   font-size: 1.05rem;
   font-weight: 600;
@@ -1192,6 +1213,121 @@ def _edit_panel(meta):
             download_col.button("⬇️ Download PDF", disabled=True, width="stretch")
 
 
+def _new_offer_actions():
+    """Render and handle New Offer actions directly below the offer number."""
+    _sync_new_header_from_widgets()
+    h = st.session_state.header
+    calc_grid = calc.recompute(st.session_state.grid)
+    s = calc.summarize(calc_grid, st.session_state.get("discount") or 0.0)
+    discount_sar = s["discount_sar"]
+    _optname = (st.session_state.get("no_option") or h.get("option") or "").strip()
+
+    if st.session_state.get("no_offer_lock"):
+        st.caption(
+            f"Adding options to **{h['offer']}** - build this option, name it, then "
+            "**Save option**. Use **➕ Add another option** to start the next one, or "
+            "**🆕 New offer** to begin a fresh offer."
+        )
+
+    ac1, ac2, ac3, ac4, ac5, ac6 = st.columns([1.05, 1.1, 0.9, 1.05, 0.9, 1.05])
+    if ac1.button(
+        "💾 Save option" if st.session_state.get("no_offer_lock") else "💾 Save offer",
+        type="primary",
+        width="stretch",
+    ):
+        _sync_new_header_from_widgets()
+        h = st.session_state.header
+        _optname = (st.session_state.get("no_option") or h.get("option") or "").strip()
+        h["option"] = _optname
+        _locked_now = st.session_state.get("no_offer_lock")
+        _done = st.session_state.get("no_saved_options", [])
+        if st.session_state.grid.empty:
+            st.warning("Grid is empty.")
+        elif _locked_now and not _optname:
+            st.warning("Enter an Option label for this alternative (e.g. KNX).")
+        elif _optname and _optname in _done:
+            st.warning(f"Option '{_optname}' is already saved for this offer.")
+        else:
+            name = (h["project"] or "Untitled") + (f" ({_optname})" if _optname else "")
+            pid = repo.save_offer(
+                name=name,
+                client=h["client"],
+                contact=h["contact"],
+                offer_no=h["offer"],
+                system_suffix=h["system"],
+                grid=calc_grid,
+                discount_sar=discount_sar,
+                factors=(s["markup_factor"], None, None),
+                sales_person=h.get("sales"),
+                presales_engineer=h.get("presales"),
+                project_manager=h.get("pm"),
+                terms={k: h.get(k) for k in TERMS_KEYS},
+                option_label=_optname,
+                project_sheet_info=h.get("project_sheet"),
+                phone=h.get("phone"),
+                contractor=h.get("contractor"),
+                region=h.get("region"),
+            )
+            saved_option_label = _text(repo.project_meta(pid).get("OptionLabel"))
+            st.session_state.no_offer_lock = h["offer"]
+            st.session_state.setdefault("no_saved_options", []).append(
+                saved_option_label or "Main"
+            )
+            st.success(
+                f"Saved {('option ' + saved_option_label) if saved_option_label else 'offer'} "
+                f"(ProjectID {pid}). Option label: **{saved_option_label or 'Main'}**."
+            )
+
+    if ac2.button(
+        "➕ Add another option",
+        width="stretch",
+        disabled=not st.session_state.get("no_offer_lock"),
+    ):
+        st.session_state.grid = _empty_grid()
+        st.session_state["_no_reset_option"] = True
+        st.rerun()
+
+    if ac3.button("🆕 New offer", width="stretch"):
+        st.session_state.grid = _empty_grid()
+        st.session_state.no_offer_lock = None
+        st.session_state.no_saved_options = []
+        st.session_state["_no_reset_all"] = True
+        st.session_state.pop("pdf_bytes", None)
+        st.session_state.pop("project_sheet_bytes", None)
+        st.rerun()
+
+    if ac4.button("📄 Generate Offer PDF", width="stretch"):
+        _make_pdf_download(h, st.session_state.grid, s)
+
+    _pdf_name = f"Quotation_{h['offer']}{(' ' + _optname) if _optname else ''}.pdf"
+    if "pdf_bytes" in st.session_state:
+        ac5.download_button(
+            "⬇️ Download PDF",
+            st.session_state.pdf_bytes,
+            file_name=_pdf_name,
+            mime="application/pdf",
+            width="stretch",
+        )
+    else:
+        ac5.button("⬇️ Download PDF", disabled=True, width="stretch")
+
+    if _ps_enabled() and ac6.button("📊 Generate Project Sheet", width="stretch"):
+        _make_project_sheet_download(h, s)
+
+    if _ps_enabled() and "project_sheet_bytes" in st.session_state:
+        ps_download_col, _ = st.columns([1.05, 5.0])
+        ps_download_col.download_button(
+            "⬇️ Download Project Sheet",
+            st.session_state.project_sheet_bytes,
+            file_name=f"Project_Sheet_{_safe_filename(h.get('offer') or h.get('project'))}.xlsx",
+            mime=(
+                "application/vnd.openxmlformats-officedocument."
+                "spreadsheetml.sheet"
+            ),
+            width="stretch",
+        )
+
+
 @st.fragment
 def _new_project_editor():
     _sync_new_header_from_widgets()
@@ -1231,87 +1367,6 @@ def _new_project_editor():
         a1.metric("Total Cost (USD)", f"{s['total_cost_usd']:,.2f}")
         a2.metric("Cost in SAR", f"{s['cost_sar']:,.2f}")
         a3.metric("Total Selling (USD)", f"{s['total_sell_usd']:,.2f}")
-
-    # ---- Actions ----
-    st.divider()
-    if st.session_state.get("no_offer_lock"):
-        st.caption(f"Adding options to **{h['offer']}** - build this option, name it, then "
-                   "**Save option**. Use **➕ Add another option** to start the next one, or "
-                   "**🆕 New offer** to begin a fresh offer.")
-    ac1, ac2, ac3, ac4, ac5, ac6 = st.columns([1.05, 1.1, 0.9, 1.05, 0.9, 1.05])
-    _optname = (h.get("option") or "").strip()
-    if ac1.button("💾 Save option" if st.session_state.get("no_offer_lock") else "💾 Save offer",
-                  type="primary", width="stretch"):
-        _sync_new_header_from_widgets()
-        h = st.session_state.header
-        _optname = (st.session_state.get("no_option") or h.get("option") or "").strip()
-        h["option"] = _optname
-        _locked_now = st.session_state.get("no_offer_lock")
-        _done = st.session_state.get("no_saved_options", [])
-        if st.session_state.grid.empty:
-            st.warning("Grid is empty.")
-        elif _locked_now and not _optname:
-            st.warning("Enter an Option label for this alternative (e.g. KNX).")
-        elif _optname and _optname in _done:
-            st.warning(f"Option '{_optname}' is already saved for this offer.")
-        else:
-            name = (h["project"] or "Untitled") + (f" ({_optname})" if _optname else "")
-            pid = repo.save_offer(
-                name=name, client=h["client"], contact=h["contact"],
-                offer_no=h["offer"], system_suffix=h["system"],
-                grid=calc.recompute(st.session_state.grid),
-                discount_sar=discount_sar,
-                factors=(s["markup_factor"], None, None),
-                sales_person=h.get("sales"), presales_engineer=h.get("presales"),
-                project_manager=h.get("pm"),
-                terms={k: h.get(k) for k in TERMS_KEYS}, option_label=_optname,
-                project_sheet_info=h.get("project_sheet"), phone=h.get("phone"),
-                contractor=h.get("contractor"), region=h.get("region"))
-            saved_option_label = _text(repo.project_meta(pid).get("OptionLabel"))
-            st.session_state.no_offer_lock = h["offer"]          # lock # for further options
-            st.session_state.setdefault("no_saved_options", []).append(saved_option_label or "Main")
-            st.success(
-                f"Saved {('option ' + saved_option_label) if saved_option_label else 'offer'} "
-                f"(ProjectID {pid}). Option label: **{saved_option_label or 'Main'}**."
-            )
-
-    if ac2.button("➕ Add another option", width="stretch",
-                  disabled=not st.session_state.get("no_offer_lock")):
-        st.session_state.grid = _empty_grid()
-        st.session_state["_no_reset_option"] = True   # clear option label on next run
-        st.rerun()
-
-    if ac3.button("🆕 New offer", width="stretch"):
-        st.session_state.grid = _empty_grid()
-        st.session_state.no_offer_lock = None
-        st.session_state.no_saved_options = []
-        st.session_state["_no_reset_all"] = True       # clear option label + override
-        st.session_state.pop("pdf_bytes", None)
-        st.session_state.pop("project_sheet_bytes", None)
-        st.rerun()
-
-    if ac4.button("📄 Generate Offer PDF", width="stretch"):
-        _make_pdf_download(h, st.session_state.grid, s)
-
-    _pdf_name = f"Quotation_{h['offer']}{(' '+_optname) if _optname else ''}.pdf"
-    if "pdf_bytes" in st.session_state:
-        ac5.download_button(
-            "⬇️ Download PDF", st.session_state.pdf_bytes,
-            file_name=_pdf_name, mime="application/pdf", width="stretch")
-    else:
-        ac5.button("⬇️ Download PDF", disabled=True, width="stretch")
-
-    if _ps_enabled() and ac6.button("📊 Generate Project Sheet", width="stretch"):
-        _make_project_sheet_download(h, s)
-
-    dl1, _ = st.columns(2)
-    if _ps_enabled() and "project_sheet_bytes" in st.session_state:
-        dl1.download_button("⬇️ Download Project Sheet", st.session_state.project_sheet_bytes,
-                            file_name=f"Project_Sheet_{_safe_filename(h.get('offer') or h.get('project'))}.xlsx",
-                            mime=("application/vnd.openxmlformats-officedocument."
-                                  "spreadsheetml.sheet"),
-                            width="stretch")
-
 
 def catalogue_add(state_key: str, default_margin: float, kp: str, default_system: str = "",
                   show_clear: bool = False):
@@ -2928,6 +2983,7 @@ if mode == "New Project":
         f"<div style='background:#002060;color:#fff;padding:10px 16px;border-radius:8px;"
         f"font-size:1.2rem;margin:2px 0 12px'>🧾&nbsp;&nbsp;Offer #:&nbsp; <b>{h['offer']}</b>{_extra}</div>",
         unsafe_allow_html=True)
+    _new_offer_actions()
 
     with st.expander("Project Details", expanded=True):
         c1, c2, c3 = st.columns(3)

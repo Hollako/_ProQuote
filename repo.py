@@ -188,6 +188,8 @@ def set_setting(key: str, value) -> None:
         c.commit()
     if key == "revision_format":
         _revision_strip_pattern.cache_clear()
+    if key in {"systems", "offer_types"}:
+        systems.cache_clear()
 
 
 def delete_setting(key: str) -> None:
@@ -196,6 +198,8 @@ def delete_setting(key: str) -> None:
         c.commit()
     if key == "revision_format":
         _revision_strip_pattern.cache_clear()
+    if key in {"systems", "offer_types"}:
+        systems.cache_clear()
 
 
 def offer_types() -> list[str]:
@@ -203,6 +207,7 @@ def offer_types() -> list[str]:
     return [t.strip() for t in (raw or "").split(",") if t.strip()]
 
 
+@lru_cache(maxsize=1)
 def systems() -> list[dict]:
     """Managed systems as [{name, abbreviation}], with legacy type fallback."""
     raw = get_setting("systems") or ""
