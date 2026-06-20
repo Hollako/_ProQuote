@@ -917,10 +917,15 @@ def item_to_grid_row(item: dict, area="", system="", qty=1, default_margin=0.0) 
 def list_projects() -> pd.DataFrame:
     with _conn() as c:
         rows = c.execute(
-            """SELECT ProjectID,ProjectName,ClientName,SalesPerson,PresalesEngineer,
-                      ProjectManager,OfferNo,CreationDate,ConversionFactor,Approved,
-                      RevisionNo,BaseName,OptionLabel,Archived
-               FROM Projects_Master ORDER BY CreationDate DESC, ProjectID DESC"""
+            """SELECT p.ProjectID,p.ProjectName,p.ClientName,p.SalesPerson,p.PresalesEngineer,
+                      p.ProjectManager,p.Region,p.OfferNo,p.CreationDate,p.ConversionFactor,
+                      p.Approved,p.RevisionNo,p.BaseName,p.OptionLabel,p.Archived,
+                      (SELECT s.SystemSuffix
+                         FROM Project_Sheets s
+                        WHERE s.ProjectID=p.ProjectID
+                        ORDER BY s.SheetID LIMIT 1) AS System
+               FROM Projects_Master p
+               ORDER BY p.CreationDate DESC, p.ProjectID DESC"""
         ).fetchall()
     return pd.DataFrame([dict(r) for r in rows])
 
@@ -1067,17 +1072,22 @@ def load_project_grid(project_id: int, sheet_name: str | None = None) -> pd.Data
         "FinalUnitCostUSD": "Unit Cost $", "TotalCostUSD": "Total Cost $",
         "FinalUPriceUSD": "U. Price $", "TPriceUSD": "T. Price $",
         "FinalUPriceSAR": "U. Price SAR", "TPriceSAR": "T. Price SAR",
+        "MarginExtra": "Margin x",
         "ItemID": "_ItemID",
     })
     df["Cur"] = df["Cur"].apply(lambda v: v if str(v) in calc.CURRENCIES else "USD")
-    # effective margin = U. Price $ / Unit Cost $ (read-only, for display)
-    uc = df["Unit Cost $"].map(calc._num)
-    up = df["U. Price $"].map(calc._num)
     df["Shipping %"] = [
         calc.shipping_percent(ship, ex, unit)
         for ship, ex, unit in zip(df["Shipping %"], df["Ex Unit Cost $"], df["Unit Cost $"])
     ]
-    df["Margin x"] = (up / uc.where(uc > 0)).round(2).fillna(0.0)
+    # MarginExtra is the persisted pricing driver and must round-trip exactly.
+    # Only legacy rows that predate the stored margin fall back to the effective
+    # price/cost ratio.  An explicit zero is meaningful (manual selling price).
+    stored_margin = pd.to_numeric(df["Margin x"], errors="coerce")
+    uc = df["Unit Cost $"].map(calc._num)
+    up = df["U. Price $"].map(calc._num)
+    legacy_margin = (up / uc.where(uc > 0)).round(2)
+    df["Margin x"] = stored_margin.where(stored_margin.notna(), legacy_margin).fillna(0.0)
     return df[[c for c in calc.GRID_COLUMNS] + ["LineType", "_ItemID"]]
 
 

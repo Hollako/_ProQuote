@@ -2289,7 +2289,8 @@ def _cached_project_index(db_stamp):
             "fam": fam, "offer_nos": set(), "project_names": set(),
             "sales_people": set(), "presales_people": set(), "project_managers": set(),
             "revision_counts": {}, "approved": False, "date": "",
-            "rep_sort": None, "base": "", "client": "",
+            "rep_sort": None, "base": "", "client": "", "sales": "",
+            "system": "", "region": "",
         })
         offer_no = _text(row.OfferNo)
         project_name = _text(row.ProjectName)
@@ -2313,6 +2314,9 @@ def _cached_project_index(db_stamp):
             group["rep_sort"] = sort_key
             group["base"] = _text(row.BaseName) or repo.base_name(project_name or "Offer")
             group["client"] = _text(row.ClientName)
+            group["sales"] = _text(row.SalesPerson)
+            group["system"] = repo.system_name(_text(row.System))
+            group["region"] = _text(row.Region)
 
     projects["_fam"] = fam_keys
     fams = []
@@ -2321,11 +2325,13 @@ def _cached_project_index(db_stamp):
         project_names = sorted(group["project_names"])
         base = group["base"]
         client = group["client"]
+        offer_label = repo.base_name(offer_nos[0]) if offer_nos else ""
         project_label = ", ".join(project_names) if project_names else base
         fams.append({
             "fam": group["fam"], "base": base, "client": client,
             "offer_nos": offer_nos, "project_names": project_names,
-            "project_label": project_label,
+            "project_label": project_label, "offer_label": offer_label,
+            "sales": group["sales"], "system": group["system"], "region": group["region"],
             "name_search": " ".join([base, client] + project_names).lower(),
             "offer_search": " ".join(offer_nos).lower(),
             "sales_people": group["sales_people"],
@@ -3074,20 +3080,23 @@ elif mode == "Load Project":
         # hide the list and show only that offer (with a Back button).
         if not current_fam:
             st.markdown("**Matching offers**")
-            widths = [2.4, 1.4, 2.3, 0.9, 0.7, 0.7, 0.9, 0.8]
+            widths = [2.2, 1.35, 1.8, 0.8, 0.5, 1.25, 1.45, 0.9, 0.7, 0.7]
             hc = st.columns(widths)
-            for col, t in zip(hc, ["Project", "Client", "Offer #", "Date", "Rev.", "Opt.", "Approved", ""]):
+            for col, t in zip(hc, ["Project", "Client", "Offer #", "Date", "Rev.",
+                                   "Sales Person", "System", "Region", "Approved", ""]):
                 col.caption(t)
             for idx, f in enumerate(matches):
                 rc = st.columns(widths, vertical_alignment="center")
                 rc[0].write(_text(f["project_label"], "Offer"))
                 rc[1].write(_text(f["client"], "-"))
-                rc[2].write(_text(f["base"], "-"))
+                rc[2].write(_text(f["offer_label"], "-"))
                 rc[3].write(_fmt_date(f["date"]))
                 rc[4].write(str(f["n_rev"]))
-                rc[5].write(str(f["n_opt"]))
-                rc[6].write("✅" if f["approved"] else "")
-                if rc[7].button("View", key=f"match_view_{idx}_{f['fam']}",
+                rc[5].write(_text(f["sales"], "-"))
+                rc[6].write(_text(f["system"], "-"))
+                rc[7].write(_text(f["region"], "-"))
+                rc[8].write("✅" if f["approved"] else "")
+                if rc[9].button("View", key=f"match_view_{idx}_{f['fam']}",
                                 width="stretch"):
                     st.session_state.load_fam = f["fam"]
                     st.session_state.pop("view_pid", None)
@@ -3254,7 +3263,6 @@ elif mode == "Load Project":
             if can("edit") and b1.button("✏️ Edit / new revision or option", type="primary",
                                           width="stretch"):
                 eg = grid.copy()
-                eg["Margin x"] = 0.0   # keep loaded prices; set a margin per line to re-price
                 st.session_state.edit_grid = calc.recompute(eg)
                 st.session_state.edit_key = cur_key
                 st.session_state.edit_pid = pid
@@ -3309,7 +3317,6 @@ elif mode == "Load Project":
                 if dg.empty:
                     st.warning("This offer has no lines to duplicate.")
                 else:
-                    dg["Margin x"] = 0.0   # preserve copied selling prices until user re-prices
                     system_suffix = repo.system_name(
                         repo.base_name(sheet or "").replace("BOQ", "").strip()
                         or _default_system())

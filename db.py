@@ -152,7 +152,7 @@ CREATE TABLE IF NOT EXISTS Project_BoQ_Lines (
     TPriceUSD        REAL,
     FinalUPriceSAR   REAL,
     TPriceSAR        REAL,
-    MarginExtra      REAL,            -- the trailing analytic column (col O+)
+    MarginExtra      REAL,            -- persisted per-line pricing multiplier (Margin x)
     LineType         TEXT DEFAULT 'item',  -- 'item' | 'discount' | 'service'
     Paid             INTEGER DEFAULT 0,   -- supplier paid (procurement tracking)
     Received         INTEGER DEFAULT 0,   -- received from supplier
