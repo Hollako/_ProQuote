@@ -34,6 +34,7 @@ Source: "..\README.md"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\Start ProQuote Installed.bat"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\Install Dependencies.bat"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\.streamlit\config.toml"; DestDir: "{app}\.streamlit"; Flags: ignoreversion
+Source: "..\assets\*.png"; DestDir: "{localappdata}\ProQuoteData\default\assets"; Flags: ignoreversion onlyifdoesntexist uninsneveruninstall
 
 [Icons]
 Name: "{autodesktop}\ProQuote"; Filename: "{app}\Start ProQuote Installed.bat"; WorkingDir: "{app}"
