@@ -19,7 +19,7 @@ TERMS_KEYS = ["subject", "greeting", "system_note", "scope", "exclusions",
 PROJECT_SHEET_KEYS = [
     "job_reference", "sheet_date", "lead_source", "commission", "shipment_by",
     "downpayment_date", "invoice_to", "delivery_instructions",
-    "salesman_signature", "gm_signature",
+    "gm_signature",
 ]
 
 CATALOG_INITIAL_PRICE_DATE = "2025-01-01"

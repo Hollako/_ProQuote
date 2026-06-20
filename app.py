@@ -334,7 +334,6 @@ DEFAULT_PROJECT_SHEET_INFO = {
     "downpayment_date": "",
     "invoice_to": "",
     "delivery_instructions": "",
-    "salesman_signature": "Sameera Ibrahim",
     "gm_signature": "",
 }
 
@@ -601,7 +600,6 @@ def _prime_new_offer_form(header: dict | None = None, grid: pd.DataFrame | None 
         "downpayment_date": "no_ps_downpayment_date",
         "invoice_to": "no_ps_invoice_to",
         "delivery_instructions": "no_ps_delivery_instructions",
-        "salesman_signature": "no_ps_salesman_signature",
         "gm_signature": "no_ps_gm_signature",
     }
     ps_info = h.get("project_sheet") or {}
@@ -696,7 +694,7 @@ EDIT_WIDGET_KEYS = (
     "ed_deliv", "ed_valid", "ed_pay", "ed_notes",
     "ed_ps_job_reference", "ed_ps_sheet_date", "ed_ps_lead_source", "ed_ps_commission",
     "ed_ps_shipment_by", "ed_ps_downpayment_date", "ed_ps_invoice_to",
-    "ed_ps_delivery_instructions", "ed_ps_salesman_signature", "ed_ps_gm_signature",
+    "ed_ps_delivery_instructions", "ed_ps_gm_signature",
 )
 
 
@@ -774,7 +772,7 @@ def _sync_edit_state_from_widgets():
             "shipment_by": "ed_ps_shipment_by", "downpayment_date": "ed_ps_downpayment_date",
             "invoice_to": "ed_ps_invoice_to",
             "delivery_instructions": "ed_ps_delivery_instructions",
-            "salesman_signature": "ed_ps_salesman_signature", "gm_signature": "ed_ps_gm_signature",
+            "gm_signature": "ed_ps_gm_signature",
         }
         for field, key in ps_keys.items():
             if key in st.session_state:
@@ -833,7 +831,7 @@ def _sync_new_header_from_widgets():
         "shipment_by": "no_ps_shipment_by", "downpayment_date": "no_ps_downpayment_date",
         "invoice_to": "no_ps_invoice_to",
         "delivery_instructions": "no_ps_delivery_instructions",
-        "salesman_signature": "no_ps_salesman_signature", "gm_signature": "no_ps_gm_signature",
+        "gm_signature": "no_ps_gm_signature",
     }
     for field, key in ps_keys.items():
         if key in st.session_state:
@@ -1229,7 +1227,9 @@ def _new_offer_actions():
             "**🆕 New offer** to begin a fresh offer."
         )
 
-    ac1, ac2, ac3, ac4, ac5, ac6 = st.columns([1.05, 1.1, 0.9, 1.05, 0.9, 1.05])
+    ac1, ac2, ac3, ac4, ac5, ac6, ac7 = st.columns(
+        [1.0, 1.05, 0.85, 1.0, 0.85, 1.0, 0.95]
+    )
     if ac1.button(
         "💾 Save option" if st.session_state.get("no_offer_lock") else "💾 Save offer",
         type="primary",
@@ -1311,21 +1311,35 @@ def _new_offer_actions():
     else:
         ac5.button("⬇️ Download PDF", disabled=True, width="stretch")
 
-    if _ps_enabled() and ac6.button("📊 Generate Project Sheet", width="stretch"):
+    if _ps_enabled() and ac6.button(
+        "📊 Generate Sheet",
+        help="Generate Project Sheet",
+        width="stretch",
+    ):
         _make_project_sheet_download(h, s)
 
-    if _ps_enabled() and "project_sheet_bytes" in st.session_state:
-        ps_download_col, _ = st.columns([1.05, 5.0])
-        ps_download_col.download_button(
-            "⬇️ Download Project Sheet",
-            st.session_state.project_sheet_bytes,
-            file_name=f"Project_Sheet_{_safe_filename(h.get('offer') or h.get('project'))}.xlsx",
-            mime=(
-                "application/vnd.openxmlformats-officedocument."
-                "spreadsheetml.sheet"
-            ),
-            width="stretch",
-        )
+    if _ps_enabled():
+        if "project_sheet_bytes" in st.session_state:
+            ac7.download_button(
+                "⬇️ Download Sheet",
+                st.session_state.project_sheet_bytes,
+                file_name=(
+                    f"Project_Sheet_{_safe_filename(h.get('offer') or h.get('project'))}.xlsx"
+                ),
+                mime=(
+                    "application/vnd.openxmlformats-officedocument."
+                    "spreadsheetml.sheet"
+                ),
+                help="Download Project Sheet",
+                width="stretch",
+            )
+        else:
+            ac7.button(
+                "⬇️ Download Sheet",
+                disabled=True,
+                help="Generate the Project Sheet first",
+                width="stretch",
+            )
 
 
 @st.fragment
@@ -1480,9 +1494,8 @@ def project_sheet_info_form(store: dict, kp: str):
         _txt(st, "invoice_to", "Invoice to")
         _txt(st, "delivery_instructions",
              "Delivery Instructions / Contact person & details", area=True, height=70)
-        c9, c10 = st.columns(2)
-        _txt(c9, "salesman_signature", "Salesman Signature Name")
-        _txt(c10, "gm_signature", "GM Signature Name")
+        c9, _ = st.columns(2)
+        _txt(c9, "gm_signature", "GM Signature Name")
 
     store["project_sheet"] = ps
     return ps
@@ -1654,7 +1667,7 @@ def _project_sheet_bytes(h: dict, s: dict) -> bytes:
     ws["D17"].number_format = "#,##0.00"
 
     ws.merge_cells("A25:B27")
-    ws["A25"] = "Salesman Signature\n\n" + (ps.get("salesman_signature") or "")
+    ws["A25"] = "Salesman Signature\n\n" + _text(h.get("sales"))
     ws.merge_cells("C25:E27")
     ws["C25"] = "GM Signature" + (("\n\n" + ps.get("gm_signature")) if ps.get("gm_signature") else "")
     for cell in (ws["A25"], ws["C25"]):
@@ -3315,7 +3328,9 @@ elif mode == "Load Project":
                 _render_finance_tab(pid, s["grand_total_sar"])
 
             with view_actions:
-                b1, b2, b3, b4, b5 = st.columns([1.35, 0.95, 1.1, 0.85, 1.05])
+                b1, b2, b3, b4, b5, b6 = st.columns(
+                    [1.3, 0.9, 1.05, 0.8, 1.0, 0.95]
+                )
             if can("edit") and b1.button("✏️ Edit / new revision or option", type="primary",
                                           width="stretch"):
                 eg = grid.copy()
@@ -3348,7 +3363,6 @@ elif mode == "Load Project":
                     "downpayment_date": "ed_ps_downpayment_date",
                     "invoice_to": "ed_ps_invoice_to",
                     "delivery_instructions": "ed_ps_delivery_instructions",
-                    "salesman_signature": "ed_ps_salesman_signature",
                     "gm_signature": "ed_ps_gm_signature",
                 }.items():
                     st.session_state[key] = st.session_state.edit_project_sheet.get(
@@ -3432,15 +3446,23 @@ elif mode == "Load Project":
                 b4.button("⬇️ Download PDF", disabled=True, width="stretch")
             if _ps_enabled() and b5.button("📊 Generate Project Sheet", width="stretch"):
                 _make_project_sheet_download(_export_header(), s)
-            dl1, _ = st.columns(2)
-            if (_ps_enabled() and "project_sheet_bytes" in st.session_state
-                    and not st.session_state.get("saved_rev")):
-                dl1.download_button(
-                    "⬇️ Download Project Sheet", st.session_state.project_sheet_bytes,
-                    file_name=f"Project_Sheet_{_safe_filename(meta.get('OfferNo') or meta.get('ProjectName'))}.xlsx",
-                    mime=("application/vnd.openxmlformats-officedocument."
-                          "spreadsheetml.sheet"),
-                    width="stretch")
+            if _ps_enabled():
+                if ("project_sheet_bytes" in st.session_state
+                        and not st.session_state.get("saved_rev")):
+                    b6.download_button(
+                        "⬇️ Download Project Sheet",
+                        st.session_state.project_sheet_bytes,
+                        file_name=(
+                            f"Project_Sheet_{_safe_filename(meta.get('OfferNo') or meta.get('ProjectName'))}.xlsx"
+                        ),
+                        mime=(
+                            "application/vnd.openxmlformats-officedocument."
+                            "spreadsheetml.sheet"
+                        ),
+                        width="stretch",
+                    )
+                else:
+                    b6.button("⬇️ Download Project Sheet", disabled=True, width="stretch")
 
             if can("delete"):
               with st.expander("Delete..."):
