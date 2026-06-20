@@ -24,6 +24,18 @@ PROJECT_SHEET_KEYS = [
 
 CATALOG_INITIAL_PRICE_DATE = "2025-01-01"
 
+# Safe allow-list for the Settings -> Data Tools bulk project cleanup.  Values are
+# database column names, so callers never provide SQL identifiers directly.
+PROJECT_CLEANUP_FIELDS = {
+    "Sales Person": "SalesPerson",
+    "Pre-sales Engineer": "PresalesEngineer",
+    "Project Manager": "ProjectManager",
+    "Client": "ClientName",
+    "Contact": "ContactName",
+    "Contractor": "Contractor",
+    "Region": "Region",
+}
+
 
 def load_terms(meta: dict) -> dict:
     """Parse the OfferTerms JSON blob from a project_meta row (empty if none)."""
@@ -446,6 +458,73 @@ def cleanup_parse_clients(apply: bool = False) -> dict:
     return {"to_update": len(changes), "sample": changes[:50]}
 
 
+def project_cleanup_values(field_label: str) -> list[dict]:
+    """Distinct non-blank stored values and their project-record counts."""
+    column = PROJECT_CLEANUP_FIELDS.get(field_label)
+    if not column:
+        raise ValueError(f"Unsupported project cleanup field: {field_label}")
+    with _conn() as c:
+        rows = c.execute(
+            f"SELECT TRIM(COALESCE({column},'')) AS Value, COUNT(*) AS OfferCount "
+            f"FROM Projects_Master WHERE TRIM(COALESCE({column},'')) <> '' "
+            f"GROUP BY TRIM(COALESCE({column},'')) "
+            f"ORDER BY Value COLLATE NOCASE"
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def bulk_replace_project_field(field_label: str, old_values, replacement,
+                               apply: bool = False) -> dict:
+    """Preview or replace exact (trimmed) values in a project header field.
+
+    Multiple imported typo variants can be merged into one canonical value.  The
+    replacement itself is excluded from the source set, avoiding no-op updates when
+    it was selected accidentally.
+    """
+    column = PROJECT_CLEANUP_FIELDS.get(field_label)
+    if not column:
+        raise ValueError(f"Unsupported project cleanup field: {field_label}")
+    new_value = _str(replacement).strip()
+    if not new_value:
+        raise ValueError("Replacement value cannot be blank.")
+    sources = sorted({
+        _str(value).strip() for value in (old_values or [])
+        if _str(value).strip() and _str(value).strip() != new_value
+    }, key=str.casefold)
+    if not sources:
+        return {"to_update": 0, "sample": [], "sources": [], "replacement": new_value}
+
+    marks = ",".join("?" for _ in sources)
+    with _conn() as c:
+        rows = c.execute(
+            f"SELECT ProjectID, OfferNo, ProjectName, CreationDate, "
+            f"TRIM(COALESCE({column},'')) AS CurrentValue "
+            f"FROM Projects_Master "
+            f"WHERE TRIM(COALESCE({column},'')) IN ({marks}) "
+            f"ORDER BY CreationDate DESC, ProjectID DESC",
+            sources,
+        ).fetchall()
+        if apply and rows:
+            c.execute(
+                f"UPDATE Projects_Master SET {column}=? "
+                f"WHERE TRIM(COALESCE({column},'')) IN ({marks})",
+                [new_value, *sources],
+            )
+            c.commit()
+
+    sample = [
+        (r["ProjectID"], _str(r["OfferNo"]), _str(r["ProjectName"]),
+         _str(r["CreationDate"]), _str(r["CurrentValue"]), new_value)
+        for r in rows[:100]
+    ]
+    return {
+        "to_update": len(rows),
+        "sample": sample,
+        "sources": sources,
+        "replacement": new_value,
+    }
+
+
 def clear_imported_data() -> dict:
     """Delete ALL projects (cascades to lines/sheets/finance) and catalogue items,
     for a clean re-import. Keeps Settings, Users, Roles and branding."""
@@ -497,22 +576,40 @@ CATALOG_EDITABLE = {  # display label -> DB column
     "Default U.Price $": "DefaultUPriceUSD",
     "Default U.Price SAR": "DefaultUPriceSAR",
 }
-# DB columns that update_catalog_item is allowed to write (numeric + the currency).
-_CATALOG_WRITABLE = set(CATALOG_EDITABLE.values()) | {"Currency"}
+# DB columns that update_catalog_item is allowed to write.
+_CATALOG_PRICE_WRITABLE = set(CATALOG_EDITABLE.values()) | {"Currency"}
+_CATALOG_IDENTITY_WRITABLE = {"Brand", "Model", "Description"}
+_CATALOG_WRITABLE = _CATALOG_PRICE_WRITABLE | _CATALOG_IDENTITY_WRITABLE
 
 
-def update_catalog_item(item_id: int, fields: dict) -> None:
-    """Update cost/default-price/currency columns of a catalogue item (keyed by DB column).
+def update_catalog_item(item_id: int, fields: dict) -> bool:
+    """Update identity/cost/default-price/currency fields (keyed by DB column).
     Ex cost is in the item's currency; UnitCostUSD is recomputed in USD when the
-    Ex cost, shipping or currency changes."""
+    Ex cost, shipping or currency changes. Returns False for a duplicate item."""
     if not any(c in _CATALOG_WRITABLE for c in fields):
-        return
+        return False
+    fields = {key: value for key, value in fields.items() if key in _CATALOG_WRITABLE}
+    for field in _CATALOG_IDENTITY_WRITABLE & fields.keys():
+        fields[field] = _str(fields[field]).strip()
     with _conn() as c:
         row = c.execute(
-            "SELECT ExUnitCostUSD,ShippingPercent,UnitCostUSD,Currency FROM Items_Catalog WHERE ItemID=?",
+            "SELECT Brand,Model,Description,ExUnitCostUSD,ShippingPercent,UnitCostUSD,Currency "
+            "FROM Items_Catalog WHERE ItemID=?",
             (int(item_id),),
         ).fetchone()
         if row:
+            if _CATALOG_IDENTITY_WRITABLE & fields.keys():
+                brand = fields.get("Brand", row["Brand"]) or ""
+                model = fields.get("Model", row["Model"]) or ""
+                description = fields.get("Description", row["Description"]) or ""
+                duplicate = c.execute(
+                    "SELECT ItemID FROM Items_Catalog WHERE ItemID<>? "
+                    "AND IFNULL(Brand,'')=? AND IFNULL(Model,'')=? "
+                    "AND IFNULL(Description,'')=?",
+                    (int(item_id), brand, model, description),
+                ).fetchone()
+                if duplicate:
+                    return False
             ex = fields.get("ExUnitCostUSD", row["ExUnitCostUSD"])
             ship = fields.get("ShippingPercent", row["ShippingPercent"])
             unit = fields.get("UnitCostUSD", row["UnitCostUSD"])
@@ -526,11 +623,17 @@ def update_catalog_item(item_id: int, fields: dict) -> None:
 
         cols = [c for c in fields if c in _CATALOG_WRITABLE]
         if not cols:
-            return
-        sets = ", ".join([f"{col}=?" for col in cols] + ["PriceUpdatedAt=?"])
-        c.execute(f"UPDATE Items_Catalog SET {sets} WHERE ItemID=?",
-                  (*[fields[k] for k in cols], dt.date.today().isoformat(), item_id))
+            return False
+        updates_price = any(col in _CATALOG_PRICE_WRITABLE for col in cols)
+        sets = [f"{col}=?" for col in cols]
+        values = [fields[key] for key in cols]
+        if updates_price:
+            sets.append("PriceUpdatedAt=?")
+            values.append(dt.date.today().isoformat())
+        c.execute(f"UPDATE Items_Catalog SET {', '.join(sets)} WHERE ItemID=?",
+                  (*values, item_id))
         c.commit()
+    return True
 
 
 def add_catalog_item(brand, model, description, list_price=None, ex_cost=None,

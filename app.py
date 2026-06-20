@@ -403,6 +403,26 @@ def _person_select(col, label, role, current, key):
     return "" if pick == "-" else pick
 
 
+def _report_filter_options(df, column):
+    """Return data values plus everyone currently assignable as Sales."""
+    values = {
+        str(value).strip()
+        for value in df[column].dropna().unique()
+        if str(value).strip() and str(value).strip() != "-"
+    }
+    if column == "Sales Person":
+        values.update(
+            str(name).strip()
+            for name in auth.users_in_roles(SALES_PERSON_ROLES)
+            if str(name).strip() and str(name).strip() != "-"
+        )
+    return sorted(values, key=str.casefold)
+
+
+def _report_filter_label(column):
+    return "Assigned as Sales" if column == "Sales Person" else column
+
+
 def _empty_grid() -> pd.DataFrame:
     df = pd.DataFrame([calc.blank_row()])
     df["LineType"] = "item"
@@ -778,6 +798,30 @@ def _cancel_edit_dialog():
     if close_col.button("X Close without saving", key="ed_cancel_modal_discard",
                         width="stretch"):
         _close_edit_mode()
+        st.rerun()
+
+
+@st.dialog("Confirm approval", width="small", dismissible=False)
+def _approve_offer_dialog(project_id: int, offer_label: str):
+    _, xcol = st.columns([8, 1])
+    if xcol.button("X", key="approve_modal_close", width="stretch",
+                   help="Close without approving"):
+        st.rerun()
+
+    st.write("Are you sure you want to approve this offer?")
+    st.info(offer_label or f"Offer #{project_id}")
+    st.caption("Approving it will archive any other revision or option in the same offer family.")
+
+    yes_col, no_col = st.columns(2)
+    if yes_col.button("Yes", type="primary", key="approve_modal_yes", width="stretch"):
+        archived = repo.approve_offer(project_id)
+        st.toast(
+            f"Approved. {archived} other entr{'y' if archived == 1 else 'ies'} archived."
+            if archived else "Approved.",
+            icon="✅",
+        )
+        st.rerun()
+    if no_col.button("No", key="approve_modal_no", width="stretch"):
         st.rerun()
 
 
@@ -2209,8 +2253,15 @@ def _render_report_builder(company):
         selections, fcols = {}, [f for f in meta["filters"] if f in df.columns]
         cols = st.columns(3)
         for i, fcol in enumerate(fcols):
-            opts = sorted([str(v) for v in df[fcol].dropna().unique() if str(v).strip() != ""])
-            selections[fcol] = cols[i % 3].multiselect(fcol, opts, key=f"rf_{ds_name}_{fcol}")
+            opts = _report_filter_options(df, fcol)
+            label = _report_filter_label(fcol)
+            help_text = None
+            if fcol == "Sales Person":
+                help_text = ("Filters by the person assigned in the project's Sales Person field. "
+                             "The list includes Sales, Pre-Sales, Project Manager, and Top "
+                             "Management users who can act as Sales.")
+            selections[fcol] = cols[i % 3].multiselect(
+                label, opts, key=f"rf_{ds_name}_{fcol}", help=help_text)
         dcol = meta.get("date")
         date_from = date_to = None
         if dcol and dcol in df.columns and pd.to_datetime(df[dcol], errors="coerce").notna().any():
@@ -2252,7 +2303,8 @@ def _render_report_builder(company):
 
     # ---- Exports ----
     sub = [f"Generated {dt.date.today().isoformat()} · {ds_name}"]
-    active = [f"{k}: {', '.join(v)}" for k, v in selections.items() if v]
+    active = [f"{_report_filter_label(k)}: {', '.join(v)}"
+              for k, v in selections.items() if v]
     if date_from or date_to:
         active.append(f"Date: {date_from or '…'} → {date_to or '…'}")
     if group_by:
@@ -2275,103 +2327,292 @@ def _render_report_builder(company):
                            file_name="report.pdf", mime="application/pdf")
 
 
-def _bar(ax, labels, values, title, color, horizontal=False, fmt_k=True):
-    if horizontal:
-        ax.barh(labels, values, color=color)
-        ax.invert_yaxis()
+def _dashboard_number(value, unit="SAR"):
+    """Compact, readable dashboard number (avoids scientific notation such as 1e8)."""
+    value = float(value or 0)
+    if unit == "%":
+        return f"{value:,.1f}%"
+    if unit == "count":
+        return f"{int(round(value)):,}"
+    magnitude = abs(value)
+    if magnitude >= 1_000_000_000:
+        text = f"{value / 1_000_000_000:,.1f}B"
+    elif magnitude >= 1_000_000:
+        text = f"{value / 1_000_000:,.1f}M"
+    elif magnitude >= 1_000:
+        text = f"{value / 1_000:,.1f}K"
     else:
-        ax.bar(labels, values, color=color)
-        ax.tick_params(axis="x", rotation=45)
-    ax.set_title(title, fontsize=11, fontweight="bold")
-    ax.grid(axis="x" if horizontal else "y", alpha=0.25)
-    for s in ("top", "right"):
-        ax.spines[s].set_visible(False)
+        text = f"{value:,.0f}"
+    return f"{text} SAR" if unit == "SAR" else text
 
 
 def _render_dashboard(company):
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
+    from matplotlib.ticker import FuncFormatter
 
     stamp = _db_cache_stamp()
     offers = _cached_offers_df(False, stamp)
-    fin = _cached_finance_df(False, stamp)
+    finance = _cached_finance_df(False, stamp)
     if offers.empty:
         st.info("No offers yet — nothing to chart.")
         return
+
+    # Finance is the offers dataset plus collection/purchase metrics, so it can drive
+    # every chart when available without maintaining two separate filter states.
+    data = finance.copy() if not finance.empty else offers.copy()
     brand = company.get("color") or "#002060"
-    figs = []   # (caption, fig)
+    metric_defs = {
+        "Quoted value": ("Grand Total SAR", "sum", "SAR"),
+        "Offer records": ("ProjectID", "count", "count"),
+        "Gross profit": ("Gross Profit SAR", "sum", "SAR"),
+        "Average margin": ("Margin %", "mean", "%"),
+        "Cost": ("Cost SAR", "sum", "SAR"),
+        "Collected": ("Collected SAR", "sum", "SAR"),
+        "Remaining / due": ("Remaining SAR", "sum", "SAR"),
+        "PO spend": ("PO Spend SAR", "sum", "SAR"),
+        "Net profit": ("Net Profit SAR", "sum", "SAR"),
+    }
+    metric_defs = {label: spec for label, spec in metric_defs.items() if spec[0] in data.columns}
+    group_defs = {
+        "Month": "Month",
+        "Client": "Client",
+        "Assigned as Sales": "Sales Person",
+        "Pre-sales Engineer": "Pre-sales",
+        "Project Manager": "Project Mgr",
+        "System": "System",
+        "Status": "Status",
+    }
+    group_defs = {label: col for label, col in group_defs.items() if col in data.columns}
+    filter_cols = [
+        col for col in ("Status", "Client", "Sales Person", "Pre-sales", "Project Mgr", "System")
+        if col in data.columns
+    ]
 
-    # 1) Value & count per month
-    bym = offers.groupby("Month").agg(Value=("Grand Total SAR", "sum"),
-                                      Count=("ProjectID", "count")).reset_index()
-    bym = bym[bym["Month"].astype(str) != "NaT"].tail(12)
-    if not bym.empty:
-        fig, ax = plt.subplots(figsize=(9, 3.2))
-        _bar(ax, bym["Month"], bym["Value"], "Offer value per month (SAR)", brand)
-        figs.append(("Bookings trend", fig))
+    st.caption(
+        "Build one focused chart at a time. **Quoted value** is the total value of the "
+        "filtered offer records; **Gross profit** is discounted sales value before VAT minus cost."
+    )
+    with st.form("dashboard_builder_form"):
+        st.markdown("##### Choose what you want to see")
+        c1, c2, c3, c4 = st.columns(4)
+        metric_label = c1.selectbox("Metric", list(metric_defs), key="dash_metric")
+        group_label = c2.selectbox("Group by", list(group_defs), key="dash_group")
+        chart_type = c3.selectbox(
+            "Chart type", ["Column", "Horizontal bar", "Line"], key="dash_chart_type")
+        chart_size = c4.selectbox("Chart size", ["Compact", "Medium"], key="dash_chart_size")
+        p1, p2, p3 = st.columns([1, 1, 2])
+        top_n = p1.slider("Groups / periods", 3, 20, 10, key="dash_top_n")
+        show_values = p2.checkbox("Show values", value=True, key="dash_show_values")
+        custom_title = p3.text_input(
+            "Optional chart title", key="dash_title", placeholder="Leave blank for an automatic title")
 
-    # 2) Approved vs pending (value)
-    pipe = offers.groupby("Status")["Grand Total SAR"].sum()
-    if not pipe.empty:
-        fig, ax = plt.subplots(figsize=(4.5, 3.2))
-        ax.pie(pipe.values, labels=pipe.index, autopct="%1.0f%%",
-               colors=["#2FA84F", "#C9D3DF"], startangle=90)
-        ax.set_title("Pipeline value: approved vs pending", fontsize=11, fontweight="bold")
-        figs.append(("Pipeline", fig))
+        with st.expander("Filters (optional)", expanded=False):
+            selections = {}
+            fcols = st.columns(3)
+            for i, column in enumerate(filter_cols):
+                selections[column] = fcols[i % 3].multiselect(
+                    _report_filter_label(column),
+                    _report_filter_options(data, column),
+                    key=f"dash_filter::{column}",
+                )
+            d1, d2 = st.columns(2)
+            date_from = d1.date_input("From date", value=None, key="dash_date_from")
+            date_to = d2.date_input("To date", value=None, key="dash_date_to")
 
-    # 3) Top clients by value
-    topc = offers.groupby("Client")["Grand Total SAR"].sum().sort_values(ascending=False).head(10)
-    if not topc.empty:
-        fig, ax = plt.subplots(figsize=(9, 3.6))
-        _bar(ax, topc.index, topc.values, "Top clients by value (SAR)", brand, horizontal=True)
-        figs.append(("Top clients", fig))
+        generated = st.form_submit_button(
+            "Generate dashboard", type="primary", icon="📊", width="stretch")
 
-    # 4) Sales-person leaderboard
-    sp = offers[offers["Sales Person"].astype(str).str.strip() != ""]
-    lead = sp.groupby("Sales Person")["Grand Total SAR"].sum().sort_values(ascending=False).head(10)
-    if not lead.empty:
-        fig, ax = plt.subplots(figsize=(9, 3.2))
-        _bar(ax, lead.index, lead.values, "Sales-person leaderboard (SAR)", "#37689B", horizontal=True)
-        figs.append(("Sales leaderboard", fig))
+    if generated:
+        st.session_state["dashboard_config"] = {
+            "metric": metric_label,
+            "group": group_label,
+            "chart_type": chart_type,
+            "chart_size": chart_size,
+            "top_n": top_n,
+            "show_values": show_values,
+            "title": custom_title.strip(),
+            "filters": selections,
+            "date_from": date_from,
+            "date_to": date_to,
+        }
+        st.session_state.pop("dashboard_pdf_bytes", None)
 
-    # 5) Gross profit by top clients
-    gp = offers.groupby("Client")["Gross Profit SAR"].sum().sort_values(ascending=False).head(10)
-    if not gp.empty:
-        fig, ax = plt.subplots(figsize=(9, 3.2))
-        _bar(ax, gp.index, gp.values, "Gross profit by client (SAR)", "#2FA84F", horizontal=True)
-        figs.append(("Profit by client", fig))
+    config = st.session_state.get("dashboard_config")
+    if not config:
+        st.info("Choose a metric and grouping above, then click **Generate dashboard**.")
+        return
+    if config.get("metric") not in metric_defs or config.get("group") not in group_defs:
+        st.session_state.pop("dashboard_config", None)
+        st.info("The available data changed. Please generate the dashboard again.")
+        return
 
-    # 6) Finance: collected vs remaining vs PO spend (totals)
-    if not fin.empty:
-        totals = {"Collected": fin["Collected SAR"].sum(), "Remaining/Due": fin["Remaining SAR"].sum(),
-                  "PO Spend": fin["PO Spend SAR"].sum(), "Net Profit": fin["Net Profit SAR"].sum()}
-        fig, ax = plt.subplots(figsize=(9, 3.2))
-        _bar(ax, list(totals.keys()), list(totals.values()), "Finance totals (SAR)", brand)
-        figs.append(("Finance totals", fig))
+    filtered = reports.apply_filters(
+        data,
+        config.get("filters", {}),
+        "Date",
+        config.get("date_from"),
+        config.get("date_to"),
+    )
+    if filtered.empty:
+        st.warning("No records match these filters. Change the filters and generate again.")
+        return
 
-    for _, fig in figs:
-        st.pyplot(fig, width="stretch")
+    quoted = float(filtered["Grand Total SAR"].sum())
+    approved = float(filtered.loc[filtered["Status"] == "Approved", "Grand Total SAR"].sum())
+    gross_profit = float(filtered["Gross Profit SAR"].sum())
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric("Offer records", f"{len(filtered):,}", help="Includes revisions and options.")
+    k2.metric("Quoted value", _dashboard_number(quoted))
+    k3.metric("Approved value", _dashboard_number(approved))
+    k4.metric("Gross profit", _dashboard_number(gross_profit))
 
-    if st.button("📄 Export charts as PDF", width="stretch"):
+    metric_col, aggregation, unit = metric_defs[config["metric"]]
+    group_col = group_defs[config["group"]]
+    work = filtered.copy()
+    valid_group = work[group_col].notna() & work[group_col].astype(str).str.strip().ne("")
+    if group_col == "Month":
+        valid_group &= work[group_col].astype(str).ne("NaT")
+    work = work[valid_group]
+    if work.empty:
+        st.warning(f"The matching records have no {config['group']} value to chart.")
+        return
+
+    if aggregation == "count":
+        grouped = work.groupby(group_col).size()
+    else:
+        grouped = work.groupby(group_col)[metric_col].agg(aggregation)
+    grouped = grouped.dropna()
+    if group_col == "Month":
+        grouped = grouped.sort_index().tail(int(config["top_n"]))
+    else:
+        grouped = grouped.sort_values(ascending=False).head(int(config["top_n"]))
+    if grouped.empty:
+        st.warning("There is no numeric data for this chart.")
+        return
+
+    labels = [str(value) for value in grouped.index]
+    values = [float(value) for value in grouped.values]
+    title = config.get("title") or f"{config['metric']} by {config['group']}"
+    figsize = (7.2, 2.9) if config.get("chart_size") == "Compact" else (9.0, 3.8)
+    fig, ax = plt.subplots(figsize=figsize)
+    color = "#37689B" if config["group"] == "Assigned as Sales" else brand
+    chart_type = config.get("chart_type", "Column")
+    bars = None
+    if chart_type == "Horizontal bar":
+        bars = ax.barh(labels, values, color=color)
+        ax.invert_yaxis()
+        value_axis = ax.xaxis
+        ax.grid(axis="x", alpha=0.2)
+    elif chart_type == "Line":
+        ax.plot(labels, values, marker="o", linewidth=2.2, color=color)
+        value_axis = ax.yaxis
+        ax.grid(axis="y", alpha=0.2)
+        ax.tick_params(axis="x", rotation=35)
+    else:
+        bars = ax.bar(labels, values, color=color)
+        value_axis = ax.yaxis
+        ax.grid(axis="y", alpha=0.2)
+        ax.tick_params(axis="x", rotation=35)
+
+    if unit == "SAR":
+        value_axis.set_major_formatter(FuncFormatter(lambda value, _pos: _dashboard_number(value, "").strip()))
+    elif unit == "%":
+        value_axis.set_major_formatter(FuncFormatter(lambda value, _pos: f"{value:,.1f}%"))
+    else:
+        value_axis.set_major_formatter(FuncFormatter(lambda value, _pos: f"{value:,.0f}"))
+    if bars is not None and config.get("show_values"):
+        ax.bar_label(
+            bars,
+            labels=[_dashboard_number(value, unit) for value in values],
+            padding=3,
+            fontsize=8,
+        )
+    elif chart_type == "Line" and config.get("show_values"):
+        for x, value in enumerate(values):
+            ax.annotate(_dashboard_number(value, unit), (x, value),
+                        xytext=(0, 7), textcoords="offset points", ha="center", fontsize=8)
+    ax.set_title(title, fontsize=12, fontweight="bold", pad=12)
+    ax.set_xlabel(config["group"])
+    ax.set_ylabel(config["metric"] + (" (SAR)" if unit == "SAR" else ""))
+    for side in ("top", "right"):
+        ax.spines[side].set_visible(False)
+    fig.tight_layout()
+
+    table = pd.DataFrame({config["group"]: labels, config["metric"]: values})
+    chart_col, table_col = st.columns([2.4, 1], vertical_alignment="top")
+    chart_col.pyplot(fig, width="content", clear_figure=False)
+    table_cfg = {}
+    if unit == "SAR":
+        table_cfg[config["metric"]] = st.column_config.NumberColumn(
+            config["metric"], format="accounting")
+    elif unit == "%":
+        table_cfg[config["metric"]] = st.column_config.NumberColumn(config["metric"], format="%.1f%%")
+    else:
+        table_cfg[config["metric"]] = st.column_config.NumberColumn(config["metric"], format="%d")
+    table_col.caption(f"{len(filtered)} filtered record(s)")
+    table_col.dataframe(table, hide_index=True, width="stretch", height=300, column_config=table_cfg)
+
+    png = io.BytesIO()
+    fig.savefig(png, format="png", dpi=150, bbox_inches="tight")
+    png_bytes = png.getvalue()
+    e1, e2, e3 = st.columns(3)
+    e1.download_button(
+        "Download chart PNG", png_bytes, file_name="dashboard_chart.png", mime="image/png",
+        width="stretch", on_click="ignore")
+    e2.download_button(
+        "Export chart data", _excel_bytes({"Dashboard Data": table}),
+        file_name="dashboard_data.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        width="stretch", on_click="ignore")
+    if e3.button("Build dashboard PDF", width="stretch"):
         import tempfile
-        paths = []
-        tmp = tempfile.mkdtemp(prefix="pq_charts_")
-        for i, (_, fig) in enumerate(figs):
-            p = os.path.join(tmp, f"chart_{i}.png")
-            fig.savefig(p, dpi=130, bbox_inches="tight")
-            paths.append(p)
-        out = os.path.join(db.DATA_DIR, "_last_dashboard.pdf")
-        pdf_export.generate_report_pdf(out, "Statistics dashboard",
-                                       [f"Generated {dt.date.today().isoformat()}"],
-                                       table_df=None, totals=None, company=company, chart_paths=paths)
-        with open(out, "rb") as f:
-            st.session_state["dashboard_pdf_bytes"] = f.read()
         import shutil
-        shutil.rmtree(tmp, ignore_errors=True)
+        tmp = tempfile.mkdtemp(prefix="pq_dashboard_")
+        try:
+            chart_path = os.path.join(tmp, "dashboard_chart.png")
+            with open(chart_path, "wb") as chart_file:
+                chart_file.write(png_bytes)
+            filter_summary = [
+                f"{_report_filter_label(key)}: {', '.join(value)}"
+                for key, value in config.get("filters", {}).items() if value
+            ]
+            if config.get("date_from") or config.get("date_to"):
+                filter_summary.append(
+                    f"Date: {config.get('date_from') or '…'} to {config.get('date_to') or '…'}")
+            subtitle = [f"Generated {dt.date.today().isoformat()}"]
+            subtitle.append(
+                f"Records: {len(filtered):,} | Quoted: {_dashboard_number(quoted)} | "
+                f"Approved: {_dashboard_number(approved)} | "
+                f"Gross profit: {_dashboard_number(gross_profit)}"
+            )
+            if filter_summary:
+                subtitle.append("Filters — " + " | ".join(filter_summary))
+            selected_total = (
+                float(work[metric_col].mean())
+                if aggregation == "mean"
+                else float(grouped.sum())
+            )
+            out = os.path.join(db.DATA_DIR, "_last_dashboard.pdf")
+            pdf_export.generate_report_pdf(
+                out,
+                title,
+                subtitle,
+                table_df=table,
+                totals={config["metric"]: selected_total},
+                company=company,
+                chart_paths=[chart_path],
+            )
+            with open(out, "rb") as pdf_file:
+                st.session_state["dashboard_pdf_bytes"] = pdf_file.read()
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
     if st.session_state.get("dashboard_pdf_bytes"):
-        st.download_button("⬇️ Download charts PDF", st.session_state["dashboard_pdf_bytes"],
-                           file_name="dashboard.pdf", mime="application/pdf")
+        st.download_button(
+            "Download dashboard PDF", st.session_state["dashboard_pdf_bytes"],
+            file_name="dashboard.pdf", mime="application/pdf", on_click="ignore")
+    plt.close(fig)
 
 
 def _render_tracking_tab(project_id: int, sheet_name: str | None):
@@ -2520,7 +2761,7 @@ if st.sidebar.button("🔒 Log out", width="stretch"):
     st.rerun()
 
 _SECTIONS = [("New Project", "new_offer"), ("Load Project", "load"), ("Reports", "reports"),
-             ("Catalogue", "catalogue"), ("Settings", "settings"), ("Users", "users")]
+             ("Products Catalogue", "catalogue"), ("Settings", "settings"), ("Users", "users")]
 _allowed = [name for name, p in _SECTIONS if can(p)]
 if not _allowed:
     st.error("Your account has no accessible sections - contact the owner.")
@@ -2817,10 +3058,12 @@ elif mode == "Load Project":
                         st.rerun()
                 elif can("approve"):
                     if apc2.button("✅ Approve", type="primary", width="stretch"):
-                        n = repo.approve_offer(pid)
-                        st.toast(f"Approved. {n} other entr{'y' if n == 1 else 'ies'} archived."
-                                 if n else "Approved.", icon="✅")
-                        st.rerun()
+                        offer_label = (_text(meta.get("OfferNo"))
+                                       or _text(meta.get("ProjectName"), f"Offer #{pid}"))
+                        option_label = _text(meta.get("OptionLabel"))
+                        if option_label:
+                            offer_label = f"{offer_label} · {option_label}"
+                        _approve_offer_dialog(pid, offer_label)
                 if can("archive"):
                     if meta.get("Archived"):
                         if apc3.button("♻️ Restore", width="stretch"):
@@ -2993,7 +3236,11 @@ elif mode == "Load Project":
 elif mode == "Reports":
     st.subheader("Reports & statistics")
     _rep_company = _company_dict()
-    tab_builder, tab_dash = st.tabs(["🧱 Report Builder", "📊 Dashboard"])
+    tab_builder, tab_dash = st.tabs(
+        ["🧱 Report Builder", "📊 Dashboard"],
+        key="reports_active_tab",
+        on_change="rerun",
+    )
     with tab_builder:
         _render_report_builder(_rep_company)
     with tab_dash:
@@ -3001,8 +3248,8 @@ elif mode == "Reports":
 
 
 # ============================ CATALOGUE ============================
-elif mode == "Catalogue":
-    st.subheader("Catalogue")
+elif mode == "Products Catalogue":
+    st.subheader("Products Catalogue")
     _cat_edit = can("catalogue_edit")
 
     # ---- Add a new item ----
@@ -3038,21 +3285,33 @@ elif mode == "Catalogue":
                     else:
                         st.warning("An item with the same Brand + Model + Description already exists.")
 
-    st.caption("Prices shown **rounded up**. Edit cost / default-price cells inline, or tick "
-               "**Del** to remove items. Brand / Model / Description are read-only here - "
-               "use **Add new item** above to create one.")
+    st.caption("Prices shown **rounded up**. Edit Brand, Model, Description, cost, or "
+               "default-price cells inline, or tick **Del** to remove items. Use "
+               "**Add new item** above to create another product.")
     term = st.text_input("Search", placeholder="Model / Description / Brand")
     term = term.strip()
     if not term:
         st.info("Search by model, description, or brand.")
         res = pd.DataFrame()
     else:
-        _cat_limit = 300
+        _cat_limit = 1000
         res = repo.search_catalog(term, limit=_cat_limit).reset_index(drop=True)
         st.caption(
             f"{len(res)} item(s)"
             + (f" shown - refine the search for more specific results" if len(res) >= _cat_limit else "")
         )
+    _cat_select_reset = st.session_state.pop("_cat_clear_select_all", None)
+    if _cat_select_reset:
+        st.session_state[_cat_select_reset] = False
+    _cat_save_result = st.session_state.pop("_cat_save_result", None)
+    if _cat_save_result is not None:
+        _cat_saved, _cat_conflicts = _cat_save_result
+        st.success(f"Updated {_cat_saved} catalogue item(s).")
+        if _cat_conflicts:
+            st.warning(
+                f"Skipped {_cat_conflicts} item(s) because the edited description would "
+                "duplicate an existing Brand + Model + Description."
+            )
     if not res.empty:
         rename = {"ListPriceUSD": "List Price $", "ExUnitCostUSD": "Ex Unit Cost $",
                   "Currency": "Cur",
@@ -3086,23 +3345,42 @@ elif mode == "Catalogue":
         colcfg["Price Updated"] = st.column_config.TextColumn(
             "Updated On", width="small", alignment="center")
         colcfg["Times Quoted"] = st.column_config.NumberColumn("Times Quoted", format="%d")
+        colcfg["Brand"] = st.column_config.TextColumn("Brand", width="medium")
+        colcfg["Model"] = st.column_config.TextColumn("Model", width="medium")
+        colcfg["Description"] = st.column_config.TextColumn("Description", width="large")
         if not _cat_edit:                              # read-only catalogue
             st.dataframe(disp[base_cols], width="stretch", hide_index=True,
                          column_config=colcfg)
         else:
-            disp["Del"] = False
+            select_all_key = f"cat_select_all::{term}"
+            select_all = st.checkbox(
+                "Select all displayed products",
+                key=select_all_key,
+                help="Selects every product shown by the current search for deletion.",
+            )
+            disp["Del"] = bool(select_all)
             colcfg["Del"] = st.column_config.CheckboxColumn("Del", help="Tick to delete this item")
+            editor_generation = int(st.session_state.get("_cat_editor_generation", 0))
             edited = st.data_editor(
                 disp[["Del"] + base_cols], column_config=colcfg, num_rows="fixed", hide_index=True,
-                width="stretch", key=f"cat_editor::{term}",
-                disabled=["Brand", "Model", "Description", "Price Updated", "Times Quoted"])
+                width="stretch",
+                key=f"cat_editor::{term}::{int(select_all)}::{editor_generation}",
+                disabled=["Price Updated", "Times Quoted"])
             del_ids = [int(res.iloc[i]["ItemID"]) for i in range(len(edited))
                        if bool(edited.iloc[i]["Del"])]
             b1, b2 = st.columns(2)
-            if b1.button("💾 Save price changes", type="primary", width="stretch"):
+            if b1.button("💾 Save catalogue changes", type="primary", width="stretch"):
                 n = 0
+                duplicate_conflicts = 0
                 for i in range(len(edited)):
                     changes = {}
+                    for text_field in ("Brand", "Model", "Description"):
+                        new_text = "" if pd.isna(edited.iloc[i][text_field]) else str(
+                            edited.iloc[i][text_field]).strip()
+                        old_text = "" if pd.isna(disp.iloc[i][text_field]) else str(
+                            disp.iloc[i][text_field]).strip()
+                        if new_text != old_text:
+                            changes[text_field] = new_text
                     for c in edit_cols:
                         new = edited.iloc[i][c]
                         if pd.isna(new):
@@ -3113,13 +3391,17 @@ elif mode == "Catalogue":
                     if new_cur in calc.CURRENCIES and new_cur != str(disp.iloc[i]["Cur"]):
                         changes["Currency"] = new_cur
                     if changes:
-                        repo.update_catalog_item(int(res.iloc[i]["ItemID"]), changes)
-                        n += 1
-                st.success(f"Updated {n} catalogue item(s).")
+                        if repo.update_catalog_item(int(res.iloc[i]["ItemID"]), changes):
+                            n += 1
+                        else:
+                            duplicate_conflicts += 1
+                st.session_state["_cat_save_result"] = (n, duplicate_conflicts)
                 st.rerun()
             if b2.button(f"Delete {len(del_ids)} checked item(s)", width="stretch",
                          disabled=not del_ids):
                 n = repo.delete_catalog_items(del_ids)
+                st.session_state["_cat_clear_select_all"] = select_all_key
+                st.session_state["_cat_editor_generation"] = editor_generation + 1
                 st.success(f"Deleted {n} item(s).")
                 st.rerun()
 
@@ -3140,7 +3422,7 @@ elif mode == "Settings":
         "Data Tools",
         "Backup & Restore",
         "Updates",
-    ])
+    ], key="settings_active_tab", on_change="rerun")
 
     with tab_offer:
         st.markdown("##### Offer numbers")
@@ -3645,6 +3927,124 @@ elif mode == "Settings":
                 "first and creates a safety backup before applying."
             )
 
+            # ---- Bulk exact-value replacement for migrated project headers ----
+            st.markdown("**Bulk project field cleanup**")
+            st.caption(
+                "Merge one or several misspelled values into the correct value. Changes are "
+                "exact-match only and apply to every matching offer, revision, and option."
+            )
+            _bulk_result = st.session_state.pop("_bulk_cleanup_result", None)
+            if _bulk_result:
+                st.success(
+                    f"Updated {_bulk_result['updated']} project record(s) in "
+                    f"{_bulk_result['field']}. A safety backup was created first."
+                )
+
+            _bulk_fields = list(repo.PROJECT_CLEANUP_FIELDS)
+            _bulk_field = st.selectbox(
+                "Field to clean",
+                _bulk_fields,
+                key="bulk_cleanup_field",
+            )
+            _bulk_rows = repo.project_cleanup_values(_bulk_field)
+            _bulk_counts = {row["Value"]: int(row["OfferCount"]) for row in _bulk_rows}
+            _bulk_stored = list(_bulk_counts)
+            _bulk_sources = st.multiselect(
+                "Misspelled / old values to replace",
+                _bulk_stored,
+                key=f"bulk_cleanup_sources::{_bulk_field}",
+                format_func=lambda value: f"{value} ({_bulk_counts[value]} record(s))",
+                help="Select every typo variant that should become the same correct value.",
+            )
+
+            _bulk_canonical = []
+            if _bulk_field == "Sales Person":
+                _bulk_canonical = auth.users_in_roles(SALES_PERSON_ROLES)
+            elif _bulk_field == "Pre-sales Engineer":
+                _bulk_canonical = auth.users_in_role(PEOPLE_ROLES["presales"])
+            elif _bulk_field == "Project Manager":
+                _bulk_canonical = auth.users_in_role(PEOPLE_ROLES["pm"])
+            _bulk_targets = sorted(
+                {str(value).strip() for value in [*_bulk_stored, *_bulk_canonical]
+                 if str(value).strip() and str(value).strip() not in _bulk_sources},
+                key=str.casefold,
+            )
+            _bulk_new_marker = "(type a new correct value)"
+            _bulk_target_choice = st.selectbox(
+                "Correct replacement value",
+                [_bulk_new_marker, *_bulk_targets],
+                key=f"bulk_cleanup_target::{_bulk_field}",
+                help="People lists include the active users allowed for that assignment.",
+            )
+            _bulk_custom = ""
+            if _bulk_target_choice == _bulk_new_marker:
+                _bulk_custom = st.text_input(
+                    "New correct value",
+                    key=f"bulk_cleanup_custom::{_bulk_field}",
+                    placeholder="Type the exact spelling to store",
+                )
+            _bulk_replacement = (
+                _bulk_custom.strip()
+                if _bulk_target_choice == _bulk_new_marker
+                else _bulk_target_choice
+            )
+
+            _bulk_preview = None
+            if _bulk_sources and _bulk_replacement:
+                _bulk_preview = repo.bulk_replace_project_field(
+                    _bulk_field, _bulk_sources, _bulk_replacement, apply=False)
+                if _bulk_preview["to_update"]:
+                    st.write(
+                        f"Will update **{_bulk_preview['to_update']}** project record(s) to "
+                        f"**{_bulk_preview['replacement']}**."
+                    )
+                    st.dataframe(
+                        pd.DataFrame(
+                            _bulk_preview["sample"],
+                            columns=["ProjectID", "Offer #", "Project", "Date",
+                                     "Current value", "New value"],
+                        ),
+                        hide_index=True,
+                        width="stretch",
+                    )
+                    if _bulk_preview["to_update"] > len(_bulk_preview["sample"]):
+                        st.caption(
+                            f"Showing the first {len(_bulk_preview['sample'])} of "
+                            f"{_bulk_preview['to_update']} affected records."
+                        )
+                else:
+                    st.info("No records need changing for this selection.")
+
+            _bulk_ready = bool(_bulk_preview and _bulk_preview["to_update"])
+            _bulk_confirm = st.checkbox(
+                "I reviewed the affected offers and want to apply this replacement.",
+                key=f"bulk_cleanup_confirm::{_bulk_field}",
+                disabled=not _bulk_ready,
+            )
+            if st.button(
+                "Apply bulk replacement (creates backup)",
+                type="primary",
+                key="apply_bulk_project_cleanup",
+                disabled=not (_bulk_ready and _bulk_confirm),
+            ):
+                db_backup.create_profile_backup("before-project-field-cleanup")
+                _bulk_applied = repo.bulk_replace_project_field(
+                    _bulk_field, _bulk_sources, _bulk_replacement, apply=True)
+                st.session_state["_bulk_cleanup_result"] = {
+                    "updated": _bulk_applied["to_update"],
+                    "field": _bulk_field,
+                }
+                for _bulk_key in (
+                    f"bulk_cleanup_sources::{_bulk_field}",
+                    f"bulk_cleanup_target::{_bulk_field}",
+                    f"bulk_cleanup_custom::{_bulk_field}",
+                    f"bulk_cleanup_confirm::{_bulk_field}",
+                ):
+                    st.session_state.pop(_bulk_key, None)
+                st.rerun()
+
+            st.markdown("---")
+
             # ---- 1) Stamp year from offer number ----
             st.markdown(
                 "**Stamp date from project name / offer #** - uses the full date in the "
@@ -3750,6 +4150,12 @@ elif mode == "Settings":
                     st.session_state.pop("clean_client", None)
                     st.success(f"Set client on {res['to_update']} offers. Backup created first.")
                     st.rerun()
+
+            st.markdown("---")
+            st.markdown("##### Cleanup catalogue items")
+            st.caption("Find duplicate catalogue items with the same Model + Description, "
+                       "then review and delete selected copies.")
+            _catalog_dedupe_tool()
 
             st.markdown("---")
             # ---- Clear everything for a clean re-import ----
@@ -3892,12 +4298,6 @@ elif mode == "Settings":
                     st.rerun()
                 except Exception as e:
                     st.error(f"Restore failed: {e}")
-
-            st.divider()
-            st.markdown("##### Cleanup catalogue items")
-            st.caption("Find duplicate catalogue items with the same Model + Description, "
-                       "then review and delete selected copies.")
-            _catalog_dedupe_tool()
 
     with tab_updates:
         st.markdown("##### Software updates")
