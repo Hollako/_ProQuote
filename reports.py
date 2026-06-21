@@ -47,6 +47,7 @@ def offers_df(include_archived: bool = False) -> pd.DataFrame:
                p.ProjectManager, p.OfferNo, p.CreationDate, p.RevisionNo, p.OptionLabel,
                IFNULL(p.Approved,0) AS Approved, IFNULL(p.Archived,0) AS Archived,
                IFNULL(p.DiscountAmount,0) AS DiscountAmount,
+               IFNULL(p.CommissionAmount,0) AS CommissionAmount,
                s.SystemSuffix AS System,
                IFNULL(lt.SubtotalSAR,0) AS SubtotalSAR,
                IFNULL(lt.TotalCostUSD,0) AS TotalCostUSD
@@ -62,11 +63,13 @@ def offers_df(include_archived: bool = False) -> pd.DataFrame:
         return df
     sub = df["SubtotalSAR"].astype(float)
     disc = df["DiscountAmount"].abs().clip(upper=sub)
+    commission = df["CommissionAmount"].abs()
     discounted = sub - disc
     vat = discounted * calc.VAT_RATE
-    cost_sar = df["TotalCostUSD"].astype(float) * calc.SAR_PER_USD
+    cost_sar = df["TotalCostUSD"].astype(float) * calc.SAR_PER_USD + commission
     df["Subtotal SAR"] = sub.round(0)
     df["Discount SAR"] = disc.round(0)
+    df["Commission SAR"] = commission.round(0)
     df["Grand Total SAR"] = (discounted + vat).round(0)
     df["Cost SAR"] = cost_sar.round(0)
     df["Gross Profit SAR"] = (discounted - cost_sar).round(0)
@@ -131,7 +134,10 @@ def finance_df(include_archived: bool = False) -> pd.DataFrame:
     df["PO Spend SAR"] = df["ProjectID"].map(pur).fillna(0).round(0)
     gt = df["Grand Total SAR"]
     df["Remaining SAR"] = (gt - df["Collected SAR"]).round(0)
-    df["Net Profit SAR"] = (gt - df["PO Spend SAR"] - gt * calc.VAT_RATE).round(0)
+    commission = df.get("Commission SAR", 0)
+    df["Net Profit SAR"] = (
+        gt - df["PO Spend SAR"] - gt * calc.VAT_RATE - commission
+    ).round(0)
     return df
 
 
@@ -141,10 +147,10 @@ DATASETS = {
         "builder": offers_df,
         "filters": ["Client", "Sales Person", "Pre-sales", "Project Mgr", "System", "Status"],
         "date": "Date",
-        "metrics": ["Subtotal SAR", "Discount SAR", "Grand Total SAR", "Cost SAR",
+        "metrics": ["Subtotal SAR", "Discount SAR", "Commission SAR", "Grand Total SAR", "Cost SAR",
                     "Gross Profit SAR", "Margin %"],
         "show": ["Offer #", "Project", "Client", "Sales Person", "System", "Status", "Date",
-                 "Grand Total SAR", "Cost SAR", "Gross Profit SAR", "Margin %"],
+                 "Grand Total SAR", "Commission SAR", "Cost SAR", "Gross Profit SAR", "Margin %"],
     },
     "Line items": {
         "builder": lines_df,
@@ -158,9 +164,9 @@ DATASETS = {
         "builder": finance_df,
         "filters": ["Client", "Sales Person", "Project Mgr", "System", "Status"],
         "date": "Date",
-        "metrics": ["Grand Total SAR", "Collected SAR", "Remaining SAR", "PO Spend SAR",
+        "metrics": ["Grand Total SAR", "Commission SAR", "Collected SAR", "Remaining SAR", "PO Spend SAR",
                     "Net Profit SAR"],
-        "show": ["Offer #", "Project", "Client", "Status", "Grand Total SAR",
+        "show": ["Offer #", "Project", "Client", "Status", "Grand Total SAR", "Commission SAR",
                  "Collected SAR", "Remaining SAR", "PO Spend SAR", "Net Profit SAR"],
     },
 }

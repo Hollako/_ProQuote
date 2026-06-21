@@ -82,6 +82,9 @@ CREATE TABLE IF NOT EXISTS Projects_Master (
     OfferNo          TEXT,
     CreationDate     TEXT,            -- ISO date (from Quotation 'Date:' or file mtime)
     DiscountAmount   REAL DEFAULT 0,  -- primary discount (first system sheet)
+    CommissionAmount REAL DEFAULT 0,  -- internal expense; excluded from client totals and profit
+    CommissionPercent REAL DEFAULT 0, -- percentage gross-up applied to item margins
+    CommissionMode TEXT DEFAULT 'Deduct from profit',
     ConversionFactor REAL,            -- primary factor (e.g. 1.69)
     SourceFile       TEXT UNIQUE,     -- absolute path; used for idempotent re-ingest
     IngestedAt       TEXT,
@@ -245,6 +248,9 @@ MIGRATIONS = {
         "Region": "TEXT",
         "PresalesEngineer": "TEXT",
         "ProjectManager": "TEXT",
+        "CommissionAmount": "REAL DEFAULT 0",
+        "CommissionPercent": "REAL DEFAULT 0",
+        "CommissionMode": "TEXT DEFAULT 'Deduct from profit'",
         "RevisionNo": "INTEGER DEFAULT 0",
         "BaseName": "TEXT",
         "OfferTerms": "TEXT",

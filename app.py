@@ -419,9 +419,10 @@ def _person_select(col, label, role, current, key, **widget_kwargs):
     opts = ["-"] + names
     if cur and cur != "-" and cur not in names:
         opts = ["-", cur] + names            # preserve a real stored name not in the list
-    pick = col.selectbox(
-        label, opts, index=opts.index(cur) if cur in opts else 0, key=key, **widget_kwargs
-    )
+    initial = {} if key in st.session_state else {
+        "index": opts.index(cur) if cur in opts else 0
+    }
+    pick = col.selectbox(label, opts, key=key, **initial, **widget_kwargs)
     return "" if pick == "-" else pick
 
 
@@ -435,13 +436,14 @@ def _region_select(col, current, key, **widget_kwargs):
         if legacy and legacy not in options:
             options.append(legacy)
     selected = widget_cur if widget_cur in options else (cur if cur in options else "")
+    initial = {} if key in st.session_state else {"index": options.index(selected)}
     return col.selectbox(
         "Region",
         options,
-        index=options.index(selected),
         key=key,
         format_func=lambda value: value or "-",
         help="Manage this dropdown in Settings → Company Details → Project regions.",
+        **initial,
         **widget_kwargs,
     )
 
@@ -463,14 +465,15 @@ def _system_select(col, current, key, **widget_kwargs):
         abbreviation = repo.system_abbreviation(name)
         return f"{name} - {abbreviation}" if abbreviation and abbreviation != name else name
 
+    initial = {} if key in st.session_state else {"index": options.index(selected)}
     return col.selectbox(
         "System",
         options,
-        index=options.index(selected),
         key=key,
         format_func=_label,
         help=("The full system name is stored on the project; its abbreviation replaces "
               "*TYPE* in the Offer #. Manage systems in Settings → Company Details."),
+        **initial,
         **widget_kwargs,
     )
 
@@ -539,6 +542,8 @@ def _ensure_state():
         }
     if "discount" not in st.session_state:
         st.session_state.discount = 0.0
+    if "commission" not in st.session_state:
+        st.session_state.commission = 0.0
 
 
 def _new_offer_header(overrides: dict | None = None) -> dict:
@@ -557,18 +562,33 @@ def _new_offer_header(overrides: dict | None = None) -> dict:
 
 
 def _prime_new_offer_form(header: dict | None = None, grid: pd.DataFrame | None = None,
-                          discount: float = 0.0):
+                          discount: float = 0.0, commission: float = 0.0,
+                          commission_percent: float = 0.0,
+                          commission_mode: str = "Protect profit"):
     """Load data into the New Offer form before its widgets are rendered."""
     h = _new_offer_header(header or {})
     h["project_sheet"] = {**DEFAULT_PROJECT_SHEET_INFO, **(h.get("project_sheet") or {})}
     st.session_state.header = h
     st.session_state.grid = grid.copy() if grid is not None else _empty_grid()
     st.session_state.discount = abs(float(discount or 0.0))
+    st.session_state.commission = abs(float(commission or 0.0))
+    st.session_state.no_commission_percent = max(float(commission_percent or 0.0), 0.0)
+    st.session_state.no_commission_mode = (
+        commission_mode if commission_mode in ("Protect profit", "Deduct from profit")
+        else "Deduct from profit"
+    )
+    st.session_state.no_commission_applied_percent = st.session_state.no_commission_percent
+    if st.session_state.no_commission_mode != "Protect profit":
+        st.session_state.no_commission_applied_percent = 0.0
     st.session_state.no_offer_lock = None
     st.session_state.no_saved_options = []
     for key in ("editor", "pdf_bytes", "project_sheet_bytes", "saved_rev"):
         st.session_state.pop(key, None)
-    for key in ("no_discount_percent", "no_discount_driver", "no_discount_subtotal"):
+    for key in (
+        "no_discount_percent", "no_discount_driver", "no_discount_subtotal",
+        "no_commission_driver", "no_commission_subtotal",
+        "no_commission_base_subtotal",
+    ):
         st.session_state.pop(key, None)
 
     st.session_state["no_client"] = h.get("client", "")
@@ -691,8 +711,11 @@ EDIT_WIDGET_KEYS = (
     "edit_grid", "edit_key", "edit_pid", "edit_system", "edit_terms", "edit_header",
     "edit_project_sheet", "edit_discount", "edit_dirty_snapshot", "edit_show_cancel_dialog",
     "edit_close_after_save", "pending_close_edit", "pending_save", "pending_option_label",
-    "edit_editor", "ed_option", "ed_discount_percent",
-    "ed_discount_driver", "ed_discount_subtotal", "eh_client", "eh_project", "eh_contact",
+    "edit_commission", "edit_editor", "ed_option", "ed_discount_percent",
+    "ed_discount_driver", "ed_discount_subtotal", "ed_commission_percent",
+    "ed_commission_driver", "ed_commission_subtotal", "ed_commission_mode",
+    "ed_commission_applied_percent",
+    "ed_commission_base_subtotal", "eh_client", "eh_project", "eh_contact",
     "eh_phone", "eh_contractor", "eh_region", "eh_system", "eh_sales", "eh_presales", "eh_pm",
     "ed_subject", "ed_greet", "ed_scope", "ed_excl", "ed_prereq",
     "ed_deliv", "ed_valid", "ed_pay", "ed_notes",
@@ -739,6 +762,9 @@ def _edit_snapshot() -> dict:
         "header": _dict_snapshot(st.session_state.get("edit_header")),
         "project_sheet": _dict_snapshot(st.session_state.get("edit_project_sheet")),
         "discount": _snapshot_value(st.session_state.get("edit_discount")),
+        "commission": _snapshot_value(st.session_state.get("edit_commission")),
+        "commission_percent": _snapshot_value(st.session_state.get("ed_commission_percent")),
+        "commission_mode": _snapshot_value(st.session_state.get("ed_commission_mode")),
         "option": _snapshot_value(st.session_state.get("ed_option")),
     }
 
@@ -1068,20 +1094,20 @@ def _edit_panel(meta):
     with st.expander("✏️ Project Details (client · project · system · people)", expanded=False):
         hc1, hc2, hc3 = st.columns(3)
         eh["client"] = hc1.text_input(
-            "Client", eh.get("client", ""), key="eh_client",
+            "Client", key="eh_client",
             on_change=_copy_edit_header_widget, args=("client", "eh_client"))
         eh["project"] = hc1.text_input(
-            "Project", eh.get("project", ""), key="eh_project",
+            "Project", key="eh_project",
             on_change=_copy_edit_header_widget, args=("project", "eh_project"))
         eh["contact"] = hc2.text_input(
-            "Contact", eh.get("contact", ""), key="eh_contact",
+            "Contact", key="eh_contact",
             on_change=_copy_edit_header_widget, args=("contact", "eh_contact"))
         eh["phone"] = hc2.text_input(
-            "Phone", eh.get("phone", ""), key="eh_phone",
+            "Phone", key="eh_phone",
             on_change=_copy_widget_to_state_dict,
             args=("edit_header", "phone", "eh_phone"))
         eh["contractor"] = hc3.text_input(
-            "Contractor", eh.get("contractor", ""), key="eh_contractor",
+            "Contractor", key="eh_contractor",
             on_change=_copy_widget_to_state_dict,
             args=("edit_header", "contractor", "eh_contractor"))
         eh["region"] = _region_select(
@@ -1136,10 +1162,14 @@ def _edit_panel(meta):
     st.markdown("##### Totals")
     edit_calc_grid = calc.recompute(st.session_state.edit_grid)
     edit_base_summary = calc.summarize(edit_calc_grid, 0)
-    tcol, pcol, _ = st.columns([1, 1, 2])
+    tcol, pcol, cmcol, ccol, cpcol = st.columns(5)
     edit_discount = _discount_inputs(
         "ed", "edit_discount", edit_base_summary["subtotal_sar"], tcol, pcol)
-    s = calc.summarize(edit_calc_grid, edit_discount)
+    commission_base = max(edit_base_summary["subtotal_sar"] - edit_discount, 0.0)
+    edit_commission, edit_commission_percent, edit_commission_mode = _commission_inputs(
+        "ed", "edit_commission", commission_base,
+        "edit_grid", "edit_editor", "edit_discount", cmcol, ccol, cpcol)
+    s = calc.summarize(edit_calc_grid, edit_discount, edit_commission)
     m1, m2, m3 = st.columns(3)
     _subtotal_metric(m1, s)
     m2.metric(f"VAT {calc.VAT_RATE * 100:g}% (SAR)", f"{s['vat_amount_sar']:,.2f}")
@@ -1182,6 +1212,9 @@ def _edit_panel(meta):
         repo.update_offer(
             st.session_state.edit_pid, calc.recompute(st.session_state.edit_grid),
             discount_sar=edit_discount,
+            commission_sar=edit_commission,
+            commission_percent=edit_commission_percent,
+            commission_mode=edit_commission_mode,
             factors=(s["markup_factor"], None, None),
             system_suffix=st.session_state.get("edit_system") or _default_system(), terms=edit_terms,
             project_sheet_info=edit_project_sheet, header=edit_header,
@@ -1206,6 +1239,9 @@ def _edit_panel(meta):
         npid, nname, nrev = repo.save_revision(
             st.session_state.edit_pid, calc.recompute(st.session_state.edit_grid),
             discount_sar=edit_discount,
+            commission_sar=edit_commission,
+            commission_percent=edit_commission_percent,
+            commission_mode=edit_commission_mode,
             factors=(s["markup_factor"], None, None),
             system_suffix=st.session_state.get("edit_system") or _default_system(),
             terms=edit_terms, option_label=pending_option_label,
@@ -1228,6 +1264,9 @@ def _edit_panel(meta):
                 st.session_state.edit_pid, calc.recompute(st.session_state.edit_grid),
                 option_label=pending_option_label,
                 discount_sar=edit_discount,
+                commission_sar=edit_commission,
+                commission_percent=edit_commission_percent,
+                commission_mode=edit_commission_mode,
                 factors=(s["markup_factor"], None, None),
                 system_suffix=st.session_state.get("edit_system") or _default_system(), terms=edit_terms,
                 project_sheet_info=edit_project_sheet, header=edit_header)
@@ -1275,8 +1314,16 @@ def _new_offer_actions():
     _sync_new_header_from_widgets()
     h = st.session_state.header
     calc_grid = calc.recompute(st.session_state.grid)
-    s = calc.summarize(calc_grid, st.session_state.get("discount") or 0.0)
+    s = calc.summarize(
+        calc_grid,
+        st.session_state.get("discount") or 0.0,
+        st.session_state.get("commission") or 0.0,
+    )
     discount_sar = s["discount_sar"]
+    commission_percent = max(
+        _safe_float(st.session_state.get("no_commission_percent")), 0.0
+    )
+    commission_mode = st.session_state.get("no_commission_mode", "Protect profit")
     _optname = (st.session_state.get("no_option") or h.get("option") or "").strip()
 
     if st.session_state.get("no_offer_lock"):
@@ -1316,6 +1363,9 @@ def _new_offer_actions():
                 system_suffix=h["system"],
                 grid=calc_grid,
                 discount_sar=discount_sar,
+                commission_sar=s["commission_sar"],
+                commission_percent=commission_percent,
+                commission_mode=commission_mode,
                 factors=(s["markup_factor"], None, None),
                 sales_person=h.get("sales"),
                 presales_engineer=h.get("presales"),
@@ -1426,9 +1476,13 @@ def _new_project_editor():
     st.markdown("##### Totals")
     calc_grid = calc.recompute(st.session_state.grid)
     base_summary = calc.summarize(calc_grid, 0)
-    dcol, pcol, _ = st.columns([1, 1, 2])
+    dcol, pcol, cmcol, ccol, cpcol = st.columns(5)
     discount_sar = _discount_inputs("no", "discount", base_summary["subtotal_sar"], dcol, pcol)
-    s = calc.summarize(calc_grid, discount_sar)
+    commission_base = max(base_summary["subtotal_sar"] - discount_sar, 0.0)
+    commission_sar, commission_percent, commission_mode = _commission_inputs(
+        "no", "commission", commission_base,
+        "grid", "editor", "discount", cmcol, ccol, cpcol)
+    s = calc.summarize(calc_grid, discount_sar, commission_sar)
 
     m1, m2, m3 = st.columns(3)
     _subtotal_metric(m1, s)
@@ -1793,7 +1847,8 @@ def revision_options(base_pid):
             if col in g.columns:
                 g[col] = g[col].map(lambda v: calc.roundup(v, 0))
         out.append({"label": m.get("OptionLabel") or "",
-                    "grid": g, "summary": calc.summarize(g, m.get("DiscountAmount") or 0)})
+                    "grid": g, "summary": calc.summarize(
+                        g, m.get("DiscountAmount") or 0, m.get("CommissionAmount") or 0)})
     return out
 
 
@@ -1804,6 +1859,7 @@ def _profit_banner(s: dict):
     sub = s.get("discounted_subtotal_sar") or 0.0
     margin_pct = (profit / sub * 100) if sub else 0.0
     factor = s.get("markup_factor")
+    commission = s.get("commission_sar", 0) or 0.0
     cost_sar = s.get("cost_sar", 0) or 0.0
     cost_usd = s.get("total_cost_usd", 0) or 0.0
     markup_txt = f"Markup x{factor:.2f}" if factor else "Markup -"
@@ -1822,13 +1878,18 @@ def _profit_banner(s: dict):
                 f"<div style='{big}'>SAR {sar:,.2f}</div>"
                 f"<div style='{small}'>$ {usd:,.2f}</div></div>")
 
+    commission_html = (
+        f"<div style='{small}'>Commission cost SAR {commission:,.2f}</div>"
+        if commission else ""
+    )
     html = (
         f"<div style='background:{bg};border-radius:8px;padding:14px 24px;margin:2px 0 10px;"
         f"display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap'>"
         + _block("🧾 Cost", cost_sar, cost_usd, "left")
         + f"<div style='flex:1;min-width:120px;text-align:center'>"
           f"<div style='{mid}'>{markup_txt}</div>"
-          f"<div style='{mid}'>Margin {margin_pct:.1f}%</div></div>"
+          + commission_html
+          + f"<div style='{mid}'>Margin {margin_pct:.1f}%</div></div>"
         + _block("💰 Gross Profit", profit, profit_usd, "right")
         + "</div>"
     )
@@ -1864,10 +1925,19 @@ def _subtotal_metric(col, s: dict):
 
 
 def _summary_metrics(s: dict):
-    m1, m2, m3 = st.columns(3)
-    _subtotal_metric(m1, s)
-    m2.metric(f"VAT {calc.VAT_RATE * 100:g}% (SAR)", f"{s['vat_amount_sar']:,.2f}")
-    m3.metric("Grand Total (SAR)", f"{s['grand_total_sar']:,.2f}")
+    commission = s.get("commission_sar", 0) or 0.0
+    if commission:
+        m1, m2, m3, m4 = st.columns(4)
+        _subtotal_metric(m1, s)
+        m2.metric("Internal Commission (SAR)", f"{commission:,.2f}",
+                  help="Internal expense only; excluded from the client quotation and profit.")
+        m3.metric(f"VAT {calc.VAT_RATE * 100:g}% (SAR)", f"{s['vat_amount_sar']:,.2f}")
+        m4.metric("Grand Total (SAR)", f"{s['grand_total_sar']:,.2f}")
+    else:
+        m1, m2, m3 = st.columns(3)
+        _subtotal_metric(m1, s)
+        m2.metric(f"VAT {calc.VAT_RATE * 100:g}% (SAR)", f"{s['vat_amount_sar']:,.2f}")
+        m3.metric("Grand Total (SAR)", f"{s['grand_total_sar']:,.2f}")
 
 
 def _project_details_readonly(meta: dict, system=""):
@@ -1970,6 +2040,110 @@ def _discount_inputs(prefix: str, amount_key: str, subtotal: float,
         on_change=_sync_discount_from_percent,
         args=(amount_key, percent_key, subtotal_key, driver_key))
     return abs(_safe_float(st.session_state.get(amount_key)))
+
+
+COMMISSION_MODES = ("Protect profit", "Deduct from profit")
+
+
+def _reprice_commission(prefix: str, amount_key: str, grid_key: str,
+                        editor_key: str, discount_key: str, driver: str):
+    """Synchronize commission fields and apply/remove a margin gross-up."""
+    percent_key = f"{prefix}_commission_percent"
+    mode_key = f"{prefix}_commission_mode"
+    applied_key = f"{prefix}_commission_applied_percent"
+    base_key = f"{prefix}_commission_base_subtotal"
+    mode = st.session_state.get(mode_key, "Protect profit")
+    if mode not in COMMISSION_MODES:
+        mode = "Deduct from profit"
+        st.session_state[mode_key] = mode
+
+    discount = abs(_safe_float(st.session_state.get(discount_key)))
+    grid = calc.recompute(st.session_state.get(grid_key, _empty_grid()))
+    old_applied = max(_safe_float(st.session_state.get(applied_key)), 0.0)
+
+    # First recover the original, non-grossed-up margins. This makes changing
+    # 15 -> 10, switching modes, or removing commission non-compounding.
+    if old_applied > 0:
+        reverse = (1 / (1 + old_applied / 100) - 1) * 100
+        grid, _ = calc.increase_margins(grid, reverse)
+    base_subtotal = calc.summarize(grid, discount)["discounted_subtotal_sar"]
+    st.session_state[base_key] = base_subtotal
+
+    entered_amount = max(_safe_float(st.session_state.get(amount_key)), 0.0)
+    entered_percent = min(
+        max(_safe_float(st.session_state.get(percent_key)), 0.0), 1000.0
+    )
+    if driver == "amount":
+        target_percent = (entered_amount / base_subtotal * 100) if base_subtotal else 0.0
+    else:
+        target_percent = entered_percent
+    target_percent = min(max(target_percent, 0.0), 1000.0)
+
+    if mode == "Protect profit" and target_percent > 0:
+        grid, changed = calc.increase_margins(grid, target_percent)
+        increased_subtotal = calc.summarize(grid, discount)["discounted_subtotal_sar"]
+        # Use the exact uplift after line rounding so gross profit is preserved.
+        commission_amount = round(max(increased_subtotal - base_subtotal, 0.0), 2)
+        applied_percent = target_percent if changed else 0.0
+    else:
+        commission_amount = round(base_subtotal * target_percent / 100, 2)
+        applied_percent = 0.0
+
+    st.session_state[amount_key] = commission_amount
+    st.session_state[percent_key] = target_percent
+    st.session_state[applied_key] = applied_percent
+    st.session_state[grid_key] = grid
+    st.session_state.pop(editor_key, None)
+
+
+def _commission_inputs(prefix: str, amount_key: str, subtotal: float,
+                       grid_key: str, editor_key: str, discount_key: str,
+                       mode_col=None, amount_col=None, percent_col=None
+                       ) -> tuple[float, float, str]:
+    """Editable commission amount/rate with selectable profit treatment."""
+    subtotal = max(_safe_float(subtotal), 0.0)
+    percent_key = f"{prefix}_commission_percent"
+    mode_key = f"{prefix}_commission_mode"
+    applied_key = f"{prefix}_commission_applied_percent"
+    base_key = f"{prefix}_commission_base_subtotal"
+    st.session_state.setdefault(percent_key, 0.0)
+    st.session_state.setdefault(mode_key, "Protect profit")
+    st.session_state.setdefault(
+        applied_key,
+        _safe_float(st.session_state[percent_key])
+        if st.session_state[mode_key] == "Protect profit" else 0.0,
+    )
+    st.session_state.setdefault(
+        base_key,
+        max(subtotal - abs(_safe_float(st.session_state.get(amount_key))), 0.0)
+        if st.session_state[mode_key] == "Protect profit" else subtotal,
+    )
+    st.session_state[amount_key] = abs(_safe_float(st.session_state.get(amount_key)))
+
+    if mode_col is None or amount_col is None or percent_col is None:
+        mode_col, amount_col, percent_col = st.columns(3)
+    mode_col.selectbox(
+        "Commission treatment", COMMISSION_MODES, key=mode_key,
+        help="Protect profit adds the commission to item margins. Deduct from profit keeps client prices unchanged.",
+        on_change=_reprice_commission,
+        args=(prefix, amount_key, grid_key, editor_key, discount_key, "percent"))
+    amount_col.number_input(
+        "Commission Amount (SAR)", min_value=0.0, step=100.0,
+        format="%.2f", key=amount_key,
+        help="Editable cashback amount. Commission % updates automatically.",
+        on_change=_reprice_commission,
+        args=(prefix, amount_key, grid_key, editor_key, discount_key, "amount"))
+    percent_col.number_input(
+        "Commission %", min_value=0.0, max_value=1000.0,
+        step=1.0, format="%.2f", key=percent_key,
+        help="Editable cashback percentage. Commission Amount updates automatically.",
+        on_change=_reprice_commission,
+        args=(prefix, amount_key, grid_key, editor_key, discount_key, "percent"))
+    return (
+        abs(_safe_float(st.session_state.get(amount_key))),
+        max(_safe_float(st.session_state.get(percent_key)), 0.0),
+        st.session_state.get(mode_key, "Protect profit"),
+    )
 
 
 def _set_offer_active_tab(state_key: str, tab: str):
@@ -2233,6 +2407,7 @@ def _render_finance_tab(project_id: int, grand_total: float):
         return
 
     gt = float(grand_total or 0.0)
+    commission = abs(float(repo.project_meta(project_id).get("CommissionAmount") or 0.0))
     # Cache the editor sources once per offer so in-progress edits stay consistent
     # (we never reload from the DB mid-edit; we just persist changes back to it).
     pay_src_key, pur_src_key = f"fin_pay_src_{project_id}", f"fin_pur_src_{project_id}"
@@ -2279,12 +2454,14 @@ def _render_finance_tab(project_id: int, grand_total: float):
                                   key=f"fin_pur_{project_id}")
         cost_total = pur_edit["Cost (SAR)"].map(calc._num).sum()
         vat = gt * calc.VAT_RATE
-        net_profit = gt - cost_total - vat
-        markup = (gt / cost_total) if cost_total > 0 else None
+        internal_cost = cost_total + commission
+        net_profit = gt - internal_cost - vat
+        markup = (gt / internal_cost) if internal_cost > 0 else None
         margin_pct = (net_profit / gt * 100) if gt else 0.0
         markup_txt = f"Markup x{markup:.2f}" if markup else "Markup -"
-        _fin_bubble("🧾 Cost (POs)", f"SAR {cost_total:,.2f}",
+        _fin_bubble("🧾 Cost (POs + Commission)", f"SAR {internal_cost:,.2f}",
                     [markup_txt, f"Margin {margin_pct:.1f}%",
+                     f"Commission SAR {commission:,.2f}",
                      f"VAT ({calc.VAT_RATE * 100:g}%) SAR {vat:,.2f}"],
                     "💰 Net Profit", f"SAR {net_profit:,.2f}",
                     positive=net_profit >= 0)
@@ -3031,7 +3208,10 @@ except (TypeError, ValueError):
 if mode == "New Project":
     duplicate = st.session_state.pop("_duplicate_offer", None)
     if duplicate:
-        _prime_new_offer_form(duplicate["header"], duplicate["grid"], duplicate["discount"])
+        _prime_new_offer_form(
+            duplicate["header"], duplicate["grid"], duplicate["discount"],
+            duplicate.get("commission", 0.0), duplicate.get("commission_percent", 0.0),
+            duplicate.get("commission_mode", "Deduct from profit"))
         st.success(f"Duplicated from **{duplicate['source']}**. Review and save as a new offer.")
     elif st.session_state.pop("_no_reset_all", False):
         _prime_new_offer_form()
@@ -3121,7 +3301,7 @@ elif mode == "Load Project":
             raw_offer = sc2.text_input("Search by offer #", key="load_search_offer")
             pc1, pc2, pc3 = st.columns(3)
             q_sales = pc1.multiselect(
-                "Assigned as Sales",
+                "Sales Person",
                 _project_person_filter_options(
                     projects, "SalesPerson", auth.users_in_roles(SALES_PERSON_ROLES)),
                 key="load_filter_sales",
@@ -3183,7 +3363,7 @@ elif mode == "Load Project":
             st.session_state.pop("view_pid", None)
             st.session_state.pop("load_fam", None)
             st.info(
-                "Search by project/client name, offer number, Assigned as Sales, "
+                "Search by project/client name, offer number, Sales Person, "
                 "Pre-sales Engineer, or Project Manager."
             )
             st.stop()
@@ -3338,7 +3518,8 @@ elif mode == "Load Project":
             for col in MONEY_COLS:
                 if col in disp.columns:
                     disp[col] = disp[col].map(lambda v: calc.roundup(v, 0))
-            s = calc.summarize(disp, meta.get("DiscountAmount") or 0)
+            s = calc.summarize(
+                disp, meta.get("DiscountAmount") or 0, meta.get("CommissionAmount") or 0)
 
             _subj = repo.load_terms(meta).get("subject")
             if _subj:
@@ -3412,6 +3593,19 @@ elif mode == "Load Project":
                                   or _default_system())
                 st.session_state.edit_system = repo.system_name(_loaded_system)
                 st.session_state.edit_discount = abs(float(meta.get("DiscountAmount") or 0))
+                st.session_state.edit_commission = abs(float(meta.get("CommissionAmount") or 0))
+                st.session_state.ed_commission_percent = abs(
+                    float(meta.get("CommissionPercent") or 0)
+                )
+                st.session_state.ed_commission_mode = (
+                    meta.get("CommissionMode")
+                    if meta.get("CommissionMode") in COMMISSION_MODES
+                    else "Deduct from profit"
+                )
+                st.session_state.ed_commission_applied_percent = (
+                    st.session_state.ed_commission_percent
+                    if st.session_state.ed_commission_mode == "Protect profit" else 0.0
+                )
                 st.session_state.edit_terms = {**DEFAULT_TERMS, **repo.load_terms(meta)}
                 st.session_state.edit_terms["system_note"] = st.session_state.edit_system
                 st.session_state.edit_header = {
@@ -3491,6 +3685,9 @@ elif mode == "Load Project":
                         "header": copied_header,
                         "grid": calc.recompute(dg),
                         "discount": abs(float(meta.get("DiscountAmount") or 0)),
+                        "commission": abs(float(meta.get("CommissionAmount") or 0)),
+                        "commission_percent": abs(float(meta.get("CommissionPercent") or 0)),
+                        "commission_mode": meta.get("CommissionMode") or "Deduct from profit",
                     }
                     st.session_state["_nav_mode"] = "New Project"
                     _clear_edit_widget_state()
@@ -3517,20 +3714,26 @@ elif mode == "Load Project":
 
             if b3.button(f"📄 Generate Offer PDF{f' ({_pdf_opt_count} options)' if _pdf_opt_count > 1 else ''}",
                          width="stretch"):
+                # A PDF generated from the loaded-offer view supersedes any
+                # saved-edit export context left in this browser session.
+                st.session_state.pop("saved_rev", None)
+                st.session_state.pop("saved_export_header", None)
+                st.session_state.pop("saved_export_grid", None)
+                st.session_state.pop("saved_export_summary", None)
                 opts = revision_options(pid)
                 _make_pdf_download(_export_header(), disp, s, options=opts if len(opts) > 1 else None)
             _pdf_name = f"Quotation_{meta.get('OfferNo') or meta.get('ProjectName')}.pdf"
-            if "pdf_bytes" in st.session_state and not st.session_state.get("saved_rev"):
+            if st.session_state.get("pdf_bytes"):
                 b4.download_button(
                     "⬇️ Download PDF", st.session_state.pdf_bytes,
                     file_name=_pdf_name, mime="application/pdf", width="stretch")
             else:
                 b4.button("⬇️ Download PDF", disabled=True, width="stretch")
             if _ps_enabled() and b5.button("📊 Generate Project Sheet", width="stretch"):
+                st.session_state.pop("saved_rev", None)
                 _make_project_sheet_download(_export_header(), s)
             if _ps_enabled():
-                if ("project_sheet_bytes" in st.session_state
-                        and not st.session_state.get("saved_rev")):
+                if st.session_state.get("project_sheet_bytes"):
                     b6.download_button(
                         "⬇️ Download Project Sheet",
                         st.session_state.project_sheet_bytes,

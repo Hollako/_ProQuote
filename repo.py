@@ -1288,12 +1288,17 @@ def project_meta(project_id: int) -> dict:
 
 
 def save_offer(name, client, contact, offer_no, system_suffix, grid: pd.DataFrame,
-               discount_sar=0.0, factors=(None, None, None),
+               discount_sar=0.0, commission_sar=0.0, commission_percent=0.0,
+               commission_mode="Deduct from profit",
+               factors=(None, None, None),
                sales_person=None, presales_engineer=None, project_manager=None,
                revision_no=0, base=None, terms=None, option_label="",
                project_sheet_info=None, phone="", contractor="", region="") -> int:
     """Persist a NEW offer (and its lines) created in the interface."""
     discount_sar = _discount_amount(discount_sar)
+    commission_sar = _discount_amount(commission_sar)
+    commission_percent = max(_f(commission_percent) or 0.0, 0.0)
+    commission_mode = (_str(commission_mode) or "Deduct from profit")
     now = dt.datetime.now().isoformat(timespec="seconds")
     today = dt.date.today().isoformat()
     base = base or (base_name(offer_no) if _str(offer_no).strip() else base_name(name))
@@ -1305,12 +1310,14 @@ def save_offer(name, client, contact, offer_no, system_suffix, grid: pd.DataFram
             """INSERT INTO Projects_Master
                  (ProjectName,ClientName,ContactName,ContactPhone,
                   Contractor,Region,SalesPerson,PresalesEngineer,ProjectManager,
-                  OfferNo,CreationDate,DiscountAmount,ConversionFactor,SourceFile,IngestedAt,
+                   OfferNo,CreationDate,DiscountAmount,CommissionAmount,CommissionPercent,CommissionMode,ConversionFactor,SourceFile,IngestedAt,
                   RevisionNo,BaseName,OfferTerms,ProjectSheetInfo,OptionLabel)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (name, client, contact, _str(phone), _str(contractor), _str(region),
              sales_person, presales_engineer, project_manager, offer_no,
-             today, discount_sar, factors[0], f"app://offer/{name}/{now}", now, revision_no, base,
+             today, discount_sar, commission_sar, commission_percent, commission_mode,
+             factors[0], f"app://offer/{name}/{now}", now,
+             revision_no, base,
              terms_json, ps_json, option_label or ""),
         )
         pid = cur.lastrowid
@@ -1370,12 +1377,17 @@ def _write_sheet_and_lines(c, pid, system_suffix, discount_sar, factors, grid) -
 
 
 def update_offer(base_project_id: int, grid: pd.DataFrame, discount_sar=0.0,
+                 commission_sar=0.0, commission_percent=0.0,
+                 commission_mode="Deduct from profit",
                  factors=(None, None, None), system_suffix="LCS", terms=None,
                  project_sheet_info=None, header=None, option_label=None) -> int:
     """Overwrite an existing revision/option IN PLACE - same ProjectID, Offer #,
     revision, option, approval. Replaces lines, discount, terms; updates the offer
     header (client/project/contact/sales/pre-sales/PM) when `header` is given."""
     discount_sar = _discount_amount(discount_sar)
+    commission_sar = _discount_amount(commission_sar)
+    commission_percent = max(_f(commission_percent) or 0.0, 0.0)
+    commission_mode = (_str(commission_mode) or "Deduct from profit")
     terms_json = json.dumps({k: terms.get(k) for k in TERMS_KEYS}) if terms else None
     ps_json = (json.dumps({k: project_sheet_info.get(k) for k in PROJECT_SHEET_KEYS})
                if project_sheet_info else None)
@@ -1385,10 +1397,11 @@ def update_offer(base_project_id: int, grid: pd.DataFrame, discount_sar=0.0,
             (base_project_id,),
         ).fetchone()
         c.execute(
-            "UPDATE Projects_Master SET DiscountAmount=?, ConversionFactor=?, "
+            "UPDATE Projects_Master SET DiscountAmount=?, CommissionAmount=?, CommissionPercent=?, CommissionMode=?, ConversionFactor=?, "
             "OfferTerms=COALESCE(?, OfferTerms), "
             "ProjectSheetInfo=COALESCE(?, ProjectSheetInfo) WHERE ProjectID=?",
-            (discount_sar, factors[0], terms_json, ps_json, base_project_id))
+            (discount_sar, commission_sar, commission_percent, commission_mode,
+             factors[0], terms_json, ps_json, base_project_id))
         if header is not None:
             current_name = current["ProjectName"] if current else ""
             current_option = current["OptionLabel"] if current else ""
@@ -1440,6 +1453,8 @@ def _header_fields(meta, header):
 
 
 def save_revision(base_project_id: int, grid: pd.DataFrame, discount_sar=0.0,
+                  commission_sar=0.0, commission_percent=0.0,
+                  commission_mode="Deduct from profit",
                   factors=(None, None, None), system_suffix="LCS",
                   terms=None, option_label=None, project_sheet_info=None,
                   header=None) -> tuple[int, str, int]:
@@ -1463,7 +1478,9 @@ def save_revision(base_project_id: int, grid: pd.DataFrame, discount_sar=0.0,
     pid = save_offer(
         name=name, client=client, contact=contact,
         offer_no=offer_rev, system_suffix=system_suffix, grid=grid,
-        discount_sar=discount_sar, factors=factors,
+        discount_sar=discount_sar, commission_sar=commission_sar,
+        commission_percent=commission_percent, commission_mode=commission_mode,
+        factors=factors,
         sales_person=sales, presales_engineer=presales, project_manager=pm,
         revision_no=rev, base=base, terms=terms if terms is not None else load_terms(meta),
         project_sheet_info=(project_sheet_info if project_sheet_info is not None
@@ -1473,7 +1490,9 @@ def save_revision(base_project_id: int, grid: pd.DataFrame, discount_sar=0.0,
 
 
 def save_option(base_project_id: int, grid: pd.DataFrame, option_label: str,
-                discount_sar=0.0, factors=(None, None, None), system_suffix="LCS",
+                discount_sar=0.0, commission_sar=0.0, commission_percent=0.0,
+                commission_mode="Deduct from profit",
+                factors=(None, None, None), system_suffix="LCS",
                 terms=None, project_sheet_info=None, header=None) -> tuple[int, str, int]:
     """Save `grid` as another OPTION of the SAME revision (e.g. Dynalite vs KNX).
 
@@ -1491,7 +1510,9 @@ def save_option(base_project_id: int, grid: pd.DataFrame, option_label: str,
     pid = save_offer(
         name=name, client=client, contact=contact,
         offer_no=meta.get("OfferNo"), system_suffix=system_suffix, grid=grid,
-        discount_sar=discount_sar, factors=factors,
+        discount_sar=discount_sar, commission_sar=commission_sar,
+        commission_percent=commission_percent, commission_mode=commission_mode,
+        factors=factors,
         sales_person=sales, presales_engineer=presales, project_manager=pm,
         revision_no=rev, base=base, terms=terms if terms is not None else load_terms(meta),
         project_sheet_info=(project_sheet_info if project_sheet_info is not None

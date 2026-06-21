@@ -195,36 +195,60 @@ def effective_margin(df: pd.DataFrame) -> pd.Series:
     return (up / uc.where(uc > 0)).round(4)
 
 
-def summarize(df: pd.DataFrame, discount_sar: float = 0.0) -> dict:
-    """Bottom-line totals block + the conversion/markup factors."""
+def increase_margins(df: pd.DataFrame, percentage: float) -> tuple[pd.DataFrame, int]:
+    """Adjust every positive item margin by a percentage and recalculate prices."""
+    grid = recompute(df)
+    percentage = max(_num(percentage), -100.0)
+    factor = 1 + percentage / 100
+    line_types = grid.get("LineType", pd.Series("item", index=grid.index))
+    margins = grid["Margin x"].map(_num)
+    mask = line_types.astype(str).str.lower().ne("discount") & margins.gt(0)
+    grid.loc[mask, "Margin x"] = (margins.loc[mask] * factor).round(4)
+    return recompute(grid), int(mask.sum())
+
+
+def summarize(df: pd.DataFrame, discount_sar: float = 0.0,
+              commission_sar: float = 0.0) -> dict:
+    """Client totals plus internal commission-adjusted profit metrics."""
     items = df[df.get("LineType", "item").astype(str) != "discount"] if "LineType" in df else df
-    total_cost_usd = items["Total Cost $"].map(_num).sum()
+    product_cost_usd = items["Total Cost $"].map(_num).sum()
     total_sell_usd = items["T. Price $"].map(_num).sum()
     subtotal_sar = items["T. Price SAR"].map(_num).sum()
 
     discount_sar = min(abs(_num(discount_sar)), subtotal_sar)
     discount_percent = (discount_sar / subtotal_sar * 100) if subtotal_sar else 0.0
     discounted = subtotal_sar - discount_sar
+    commission_sar = max(_num(commission_sar), 0.0)
+    commission_percent = (commission_sar / discounted * 100) if discounted else 0.0
+    # Commission is an internal expense. It is never included in client-facing
+    # subtotal, VAT, grand total, or exported quotation totals.
     vat = round(discounted * VAT_RATE, 2)
     grand_total = round(discounted + vat, 2)
 
-    cost_sar = total_cost_usd * SAR_PER_USD
+    product_cost_sar = product_cost_usd * SAR_PER_USD
+    cost_sar = product_cost_sar + commission_sar
+    total_cost_usd = product_cost_usd + commission_sar / SAR_PER_USD
     markup_factor = (discounted / cost_sar) if cost_sar else None
 
     return {
         "total_cost_usd": round(total_cost_usd, 2),
+        "product_cost_usd": round(product_cost_usd, 2),
         "total_sell_usd": round(total_sell_usd, 2),
         "subtotal_sar": round(subtotal_sar, 2),
         "discount_sar": round(discount_sar, 2),
         "discount_percent": round(discount_percent, 4),
         "discounted_subtotal_sar": round(discounted, 2),
+        "commission_sar": round(commission_sar, 2),
+        "commission_percent": round(commission_percent, 4),
         "vat_rate": VAT_RATE,
         "vat_amount_sar": vat,
         "grand_total_sar": grand_total,
+        "product_cost_sar": round(product_cost_sar, 2),
         "cost_sar": round(cost_sar, 2),
         "markup_factor": round(markup_factor, 4) if markup_factor else None,
+        # Commission is internal cost, so it reduces markup and profit.
         "gross_margin_sar": round(discounted - cost_sar, 2),
-        "gross_margin_usd": round((discounted / SAR_PER_USD) - total_cost_usd, 2),
+        "gross_margin_usd": round((discounted - cost_sar) / SAR_PER_USD, 2),
     }
 
 
