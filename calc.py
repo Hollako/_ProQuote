@@ -155,7 +155,7 @@ def recompute(df: pd.DataFrame) -> pd.DataFrame:
         # Unit Cost rounded UP to a whole dollar (landed cost, always USD).
         unit = roundup(ex_usd * (1 + ship / 100), 0) if ex > 0 else roundup(_num(r.get("Unit Cost $")), 0)
 
-        margin = _num(r.get("Margin x"))
+        margin = round(_num(r.get("Margin x")), 4)
         if margin > 0:
             uprice = u_price_from_margin(unit, margin)        # formula-driven
         else:
@@ -178,6 +178,10 @@ def recompute(df: pd.DataFrame) -> pd.DataFrame:
         tpsar_l.append(roundup(qty * usar, 0))
 
     df["Shipping %"] = ship_l
+    # Margin is a pricing driver with at most four decimal places. Keeping the
+    # numeric values rounded lets the UI display only meaningful digits (1.6,
+    # 1.25, 1.2345) instead of padding every cell with trailing zeroes.
+    df["Margin x"] = [round(_num(value), 4) for value in df["Margin x"]]
     df["Unit Cost $"], df["Total Cost $"] = unit_l, tc_l
     df["U. Price $"], df["T. Price $"] = up_l, tp_l
     df["U. Price SAR"], df["T. Price SAR"] = usar_l, tpsar_l
@@ -188,7 +192,7 @@ def effective_margin(df: pd.DataFrame) -> pd.Series:
     """Read-only effective margin = U. Price $ / Unit Cost $ (for display)."""
     uc = df["Unit Cost $"].map(_num)
     up = df["U. Price $"].map(_num)
-    return (up / uc.where(uc > 0)).round(2)
+    return (up / uc.where(uc > 0)).round(4)
 
 
 def summarize(df: pd.DataFrame, discount_sar: float = 0.0) -> dict:

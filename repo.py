@@ -131,6 +131,24 @@ def base_name(name) -> str:
     return s.strip() or "Offer"
 
 
+def project_name_with_option(name, option_label="", previous_option="") -> str:
+    """Return a project display name with exactly one trailing option label.
+
+    OptionLabel remains the canonical database field; the suffix in ProjectName
+    is kept in sync for the user-facing offer lists.  ``previous_option`` lets an
+    edited label replace (or clear) an existing suffix instead of accumulating
+    values such as ``Project (Dynalite) (KNX)``.
+    """
+    stem = _str(name).strip() or "Untitled"
+    for label in (previous_option, option_label):
+        clean_label = _str(label).strip()
+        suffix = f" ({clean_label})" if clean_label else ""
+        if suffix and stem.casefold().endswith(suffix.casefold()):
+            stem = stem[:-len(suffix)].rstrip()
+    clean_option = _str(option_label).strip()
+    return f"{stem} ({clean_option})" if clean_option else stem
+
+
 # ---------- Settings (key/value) ----------
 
 DEFAULT_SETTINGS = {
@@ -898,7 +916,7 @@ def item_to_grid_row(item: dict, area="", system="", qty=1, default_margin=0.0) 
     ship = calc.shipping_percent(item.get("ShippingPercent"), ex_usd, item.get("UnitCostUSD"))
     unit = item.get("UnitCostUSD") or calc.roundup(ex_usd * (1 + ship / 100), 0)
     uprice = item.get("DefaultUPriceUSD") or 0.0
-    margin = round(uprice / unit, 2) if (unit and uprice) else (default_margin or 0.0)
+    margin = round(uprice / unit, 4) if (unit and uprice) else (default_margin or 0.0)
     row.update({
         "Description": item.get("Description") or "",
         "Brand": item.get("Brand") or "",
@@ -1091,7 +1109,7 @@ def load_project_grid(project_id: int, sheet_name: str | None = None) -> pd.Data
     stored_margin = pd.to_numeric(df["Margin x"], errors="coerce")
     uc = df["Unit Cost $"].map(calc._num)
     up = df["U. Price $"].map(calc._num)
-    legacy_margin = (up / uc.where(uc > 0)).round(2)
+    legacy_margin = (up / uc.where(uc > 0)).round(4)
     df["Margin x"] = stored_margin.where(stored_margin.notna(), legacy_margin).fillna(0.0)
     return df[[c for c in calc.GRID_COLUMNS] + ["LineType", "_ItemID"]]
 
@@ -1278,7 +1296,7 @@ def save_offer(name, client, contact, offer_no, system_suffix, grid: pd.DataFram
     discount_sar = _discount_amount(discount_sar)
     now = dt.datetime.now().isoformat(timespec="seconds")
     today = dt.date.today().isoformat()
-    base = base or base_name(name)
+    base = base or (base_name(offer_no) if _str(offer_no).strip() else base_name(name))
     terms_json = json.dumps({k: terms.get(k) for k in TERMS_KEYS}) if terms else None
     ps_json = (json.dumps({k: project_sheet_info.get(k) for k in PROJECT_SHEET_KEYS})
                if project_sheet_info else None)
@@ -1362,18 +1380,30 @@ def update_offer(base_project_id: int, grid: pd.DataFrame, discount_sar=0.0,
     ps_json = (json.dumps({k: project_sheet_info.get(k) for k in PROJECT_SHEET_KEYS})
                if project_sheet_info else None)
     with _conn() as c:
+        current = c.execute(
+            "SELECT ProjectName,OptionLabel,OfferNo FROM Projects_Master WHERE ProjectID=?",
+            (base_project_id,),
+        ).fetchone()
         c.execute(
             "UPDATE Projects_Master SET DiscountAmount=?, ConversionFactor=?, "
             "OfferTerms=COALESCE(?, OfferTerms), "
             "ProjectSheetInfo=COALESCE(?, ProjectSheetInfo) WHERE ProjectID=?",
             (discount_sar, factors[0], terms_json, ps_json, base_project_id))
         if header is not None:
+            current_name = current["ProjectName"] if current else ""
+            current_option = current["OptionLabel"] if current else ""
+            saved_option = current_option if option_label is None else option_label
+            project_name = project_name_with_option(
+                (header.get("project") or "").strip() or current_name,
+                saved_option,
+                current_option,
+            )
             c.execute(
                 "UPDATE Projects_Master SET ProjectName=COALESCE(?,ProjectName), ClientName=?, "
                 "ContactName=?, ContactPhone=?, Contractor=?, Region=?, "
                 "SalesPerson=?, PresalesEngineer=?, ProjectManager=? "
                 "WHERE ProjectID=?",
-                ((header.get("project") or "").strip() or None, _str(header.get("client")),
+                (project_name, _str(header.get("client")),
                  _str(header.get("contact")), _str(header.get("phone")),
                  _str(header.get("contractor")), _str(header.get("region")),
                  _str(header.get("sales")), _str(header.get("presales")),
@@ -1381,6 +1411,13 @@ def update_offer(base_project_id: int, grid: pd.DataFrame, discount_sar=0.0,
         if option_label is not None:
             c.execute("UPDATE Projects_Master SET OptionLabel=? WHERE ProjectID=?",
                       (_str(option_label), base_project_id))
+        if current:
+            final_project_name = project_name if header is not None else current["ProjectName"]
+            family_source = current["OfferNo"] or final_project_name
+            c.execute(
+                "UPDATE Projects_Master SET BaseName=? WHERE ProjectID=?",
+                (base_name(family_source), base_project_id),
+            )
         c.execute("DELETE FROM Project_BoQ_Lines WHERE ProjectID=?", (base_project_id,))
         c.execute("DELETE FROM Project_Sheets WHERE ProjectID=?", (base_project_id,))
         _write_sheet_and_lines(c, base_project_id, system_suffix, discount_sar, factors, grid)
@@ -1417,7 +1454,9 @@ def save_revision(base_project_id: int, grid: pd.DataFrame, discount_sar=0.0,
     opt = option_label if option_label is not None else (meta.get("OptionLabel") or "")
     sep, tok = revision_separator(), revision_token(rev)
     proj_override = (header.get("project") or "").strip() if header is not None else ""
-    name = (proj_override or f"{base}{sep}{tok}") + (f" ({opt})" if opt else "")
+    name = project_name_with_option(
+        proj_override or f"{base}{sep}{tok}", opt, meta.get("OptionLabel") or ""
+    )
     offer = meta.get("OfferNo")
     offer_rev = f"{base_name(offer)}{sep}{tok}" if offer else None
     client, contact, phone, contractor, region, sales, presales, pm = _header_fields(meta, header)
@@ -1447,7 +1486,7 @@ def save_option(base_project_id: int, grid: pd.DataFrame, option_label: str,
     opt = (option_label or "").strip() or "Option"
     proj_override = (header.get("project") or "").strip() if header is not None else ""
     stem = proj_override or (f"{base}{revision_separator()}{revision_token(rev)}" if rev else base)
-    name = f"{stem} ({opt})"
+    name = project_name_with_option(stem, opt, meta.get("OptionLabel") or "")
     client, contact, phone, contractor, region, sales, presales, pm = _header_fields(meta, header)
     pid = save_offer(
         name=name, client=client, contact=contact,

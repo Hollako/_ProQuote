@@ -405,7 +405,7 @@ def _catalog_dedupe_tool():
         st.rerun()                                        # app-level: refresh the main grid
 
 
-def _person_select(col, label, role, current, key):
+def _person_select(col, label, role, current, key, **widget_kwargs):
     """Dropdown of active users holding `role` (a single role name or a list of roles);
     keeps any legacy stored value selectable. Always exactly one '-' (unassign) entry."""
     raw = (auth.users_in_roles(role) if isinstance(role, (list, tuple, set))
@@ -419,11 +419,13 @@ def _person_select(col, label, role, current, key):
     opts = ["-"] + names
     if cur and cur != "-" and cur not in names:
         opts = ["-", cur] + names            # preserve a real stored name not in the list
-    pick = col.selectbox(label, opts, index=opts.index(cur) if cur in opts else 0, key=key)
+    pick = col.selectbox(
+        label, opts, index=opts.index(cur) if cur in opts else 0, key=key, **widget_kwargs
+    )
     return "" if pick == "-" else pick
 
 
-def _region_select(col, current, key):
+def _region_select(col, current, key, **widget_kwargs):
     """Managed Region dropdown that keeps legacy stored values selectable."""
     regions = repo.regions()
     cur = _text(current).strip()
@@ -440,10 +442,11 @@ def _region_select(col, current, key):
         key=key,
         format_func=lambda value: value or "-",
         help="Manage this dropdown in Settings → Company Details → Project regions.",
+        **widget_kwargs,
     )
 
 
-def _system_select(col, current, key):
+def _system_select(col, current, key, **widget_kwargs):
     """Full-name System dropdown; the configured abbreviation is shown alongside it."""
     names = repo.system_names()
     cur = repo.system_name(current)
@@ -468,6 +471,7 @@ def _system_select(col, current, key):
         format_func=_label,
         help=("The full system name is stored on the project; its abbreviation replaces "
               "*TYPE* in the Offer #. Manage systems in Settings → Company Details."),
+        **widget_kwargs,
     )
 
 
@@ -748,10 +752,13 @@ def _sync_edit_state_from_widgets():
         }
         for field, key in header_keys.items():
             if key in st.session_state:
-                st.session_state.edit_header[field] = st.session_state.get(key)
+                value = st.session_state.get(key)
+                if field in ("sales", "presales", "pm") and value == "-":
+                    value = ""
+                st.session_state.edit_header[field] = value
 
     if "eh_system" in st.session_state:
-        st.session_state.edit_system = st.session_state.get("eh_system") or ""
+        st.session_state.edit_system = repo.system_name(st.session_state.get("eh_system"))
 
     if "edit_terms" in st.session_state:
         term_keys = {
@@ -847,6 +854,33 @@ def _copy_widget_to_state_dict(state_key: str, field: str, widget_key: str):
         st.session_state[state_key] = target
 
 
+def _copy_edit_header_widget(field: str, widget_key: str, blank_marker=None):
+    """Immediately copy an Edit Project Details widget into the save payload."""
+    if "edit_header" not in st.session_state or widget_key not in st.session_state:
+        return
+    value = st.session_state.get(widget_key)
+    if blank_marker is not None and value == blank_marker:
+        value = ""
+    st.session_state.edit_header[field] = value
+
+
+def _copy_edit_system_widget():
+    """Immediately synchronize the Edit System selector and its dependent note."""
+    system = repo.system_name(st.session_state.get("eh_system"))
+    st.session_state.edit_system = system
+    if "edit_terms" in st.session_state:
+        st.session_state.edit_terms["system_note"] = system
+
+
+def _clear_offer_data_caches():
+    """Ensure a just-saved offer is re-read when the editor closes or the page reruns."""
+    for name in ("_cached_project_index", "_cached_project_grid", "_cached_offers_df",
+                 "_cached_finance_df", "_cached_report_dataset"):
+        cached = globals().get(name)
+        if cached is not None and hasattr(cached, "clear"):
+            cached.clear()
+
+
 def _edit_has_unsaved_changes() -> bool:
     _sync_edit_state_from_widgets()
     original = st.session_state.get("edit_dirty_snapshot")
@@ -860,10 +894,17 @@ def _mark_edit_clean():
     st.session_state.edit_close_after_save = False
 
 
+def _clear_edit_widget_state():
+    """Remove every per-offer edit value so it cannot leak into another edit."""
+    for key in EDIT_WIDGET_KEYS:
+        st.session_state.pop(key, None)
+
+
 def _close_edit_mode():
     st.session_state.edit_mode = False
     _request_scroll_top()
-    for key in EDIT_WIDGET_KEYS + (
+    _clear_edit_widget_state()
+    for key in (
         "pdf_bytes", "project_sheet_bytes", "saved_rev",
         "saved_export_header", "saved_export_grid", "saved_export_summary",
     ):
@@ -938,7 +979,7 @@ def render_editable_grid(state_key: str, editor_key: str, in_fragment: bool = Fa
         "Shipping %", format="%.2f", min_value=0.0, step=5.0,
         help="Added to Ex Unit Cost. Unit Cost = Ex Unit Cost x (1 + Shipping % / 100), in USD.")
     colcfg["Margin x"] = st.column_config.NumberColumn(
-        "Margin x", format="%.2f", min_value=0.0, step=0.05,
+        "Margin x", format="plain", min_value=0.0, step=None,
         help="Multiplier on landed Unit Cost. U.Price $ = ⌈Unit Cost x Margin⌉. "
              "Set 0 to type U.Price $ manually.")
     order = column_order if column_order is not None else _builder_column_order(editor_key)
@@ -1026,9 +1067,15 @@ def _edit_panel(meta):
     eh = st.session_state.edit_header
     with st.expander("✏️ Project Details (client · project · system · people)", expanded=False):
         hc1, hc2, hc3 = st.columns(3)
-        eh["client"] = hc1.text_input("Client", eh.get("client", ""), key="eh_client")
-        eh["project"] = hc1.text_input("Project", eh.get("project", ""), key="eh_project")
-        eh["contact"] = hc2.text_input("Contact", eh.get("contact", ""), key="eh_contact")
+        eh["client"] = hc1.text_input(
+            "Client", eh.get("client", ""), key="eh_client",
+            on_change=_copy_edit_header_widget, args=("client", "eh_client"))
+        eh["project"] = hc1.text_input(
+            "Project", eh.get("project", ""), key="eh_project",
+            on_change=_copy_edit_header_widget, args=("project", "eh_project"))
+        eh["contact"] = hc2.text_input(
+            "Contact", eh.get("contact", ""), key="eh_contact",
+            on_change=_copy_edit_header_widget, args=("contact", "eh_contact"))
         eh["phone"] = hc2.text_input(
             "Phone", eh.get("phone", ""), key="eh_phone",
             on_change=_copy_widget_to_state_dict,
@@ -1037,17 +1084,26 @@ def _edit_panel(meta):
             "Contractor", eh.get("contractor", ""), key="eh_contractor",
             on_change=_copy_widget_to_state_dict,
             args=("edit_header", "contractor", "eh_contractor"))
-        eh["region"] = _region_select(hc3, eh.get("region", ""), "eh_region")
+        eh["region"] = _region_select(
+            hc3, eh.get("region", ""), "eh_region",
+            on_change=_copy_edit_header_widget, args=("region", "eh_region"))
         ph1, ph2, ph3 = st.columns(3)
         eh["sales"] = _person_select(ph1, "Sales Person", SALES_PERSON_ROLES,
-                                     eh.get("sales", ""), "eh_sales")
+                                     eh.get("sales", ""), "eh_sales",
+                                     on_change=_copy_edit_header_widget,
+                                     args=("sales", "eh_sales", "-"))
         eh["presales"] = _person_select(ph2, "Pre-sales Engineer", PEOPLE_ROLES["presales"],
-                                        eh.get("presales", ""), "eh_presales")
+                                        eh.get("presales", ""), "eh_presales",
+                                        on_change=_copy_edit_header_widget,
+                                        args=("presales", "eh_presales", "-"))
         eh["pm"] = _person_select(ph3, "Project Manager", PEOPLE_ROLES["pm"],
-                                  eh.get("pm", ""), "eh_pm")
+                                  eh.get("pm", ""), "eh_pm",
+                                  on_change=_copy_edit_header_widget,
+                                  args=("pm", "eh_pm", "-"))
         sy1, sy2 = st.columns([1, 2], vertical_alignment="bottom")
         st.session_state.edit_system = _system_select(
-            sy1, st.session_state.get("edit_system", ""), "eh_system")
+            sy1, st.session_state.get("edit_system", ""), "eh_system",
+            on_change=_copy_edit_system_widget)
         st.session_state.edit_terms["system_note"] = st.session_state.edit_system
         sy2.caption("Changing the System updates the BOQ system; the existing Offer # stays unchanged.")
     st.session_state.edit_header = eh
@@ -1130,6 +1186,7 @@ def _edit_panel(meta):
             system_suffix=st.session_state.get("edit_system") or _default_system(), terms=edit_terms,
             project_sheet_info=edit_project_sheet, header=edit_header,
             option_label=pending_option_label)
+        _clear_offer_data_caches()
         saved_option_label = _text(
             repo.project_meta(st.session_state.edit_pid).get("OptionLabel")
         )
@@ -1153,6 +1210,7 @@ def _edit_panel(meta):
             system_suffix=st.session_state.get("edit_system") or _default_system(),
             terms=edit_terms, option_label=pending_option_label,
             project_sheet_info=edit_project_sheet, header=edit_header)
+        _clear_offer_data_caches()
         saved_option_label = _text(repo.project_meta(npid).get("OptionLabel"))
         _post_save(npid, nname, nrev)
         st.toast(f"Saved {nname} as ProjectID {npid}.", icon="✅")
@@ -1173,6 +1231,7 @@ def _edit_panel(meta):
                 factors=(s["markup_factor"], None, None),
                 system_suffix=st.session_state.get("edit_system") or _default_system(), terms=edit_terms,
                 project_sheet_info=edit_project_sheet, header=edit_header)
+            _clear_offer_data_caches()
             saved_option_label = _text(repo.project_meta(npid).get("OptionLabel"))
             _post_save(npid, nname, nrev)
             st.toast(f"Saved option {nname} as ProjectID {npid}.", icon="✅")
@@ -1248,7 +1307,7 @@ def _new_offer_actions():
         elif _optname and _optname in _done:
             st.warning(f"Option '{_optname}' is already saved for this offer.")
         else:
-            name = (h["project"] or "Untitled") + (f" ({_optname})" if _optname else "")
+            name = repo.project_name_with_option(h["project"] or "Untitled", _optname)
             pid = repo.save_offer(
                 name=name,
                 client=h["client"],
@@ -2362,10 +2421,14 @@ def _cached_project_index(db_stamp):
         })
         offer_no = _text(row.OfferNo)
         project_name = _text(row.ProjectName)
+        # The matching-results row represents the whole offer family, which can
+        # contain several options. Keep its Project column uncluttered; option
+        # labels are shown after opening the offer in Revisions & options.
+        project_display_name = repo.project_name_with_option(project_name, "", option)
         if offer_no:
             group["offer_nos"].add(offer_no)
-        if project_name:
-            group["project_names"].add(project_name)
+        if project_display_name:
+            group["project_names"].add(project_display_name)
         sales_person = _text(row.SalesPerson).strip()
         presales_person = _text(row.PresalesEngineer).strip()
         project_manager = _text(row.ProjectManager).strip()
@@ -3092,6 +3155,7 @@ elif mode == "Load Project":
                 st.session_state.pop("view_pid", None)
                 st.session_state.pop("pdf_bytes", None)
                 st.session_state.pop("project_sheet_bytes", None)
+                _clear_edit_widget_state()
                 st.session_state.edit_mode = False
         else:
             search_snapshot = st.session_state.get("load_search_snapshot") or {
@@ -3149,21 +3213,21 @@ elif mode == "Load Project":
         # hide the list and show only that offer (with a Back button).
         if not current_fam:
             st.markdown("**Matching offers**")
-            widths = [2.2, 1.35, 1.8, 0.8, 0.5, 1.25, 1.45, 0.9, 0.7, 0.7]
+            widths = [2.2, 1.45, 1.35, 1.8, 1.25, 0.9, 0.5, 0.8, 0.7, 0.7]
             hc = st.columns(widths)
-            for col, t in zip(hc, ["Project", "Client", "Offer #", "Date", "Rev.",
-                                   "Sales Person", "System", "Region", "Approved", ""]):
+            for col, t in zip(hc, ["Project", "System", "Client", "Offer #", "Sales Person",
+                                   "Region", "Rev.", "Date", "Approved", ""]):
                 col.caption(t)
             for idx, f in enumerate(matches):
                 rc = st.columns(widths, vertical_alignment="center")
                 rc[0].write(_text(f["project_label"], "Offer"))
-                rc[1].write(_text(f["client"], "-"))
-                rc[2].write(_text(f["offer_label"], "-"))
-                rc[3].write(_fmt_date(f["date"]))
-                rc[4].write(str(f["n_rev"]))
-                rc[5].write(_text(f["sales"], "-"))
-                rc[6].write(_text(f["system"], "-"))
-                rc[7].write(_text(f["region"], "-"))
+                rc[1].write(_text(f["system"], "-"))
+                rc[2].write(_text(f["client"], "-"))
+                rc[3].write(_text(f["offer_label"], "-"))
+                rc[4].write(_text(f["sales"], "-"))
+                rc[5].write(_text(f["region"], "-"))
+                rc[6].write(str(f["n_rev"]))
+                rc[7].write(_fmt_date(f["date"]))
                 rc[8].write("✅" if f["approved"] else "")
                 if rc[9].button("View", key=f"match_view_{idx}_{f['fam']}",
                                 width="stretch"):
@@ -3171,6 +3235,7 @@ elif mode == "Load Project":
                     st.session_state.pop("view_pid", None)
                     st.session_state.pop("pdf_bytes", None)
                     st.session_state.pop("project_sheet_bytes", None)
+                    _clear_edit_widget_state()
                     st.session_state.edit_mode = False
                     _request_scroll_top()
                     st.rerun()
@@ -3186,6 +3251,7 @@ elif mode == "Load Project":
                 st.session_state.get("load_search_snapshot") or {})
             for k in ("load_fam", "view_pid", "pdf_bytes", "project_sheet_bytes"):
                 st.session_state.pop(k, None)
+            _clear_edit_widget_state()
             st.session_state.edit_mode = False
             _request_scroll_top()
             st.rerun()
@@ -3252,6 +3318,8 @@ elif mode == "Load Project":
                     st.session_state.view_pid = rid
                     st.session_state.pop("pdf_bytes", None)
                     st.session_state.pop("project_sheet_bytes", None)
+                    _clear_edit_widget_state()
+                    st.session_state.edit_mode = False
                     _request_scroll_top()
                     st.rerun()
 
@@ -3333,6 +3401,9 @@ elif mode == "Load Project":
                 )
             if can("edit") and b1.button("✏️ Edit / new revision or option", type="primary",
                                           width="stretch"):
+                # Always initialize from this selected database record. Stale widget
+                # keys from a previous edit must never override its System/Region.
+                _clear_edit_widget_state()
                 eg = grid.copy()
                 st.session_state.edit_grid = calc.recompute(eg)
                 st.session_state.edit_key = cur_key
@@ -3351,6 +3422,16 @@ elif mode == "Load Project":
                     "presales": _text(meta.get("PresalesEngineer")),
                     "pm": _text(meta.get("ProjectManager")),
                 }
+                for field, widget_key in {
+                    "client": "eh_client", "project": "eh_project", "contact": "eh_contact",
+                    "phone": "eh_phone", "contractor": "eh_contractor", "region": "eh_region",
+                    "sales": "eh_sales", "presales": "eh_presales", "pm": "eh_pm",
+                }.items():
+                    value = st.session_state.edit_header.get(field, "")
+                    st.session_state[widget_key] = value if value else (
+                        "-" if field in ("sales", "presales", "pm") else ""
+                    )
+                st.session_state["eh_system"] = st.session_state.edit_system
                 st.session_state.edit_project_sheet = {
                     **DEFAULT_PROJECT_SHEET_INFO, **repo.load_project_sheet_info(meta)
                 }
@@ -3412,6 +3493,7 @@ elif mode == "Load Project":
                         "discount": abs(float(meta.get("DiscountAmount") or 0)),
                     }
                     st.session_state["_nav_mode"] = "New Project"
+                    _clear_edit_widget_state()
                     st.session_state.edit_mode = False
                     _request_scroll_top()
                     st.rerun()
@@ -3708,7 +3790,8 @@ elif mode == "Settings":
             dmargin = c2.number_input(
                 "Default margin x",
                 min_value=0.0,
-                step=0.05,
+                step=0.0001,
+                format="%.5g",
                 value=float(repo.get_setting("default_margin") or 1.6),
                 help=(
                     "Applied to new blank rows and catalogue items with no historical price, "
