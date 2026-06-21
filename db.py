@@ -5,6 +5,7 @@ Single-file relational database for the centralized Bill of Quantities engine.
 All money is stored exactly as found in the source sheets (no rounding on ingest).
 """
 import os
+import math
 import sqlite3
 
 # The database + assets live in a per-company DATA DIRECTORY. Set the env var
@@ -327,12 +328,51 @@ def _backfill_catalog_price_dates(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
+def _backfill_imported_margins(conn: sqlite3.Connection) -> None:
+    """One-time repair: replace imported trailing-cell values with price/cost margin."""
+    migration_key = "migration_imported_margin_v2"
+    done = conn.execute("SELECT value FROM Settings WHERE key=?", (migration_key,)).fetchone()
+    if done and done["value"] == "1":
+        return
+    rows = conn.execute(
+        """SELECT l.LineID,l.FinalUnitCostUSD,l.TotalCostUSD,l.FinalUPriceUSD,l.TPriceUSD
+             FROM Project_BoQ_Lines l
+             JOIN Projects_Master p ON p.ProjectID=l.ProjectID
+            WHERE l.LineType NOT IN ('discount','spare')
+              AND IFNULL(p.SourceFile,'') NOT LIKE 'app://%'"""
+    ).fetchall()
+    updates = []
+    for row in rows:
+        unit_cost = row["FinalUnitCostUSD"]
+        unit_price = row["FinalUPriceUSD"]
+        total_cost = row["TotalCostUSD"]
+        total_price = row["TPriceUSD"]
+        editor_cost = math.ceil(float(unit_cost)) if unit_cost is not None and unit_cost > 0 else 0
+        if editor_cost > 0 and unit_price is not None:
+            margin = round(max(float(unit_price) / editor_cost, 0.0), 4)
+        elif total_cost is not None and total_cost > 0 and total_price is not None:
+            margin = round(max(float(total_price) / float(total_cost), 0.0), 4)
+        else:
+            margin = 0.0
+        updates.append((margin, row["LineID"]))
+    conn.executemany(
+        "UPDATE Project_BoQ_Lines SET MarginExtra=? WHERE LineID=?",
+        updates,
+    )
+    conn.execute(
+        "INSERT OR REPLACE INTO Settings(key,value) VALUES (?, '1')",
+        (migration_key,),
+    )
+    conn.commit()
+
+
 def init_db(db_path: str = DB_PATH) -> sqlite3.Connection:
     conn = connect(db_path)
     conn.executescript(SCHEMA)
     _migrate(conn)
     _backfill_tracking_quantities(conn)
     _backfill_catalog_price_dates(conn)
+    _backfill_imported_margins(conn)
     conn.commit()
     return conn
 

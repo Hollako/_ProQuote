@@ -187,6 +187,14 @@ def parse_boq_sheet(ws):
             order += 1
             ex_unit_cost = to_num(cell(ws, r, colmap, "ex_unit_cost"))
             unit_cost = to_num(cell(ws, r, colmap, "unit_cost"))
+            shipping_percent = calc.infer_shipping_percent(ex_unit_cost, unit_cost)
+            editor_unit_cost = (
+                calc.roundup(unit_cost, 0) if unit_cost is not None
+                else calc.unit_cost_from_ex(ex_unit_cost, shipping_percent)
+            )
+            total_cost = to_num(cell(ws, r, colmap, "total_cost"))
+            u_price = to_num(cell(ws, r, colmap, "u_price"))
+            t_price = to_num(cell(ws, r, colmap, "t_price"))
             lines.append({
                 "_type": ltype, "_order": order,
                 "area": cell(ws, r, colmap, "area"),
@@ -197,14 +205,14 @@ def parse_boq_sheet(ws):
                 "qty": qty,
                 "list_price": to_num(cell(ws, r, colmap, "list_price")),
                 "ex_unit_cost": ex_unit_cost,
-                "shipping_percent": calc.infer_shipping_percent(ex_unit_cost, unit_cost),
+                "shipping_percent": shipping_percent,
                 "unit_cost": unit_cost,
-                "total_cost": to_num(cell(ws, r, colmap, "total_cost")),
-                "u_price": to_num(cell(ws, r, colmap, "u_price")),
-                "t_price": to_num(cell(ws, r, colmap, "t_price")),
+                "total_cost": total_cost,
+                "u_price": u_price,
+                "t_price": t_price,
                 "u_price_sar": to_num(cell(ws, r, colmap, "u_price_sar")),
                 "t_price_sar": to_num(cell(ws, r, colmap, "t_price_sar")),
-                "margin": _trailing_margin(ws, r, last_data_col),
+                "margin": _pricing_margin(total_cost, t_price, editor_unit_cost, u_price),
             })
             continue
 
@@ -215,13 +223,20 @@ def parse_boq_sheet(ws):
     return lines, meta
 
 
-def _trailing_margin(ws, r, last_data_col):
-    """The analytic margin/extra value that sits just past the named columns."""
-    for c in range(last_data_col + 1, last_data_col + 4):
-        v = to_num(ws.cell(row=r, column=c).value)
-        if v is not None:
-            return v
-    return None
+def _pricing_margin(total_cost, total_price, unit_cost, unit_price):
+    """Derive the imported pricing multiplier from selling price / cost.
+
+    Imported workbooks often contain unrelated formulas immediately after the
+    named BOQ columns, so that trailing cell must never be treated as Margin x.
+    Prefer unit values because the editor recalculates ``U. Price = Unit Cost x
+    Margin``; this preserves the imported selling price even when workbook totals
+    contain fractional-cost rounding. Line totals are the fallback.
+    """
+    for cost, price in ((unit_cost, unit_price), (total_cost, total_price)):
+        cost_num, price_num = to_num(cost), to_num(price)
+        if cost_num is not None and cost_num > 0 and price_num is not None:
+            return round(max(price_num / cost_num, 0.0), 4)
+    return 0.0
 
 
 def _find_quotation_sheet(wb, suffix):
