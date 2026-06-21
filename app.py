@@ -33,8 +33,10 @@ import updater
 from version import APP_VERSION
 
 # Streamlit reruns this file, but imported helper modules can stay cached in a
-# long-lived app process. Reload the persistence layer so new DB fields and save
-# signatures are picked up without a manual server restart.
+# long-lived app process (especially during Streamlit Cloud hot deployments).
+# Reload calculation + persistence modules together so their function signatures
+# and DB fields always match the currently deployed app.py.
+calc = importlib.reload(calc)
 db = importlib.reload(db)
 repo = importlib.reload(repo)
 
