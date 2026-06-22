@@ -941,14 +941,14 @@ def list_projects() -> pd.DataFrame:
     with _conn() as c:
         rows = c.execute(
             """SELECT p.ProjectID,p.ProjectName,p.ClientName,p.SalesPerson,p.PresalesEngineer,
-                      p.ProjectManager,p.Region,p.OfferNo,p.CreationDate,p.ConversionFactor,
+                       p.ProjectManager,p.Region,p.OfferNo,p.CreationDate,p.UpdatedDate,p.ConversionFactor,
                       p.Approved,p.RevisionNo,p.BaseName,p.OptionLabel,p.Archived,
                       (SELECT s.SystemSuffix
                          FROM Project_Sheets s
                         WHERE s.ProjectID=p.ProjectID
                         ORDER BY s.SheetID LIMIT 1) AS System
                FROM Projects_Master p
-               ORDER BY p.CreationDate DESC, p.ProjectID DESC"""
+               ORDER BY COALESCE(p.UpdatedDate,p.CreationDate) DESC, p.ProjectID DESC"""
         ).fetchall()
     return pd.DataFrame([dict(r) for r in rows])
 
@@ -1310,12 +1310,12 @@ def save_offer(name, client, contact, offer_no, system_suffix, grid: pd.DataFram
             """INSERT INTO Projects_Master
                  (ProjectName,ClientName,ContactName,ContactPhone,
                   Contractor,Region,SalesPerson,PresalesEngineer,ProjectManager,
-                   OfferNo,CreationDate,DiscountAmount,CommissionAmount,CommissionPercent,CommissionMode,ConversionFactor,SourceFile,IngestedAt,
-                  RevisionNo,BaseName,OfferTerms,ProjectSheetInfo,OptionLabel)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                   OfferNo,CreationDate,UpdatedDate,DiscountAmount,CommissionAmount,CommissionPercent,CommissionMode,ConversionFactor,SourceFile,IngestedAt,
+                   RevisionNo,BaseName,OfferTerms,ProjectSheetInfo,OptionLabel)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (name, client, contact, _str(phone), _str(contractor), _str(region),
              sales_person, presales_engineer, project_manager, offer_no,
-             today, discount_sar, commission_sar, commission_percent, commission_mode,
+              today, today, discount_sar, commission_sar, commission_percent, commission_mode,
              factors[0], f"app://offer/{name}/{now}", now,
              revision_no, base,
              terms_json, ps_json, option_label or ""),

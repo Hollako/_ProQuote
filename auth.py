@@ -21,6 +21,7 @@ PERMISSIONS = [
     ("tracking",       "Item tracking"),
     ("finance",        "Finance"),
     ("reports",        "Reports & statistics"),
+    ("audit",          "Audit trail"),
     ("view_costs",     "See costs"),
     ("catalogue",      "Catalogue (view)"),
     ("catalogue_edit", "Catalogue (edit)"),
@@ -40,6 +41,9 @@ _DEFAULT_ROLE_ORDER = ["owner", "admin", "Top Management", "Project Manager", "P
 # Roles introduced after the first release - added to existing DBs by a one-time,
 # flag-guarded top-up in ensure_roles_seeded (so deleting them later doesn't resurrect them).
 _LATER_ROLES = ("Top Management",)
+_LATER_PERMISSION_GRANTS = {
+    "audit": ("admin", "Top Management"),
+}
 DEFAULT_ROLE_PERMS = {
     "owner": set(ALL_PERMS),
     "admin": set(ALL_PERMS) - {"users"},
@@ -80,6 +84,17 @@ def ensure_roles_seeded() -> None:
                 continue
             if not first_run:
                 _seed_role(c, role)
+            c.execute("INSERT OR REPLACE INTO Settings(key,value) VALUES(?,?)", (flag, "1"))
+        for permission, roles in _LATER_PERMISSION_GRANTS.items():
+            flag = f"seeded_permission::{permission}"
+            if c.execute("SELECT 1 FROM Settings WHERE key=?", (flag,)).fetchone():
+                continue
+            for role in roles:
+                if c.execute("SELECT 1 FROM Roles WHERE Role=?", (role,)).fetchone():
+                    c.execute(
+                        "INSERT OR IGNORE INTO RolePerms(Role,Permission) VALUES(?,?)",
+                        (role, permission),
+                    )
             c.execute("INSERT OR REPLACE INTO Settings(key,value) VALUES(?,?)", (flag, "1"))
         c.commit()
 

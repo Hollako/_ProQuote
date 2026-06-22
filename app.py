@@ -28,6 +28,7 @@ import db
 import db_backup
 import ingest
 import reports
+import audit as audit_log
 import runtime_env
 import updater
 from version import APP_VERSION
@@ -39,6 +40,7 @@ from version import APP_VERSION
 calc = importlib.reload(calc)
 db = importlib.reload(db)
 repo = importlib.reload(repo)
+audit_log = importlib.reload(audit_log)
 
 _LOGO = db.banner_path()                       # per-company banner (follows BOQ_DATA_DIR)
 _COMPANY = repo.get_setting("company_name") or "Company Name"
@@ -1971,6 +1973,14 @@ def _project_details_readonly(meta: dict, system=""):
         _readonly_field(p2, "Pre-sales Engineer", meta.get("PresalesEngineer"))
         _readonly_field(p3, "Project Manager", meta.get("ProjectManager"))
 
+        d1, d2, d3 = st.columns(3)
+        _readonly_field(d1, "Created", _fmt_date(meta.get("CreationDate")))
+        _readonly_field(
+            d2, "Last Updated",
+            _fmt_date(meta.get("UpdatedDate") or meta.get("CreationDate")),
+        )
+        _readonly_field(d3, "Offer #", meta.get("OfferNo"))
+
 
 def _safe_float(value, default: float = 0.0) -> float:
     try:
@@ -2594,7 +2604,8 @@ def _cached_project_index(db_stamp):
         group = groups.setdefault(fam, {
             "fam": fam, "offer_nos": set(), "project_names": set(),
             "sales_people": set(), "presales_people": set(), "project_managers": set(),
-            "revision_counts": {}, "approved": False, "date": "",
+            "revision_counts": {}, "approved": False,
+            "created_date": "", "updated_date": "",
             "rep_sort": None, "base": "", "client": "", "sales": "",
             "system": "", "region": "",
         })
@@ -2619,7 +2630,13 @@ def _cached_project_index(db_stamp):
             group["project_managers"].add(project_manager)
         group["revision_counts"][rev] = group["revision_counts"].get(rev, 0) + 1
         group["approved"] = group["approved"] or bool(row.Approved or 0)
-        group["date"] = max(group["date"], _text(row.CreationDate))
+        created_date = _text(row.CreationDate)
+        updated_date = _text(row.UpdatedDate) or created_date
+        if created_date and (
+            not group["created_date"] or created_date < group["created_date"]
+        ):
+            group["created_date"] = created_date
+        group["updated_date"] = max(group["updated_date"], updated_date)
         if group["rep_sort"] is None or sort_key >= group["rep_sort"]:
             group["rep_sort"] = sort_key
             group["base"] = _text(row.BaseName) or repo.base_name(project_name or "Offer")
@@ -2650,9 +2667,10 @@ def _cached_project_index(db_stamp):
             "n_rev": len(group["revision_counts"]),
             "n_opt": max(group["revision_counts"].values()),
             "approved": group["approved"],
-            "date": group["date"],
+            "created_date": group["created_date"],
+            "updated_date": group["updated_date"],
         })
-    fams.sort(key=lambda f: f["date"], reverse=True)
+    fams.sort(key=lambda f: (f["updated_date"], f["created_date"]), reverse=True)
     return projects, fams
 
 
@@ -3111,6 +3129,103 @@ def _render_tracking_tab(project_id: int, sheet_name: str | None):
         st.caption("🔒 Your role can view tracking but not change it.")
 
 
+def _render_audit_page():
+    st.subheader("Audit")
+    st.caption(
+        "Immutable history of application data changes from the date auditing was enabled. "
+        "Earlier changes cannot be reconstructed; password values are always redacted."
+    )
+    options = audit_log.filter_options()
+    f1, f2, f3, f4 = st.columns([1.25, 1.0, 1.35, 2.0])
+    username = f1.selectbox("User", ["", *options["users"]],
+                            format_func=lambda v: v or "All users", key="audit_user")
+    action = f2.selectbox(
+        "Action", ["", *dict.fromkeys(["INSERT", "UPDATE", "DELETE", *options["actions"]])],
+        format_func=lambda v: audit_log.ACTION_LABELS.get(v, "All actions"),
+        key="audit_action",
+    )
+    entity = f3.selectbox(
+        "Area", ["", *options["entities"]],
+        format_func=lambda v: audit_log.ENTITY_LABELS.get(v, "All areas"),
+        key="audit_entity",
+    )
+    search = f4.text_input(
+        "Search audit details", key="audit_search",
+        placeholder="Offer number, project, product, setting, username…",
+    )
+
+    d1, d2, d3, d4 = st.columns([1.0, 1.0, 1.0, 1.4], vertical_alignment="bottom")
+    use_dates = d1.checkbox("Filter by date", key="audit_use_dates")
+    today = dt.date.today()
+    date_from = d2.date_input(
+        "From", value=today - dt.timedelta(days=30), key="audit_date_from",
+        disabled=not use_dates,
+    )
+    date_to = d3.date_input(
+        "To", value=today, key="audit_date_to", disabled=not use_dates,
+    )
+    limit = d4.selectbox("Maximum rows", [100, 250, 500, 1000, 2000], index=1,
+                         key="audit_limit")
+
+    events, total = audit_log.query_events(
+        username=username, action=action, entity_type=entity, search=search,
+        date_from=date_from if use_dates else None,
+        date_to=date_to if use_dates else None,
+        limit=limit,
+    )
+    m1, m2, m3 = st.columns(3)
+    m1.metric("Matching changes", f"{total:,}")
+    m2.metric("Displayed", f"{len(events):,}")
+    m3.metric("Users in audit", f"{len(options['users']):,}")
+    if events.empty:
+        st.info("No audit changes match these filters.")
+        return
+
+    display = pd.DataFrame({
+        "ID": events["AuditID"],
+        "When": events["EventAt"].astype(str).str.replace("T", " ", regex=False),
+        "User": events["DisplayName"].fillna("").where(
+            events["DisplayName"].fillna("").str.strip().ne(""), events["Username"]),
+        "Action": events["Action"].map(audit_log.ACTION_LABELS).fillna(events["Action"]),
+        "Area": events["EntityType"].map(audit_log.ENTITY_LABELS).fillna(events["EntityType"]),
+        "Record": events["EntityID"].fillna(""),
+        "Changes": [audit_log.describe_event(row.to_dict()) for _, row in events.iterrows()],
+    })
+    st.dataframe(display, hide_index=True, width="stretch", height=min(540, 38 + len(display) * 35))
+    st.download_button(
+        "⬇️ Download filtered audit CSV", display.to_csv(index=False).encode("utf-8-sig"),
+        file_name=f"ProQuote_Audit_{today.isoformat()}.csv", mime="text/csv",
+    )
+
+    by_id = {int(row["AuditID"]): row.to_dict() for _, row in events.iterrows()}
+    selected_id = st.selectbox(
+        "Inspect a change", list(by_id), key="audit_selected_id",
+        format_func=lambda audit_id: (
+            f"#{audit_id} · {by_id[audit_id]['EventAt'].replace('T', ' ')} · "
+            f"{by_id[audit_id]['DisplayName'] or by_id[audit_id]['Username']} · "
+            f"{audit_log.ACTION_LABELS.get(by_id[audit_id]['Action'], by_id[audit_id]['Action'])} "
+            f"{audit_log.ENTITY_LABELS.get(by_id[audit_id]['EntityType'], by_id[audit_id]['EntityType'])}"
+        ),
+    )
+    event = by_id[int(selected_id)]
+    changes = audit_log.changes_frame(event)
+    st.markdown(
+        f"**Record:** `{event.get('EntityID') or '-'}` &nbsp; · &nbsp; "
+        f"**User:** {event.get('DisplayName') or event.get('Username')} "
+        f"(`{event.get('Username')}`)"
+    )
+    if changes.empty:
+        st.info("No field-level difference is available for this event.")
+    else:
+        st.dataframe(changes, hide_index=True, width="stretch")
+    with st.expander("Raw before / after snapshots"):
+        old_col, new_col = st.columns(2)
+        old_col.markdown("**Before**")
+        old_col.json(audit_log.parse_snapshot(event.get("OldValues")))
+        new_col.markdown("**After**")
+        new_col.json(audit_log.parse_snapshot(event.get("NewValues")))
+
+
 def _render_login():
     st.markdown("<div style='height:1.25rem'></div>", unsafe_allow_html=True)
     c = st.columns([1, 2, 1])[1]
@@ -3158,6 +3273,7 @@ if "auth_user" not in st.session_state:
     st.stop()
 
 USER = st.session_state.auth_user
+db.set_audit_actor(USER)
 ROLE = USER.get("Role", "viewer")
 PERMS = auth.role_perms(ROLE)
 def can(p):
@@ -3175,9 +3291,13 @@ if st.sidebar.button("🔒 Log out", width="stretch"):
     st.session_state.pop("auth_user", None)
     st.rerun()
 
-_SECTIONS = [("New Project", "new_offer"), ("Load Project", "load"), ("Reports", "reports"),
+PROJECT_WORKSPACE_LABEL = "Projects/Offers"
+_SECTIONS = [(PROJECT_WORKSPACE_LABEL, "load"), ("Reports", "reports"), ("Audit", "audit"),
              ("Products Catalogue", "catalogue"), ("Settings", "settings"), ("Users", "users")]
 _allowed = [name for name, p in _SECTIONS if can(p)]
+# New-offer-only roles still enter through the combined project workspace.
+if can("new_offer") and PROJECT_WORKSPACE_LABEL not in _allowed:
+    _allowed.insert(0, PROJECT_WORKSPACE_LABEL)
 if not _allowed:
     st.error("Your account has no accessible sections - contact the owner.")
     st.stop()
@@ -3206,8 +3326,17 @@ try:
 except (TypeError, ValueError):
     pass
 
+# Load Project is the main project workspace. New offers open as a nested view
+# from its action button instead of occupying a separate sidebar page.
+project_workspace_view = st.session_state.get("project_workspace_view", "load")
+if not can("load") and can("new_offer"):
+    project_workspace_view = "new"
+elif not can("new_offer"):
+    project_workspace_view = "load"
+st.session_state["project_workspace_view"] = project_workspace_view
+
 # ============================ NEW OFFER ============================
-if mode == "New Project":
+if mode == PROJECT_WORKSPACE_LABEL and project_workspace_view == "new":
     duplicate = st.session_state.pop("_duplicate_offer", None)
     if duplicate:
         _prime_new_offer_form(
@@ -3221,7 +3350,12 @@ if mode == "New Project":
         st.session_state["no_option"] = ""
         st.session_state.pop("editor", None)
 
-    st.subheader("New Project")
+    nt1, nt2 = st.columns([4, 1])
+    nt1.subheader("New Project")
+    if can("load") and nt2.button("← Load Project", width="stretch", key="back_to_load_project"):
+        st.session_state["project_workspace_view"] = "load"
+        _request_scroll_top()
+        st.rerun()
     h = st.session_state.header
 
     # Live offer reference (from the System abbreviation + override below) - shown as a top bar.
@@ -3278,8 +3412,16 @@ if mode == "New Project":
 
 
 # ============================ LOAD EXISTING ============================
-elif mode == "Load Project":
-    st.subheader("Load Project")
+elif mode == PROJECT_WORKSPACE_LABEL:
+    lt1, lt2 = st.columns([4, 1])
+    lt1.subheader("Load Project")
+    if can("new_offer") and lt2.button(
+        "➕ New Project / Offer", type="primary", width="stretch", key="open_new_project"
+    ):
+        _prime_new_offer_form()
+        st.session_state["project_workspace_view"] = "new"
+        _request_scroll_top()
+        st.rerun()
     if st.session_state.pop("_del_reset", False):        # clear delete confirm widgets
         st.session_state.pop("del_confirm", None)
         st.session_state.pop("del_scope", None)
@@ -3395,10 +3537,10 @@ elif mode == "Load Project":
         # hide the list and show only that offer (with a Back button).
         if not current_fam:
             st.markdown("**Matching offers**")
-            widths = [2.2, 1.45, 1.35, 1.8, 1.25, 0.9, 0.5, 0.8, 0.7, 0.7]
+            widths = [2.1, 1.3, 1.25, 1.7, 1.15, 0.85, 0.5, 0.75, 0.6, 0.7]
             hc = st.columns(widths)
             for col, t in zip(hc, ["Project", "System", "Client", "Offer #", "Sales Person",
-                                   "Region", "Rev.", "Date", "Approved", ""]):
+                                   "Region", "Rev.", "Updated", "Approved", ""]):
                 col.caption(t)
             for idx, f in enumerate(matches):
                 rc = st.columns(widths, vertical_alignment="center")
@@ -3409,7 +3551,7 @@ elif mode == "Load Project":
                 rc[4].write(_text(f["sales"], "-"))
                 rc[5].write(_text(f["region"], "-"))
                 rc[6].write(str(f["n_rev"]))
-                rc[7].write(_fmt_date(f["date"]))
+                rc[7].write(_fmt_date(f["updated_date"]))
                 rc[8].write("✅" if f["approved"] else "")
                 if rc[9].button("View", key=f"match_view_{idx}_{f['fam']}",
                                 width="stretch"):
@@ -3466,7 +3608,7 @@ elif mode == "Load Project":
 
         # Revisions grouped first, then the options inside each revision.
         st.markdown("**Revisions & options**")
-        widths = [0.35, 1.45, 1.8, 1.0, 1.3, 0.5, 1.0, 0.9]
+        widths = [0.35, 1.3, 1.65, 0.8, 0.8, 1.2, 0.45, 0.9, 0.8]
         shown_opts = shown.copy()
         shown_opts["_rev_sort"] = shown_opts["RevisionNo"].fillna(0).astype(int)
         totals_by_pid = repo.offer_grand_totals(shown_opts["ProjectID"].tolist())
@@ -3482,8 +3624,8 @@ elif mode == "Load Project":
                 unsafe_allow_html=True,
             )
             hc = st.columns(widths)
-            for col, t in zip(hc, ["", "Option", "Offer #", "Date", "Grand Total (SAR)",
-                                   "✓", "Status", ""]):
+            for col, t in zip(hc, ["", "Option", "Offer #", "Created", "Updated",
+                                   "Grand Total (SAR)", "✓", "Status", ""]):
                 _ctr(col, t, header=True)
             for _, row in rev_grp.iterrows():
                 rid = int(row["ProjectID"])
@@ -3493,10 +3635,11 @@ elif mode == "Load Project":
                 _ctr(rc[1], _text(row["OptionLabel"], "Main"))
                 _ctr(rc[2], _text(row["OfferNo"]))
                 _ctr(rc[3], _fmt_date(row["CreationDate"]))
-                _ctr(rc[4], f"{totals_by_pid.get(rid, 0):,.2f}")
-                _ctr(rc[5], "✅" if row["Approved"] else "")
-                _ctr(rc[6], "📦 Archived" if row["Archived"] else "Active")
-                if rc[7].button("View", key=f"view_{rid}", disabled=sel, width="stretch"):
+                _ctr(rc[4], _fmt_date(row.get("UpdatedDate") or row["CreationDate"]))
+                _ctr(rc[5], f"{totals_by_pid.get(rid, 0):,.2f}")
+                _ctr(rc[6], "✅" if row["Approved"] else "")
+                _ctr(rc[7], "📦 Archived" if row["Archived"] else "Active")
+                if rc[8].button("View", key=f"view_{rid}", disabled=sel, width="stretch"):
                     st.session_state.view_pid = rid
                     st.session_state.pop("pdf_bytes", None)
                     st.session_state.pop("project_sheet_bytes", None)
@@ -3691,7 +3834,8 @@ elif mode == "Load Project":
                         "commission_percent": abs(float(meta.get("CommissionPercent") or 0)),
                         "commission_mode": meta.get("CommissionMode") or "Deduct from profit",
                     }
-                    st.session_state["_nav_mode"] = "New Project"
+                    st.session_state["_nav_mode"] = PROJECT_WORKSPACE_LABEL
+                    st.session_state["project_workspace_view"] = "new"
                     _clear_edit_widget_state()
                     st.session_state.edit_mode = False
                     _request_scroll_top()
@@ -3790,6 +3934,11 @@ elif mode == "Reports":
         _render_report_builder(_rep_company)
     with tab_dash:
         _render_dashboard(_rep_company)
+
+
+# ============================ AUDIT ============================
+elif mode == "Audit":
+    _render_audit_page()
 
 
 # ============================ CATALOGUE ============================
@@ -4879,6 +5028,15 @@ elif mode == "Settings":
             ):
                 try:
                     restored_path, safety_backup = db_backup.restore_profile_from_bytes(restore_file.getvalue())
+                    restored_conn = db.init_db(restored_path)
+                    restored_conn.close()
+                    db.set_audit_actor(USER)
+                    audit_log.record_event(
+                        "RESTORE", "Database", os.path.basename(restored_path),
+                        f"Restored profile backup {restore_file.name}",
+                        new_values={"backup_file": restore_file.name},
+                    )
+                    st.session_state.db_init = True
                     st.success("Backup restored. The app will reload now.")
                     if safety_backup:
                         st.info(f"Safety backup created: {os.path.basename(safety_backup)}")

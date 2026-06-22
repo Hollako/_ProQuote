@@ -7,6 +7,7 @@ All money is stored exactly as found in the source sheets (no rounding on ingest
 import os
 import math
 import sqlite3
+import contextvars
 
 # The database + assets live in a per-company DATA DIRECTORY. Set the env var
 # BOQ_DATA_DIR to give each company its own DB + logo/banner (Model A: one shared
@@ -18,6 +19,30 @@ ASSETS_DIR = os.path.join(DATA_DIR, "assets")
 os.makedirs(DATA_DIR, exist_ok=True)
 os.makedirs(ASSETS_DIR, exist_ok=True)
 DB_PATH = os.path.join(DATA_DIR, "proquote.db")
+
+if "_AUDIT_ACTOR" not in globals():
+    _AUDIT_ACTOR = contextvars.ContextVar(
+        "proquote_audit_actor",
+        default={"user_id": None, "username": "system", "display_name": "System"},
+    )
+
+
+def set_audit_actor(user: dict | None) -> None:
+    """Attach the authenticated user to subsequent DB writes in this execution context."""
+    user = user or {}
+    _AUDIT_ACTOR.set({
+        "user_id": user.get("UserID"),
+        "username": str(user.get("Username") or "system"),
+        "display_name": str(user.get("DisplayName") or user.get("Username") or "System"),
+    })
+
+
+def clear_audit_actor() -> None:
+    set_audit_actor(None)
+
+
+def get_audit_actor() -> dict:
+    return dict(_AUDIT_ACTOR.get())
 
 
 def banner_path() -> str:
@@ -81,6 +106,7 @@ CREATE TABLE IF NOT EXISTS Projects_Master (
     ProjectManager   TEXT,            -- project manager assigned to the offer
     OfferNo          TEXT,
     CreationDate     TEXT,            -- ISO date (from Quotation 'Date:' or file mtime)
+    UpdatedDate      TEXT,            -- ISO date; changes whenever the offer is modified
     DiscountAmount   REAL DEFAULT 0,  -- primary discount (first system sheet)
     CommissionAmount REAL DEFAULT 0,  -- internal expense; excluded from client totals and profit
     CommissionPercent REAL DEFAULT 0, -- percentage gross-up applied to item margins
@@ -215,6 +241,22 @@ CREATE TABLE IF NOT EXISTS Finance_Purchases (
     PORef       TEXT             -- purchase-order reference (plain text)
 );
 
+-- Immutable application audit trail. Triggers are generated after migrations so
+-- their before/after JSON always follows the current table columns.
+CREATE TABLE IF NOT EXISTS Audit_Log (
+    AuditID      INTEGER PRIMARY KEY AUTOINCREMENT,
+    EventAt      TEXT NOT NULL,
+    UserID       INTEGER,
+    Username     TEXT NOT NULL,
+    DisplayName  TEXT,
+    Action       TEXT NOT NULL,
+    EntityType   TEXT NOT NULL,
+    EntityID     TEXT,
+    Summary      TEXT,
+    OldValues    TEXT,
+    NewValues    TEXT
+);
+
 CREATE INDEX IF NOT EXISTS idx_catalog_model ON Items_Catalog(Model);
 CREATE INDEX IF NOT EXISTS idx_catalog_desc  ON Items_Catalog(Description);
 CREATE INDEX IF NOT EXISTS idx_projects_offer_no ON Projects_Master(OfferNo);
@@ -225,6 +267,9 @@ CREATE INDEX IF NOT EXISTS idx_lines_item    ON Project_BoQ_Lines(ItemID);
 CREATE INDEX IF NOT EXISTS idx_lines_type_project ON Project_BoQ_Lines(LineType, ProjectID);
 CREATE INDEX IF NOT EXISTS idx_fin_pay_project ON Finance_Payments(ProjectID);
 CREATE INDEX IF NOT EXISTS idx_fin_pur_project ON Finance_Purchases(ProjectID);
+CREATE INDEX IF NOT EXISTS idx_audit_event_at ON Audit_Log(EventAt DESC);
+CREATE INDEX IF NOT EXISTS idx_audit_user ON Audit_Log(Username, EventAt DESC);
+CREATE INDEX IF NOT EXISTS idx_audit_entity ON Audit_Log(EntityType, EntityID, EventAt DESC);
 """
 
 
@@ -236,6 +281,11 @@ def connect(db_path: str = DB_PATH) -> sqlite3.Connection:
     conn.execute("PRAGMA journal_mode = WAL;")       # concurrent readers + 1 writer
     conn.execute("PRAGMA busy_timeout = 30000;")     # 30s wait-and-retry on lock
     conn.execute("PRAGMA synchronous = NORMAL;")     # safe with WAL, much faster
+    conn.create_function("audit_user_id", 0, lambda: _AUDIT_ACTOR.get().get("user_id"))
+    conn.create_function("audit_username", 0, lambda: _AUDIT_ACTOR.get().get("username"))
+    conn.create_function(
+        "audit_display_name", 0, lambda: _AUDIT_ACTOR.get().get("display_name")
+    )
     return conn
 
 
@@ -260,6 +310,7 @@ MIGRATIONS = {
         "OptionLabel": "TEXT",
         "Archived": "INTEGER DEFAULT 0",
         "ArchivedBy": "INTEGER",
+        "UpdatedDate": "TEXT",
     },
     "Project_BoQ_Lines": {
         "ShippingPercent": "REAL",
@@ -334,6 +385,168 @@ def _backfill_catalog_price_dates(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
+def _backfill_project_updated_dates(conn: sqlite3.Connection) -> None:
+    """Existing offer dates become both the original creation and initial update date."""
+    existing = {r["name"] for r in conn.execute("PRAGMA table_info(Projects_Master)")}
+    if not {"CreationDate", "UpdatedDate"}.issubset(existing):
+        return
+    conn.execute(
+        "UPDATE Projects_Master SET UpdatedDate=CreationDate "
+        "WHERE UpdatedDate IS NULL OR TRIM(UpdatedDate)=''"
+    )
+    conn.commit()
+
+
+def _ensure_project_date_triggers(conn: sqlite3.Connection) -> None:
+    """Keep UpdatedDate current for offer-header, sheet, and line modifications."""
+    conn.executescript(
+        """
+        CREATE TRIGGER IF NOT EXISTS trg_projects_master_updated_date
+        AFTER UPDATE ON Projects_Master
+        FOR EACH ROW
+        WHEN COALESCE(NEW.UpdatedDate,'') = COALESCE(OLD.UpdatedDate,'')
+        BEGIN
+            UPDATE Projects_Master
+               SET UpdatedDate=date('now','localtime')
+             WHERE ProjectID=NEW.ProjectID;
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS trg_project_sheets_insert_updated_date
+        AFTER INSERT ON Project_Sheets
+        BEGIN
+            UPDATE Projects_Master SET UpdatedDate=date('now','localtime')
+             WHERE ProjectID=NEW.ProjectID;
+        END;
+        CREATE TRIGGER IF NOT EXISTS trg_project_sheets_update_updated_date
+        AFTER UPDATE ON Project_Sheets
+        BEGIN
+            UPDATE Projects_Master SET UpdatedDate=date('now','localtime')
+             WHERE ProjectID=NEW.ProjectID;
+        END;
+        CREATE TRIGGER IF NOT EXISTS trg_project_sheets_delete_updated_date
+        AFTER DELETE ON Project_Sheets
+        BEGIN
+            UPDATE Projects_Master SET UpdatedDate=date('now','localtime')
+             WHERE ProjectID=OLD.ProjectID;
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS trg_project_lines_insert_updated_date
+        AFTER INSERT ON Project_BoQ_Lines
+        BEGIN
+            UPDATE Projects_Master SET UpdatedDate=date('now','localtime')
+             WHERE ProjectID=NEW.ProjectID;
+        END;
+        CREATE TRIGGER IF NOT EXISTS trg_project_lines_update_updated_date
+        AFTER UPDATE ON Project_BoQ_Lines
+        BEGIN
+            UPDATE Projects_Master SET UpdatedDate=date('now','localtime')
+             WHERE ProjectID=NEW.ProjectID;
+        END;
+        CREATE TRIGGER IF NOT EXISTS trg_project_lines_delete_updated_date
+        AFTER DELETE ON Project_BoQ_Lines
+        BEGIN
+            UPDATE Projects_Master SET UpdatedDate=date('now','localtime')
+             WHERE ProjectID=OLD.ProjectID;
+        END;
+        """
+    )
+    conn.commit()
+
+
+_AUDITED_TABLES = (
+    "Projects_Master", "Project_Sheets", "Project_BoQ_Lines", "Items_Catalog",
+    "Finance_Payments", "Finance_Purchases", "Settings", "Users", "Roles", "RolePerms",
+)
+_AUDIT_REDACTED_COLUMNS = {"Users": {"PasswordHash"}}
+
+
+def _sql_ident(value: str) -> str:
+    return '"' + value.replace('"', '""') + '"'
+
+
+def _sql_literal(value: str) -> str:
+    return "'" + value.replace("'", "''") + "'"
+
+
+def _audit_json_expr(table: str, prefix: str, columns: list[str]) -> str:
+    parts = []
+    redacted = _AUDIT_REDACTED_COLUMNS.get(table, set())
+    for column in columns:
+        parts.append(_sql_literal(column))
+        parts.append(
+            _sql_literal("[REDACTED]")
+            if column in redacted else f"{prefix}.{_sql_ident(column)}"
+        )
+    return f"json_object({','.join(parts)})"
+
+
+def _audit_entity_id_expr(prefix: str, pk_columns: list[str]) -> str:
+    if not pk_columns:
+        return f"CAST({prefix}.rowid AS TEXT)"
+    pieces = [
+        f"{_sql_literal(column + '=')} || COALESCE(CAST({prefix}.{_sql_ident(column)} AS TEXT),'')"
+        for column in pk_columns
+    ]
+    return " || '; ' || ".join(pieces)
+
+
+def _ensure_audit_triggers(conn: sqlite3.Connection) -> None:
+    """Generate immutable row-level auditing for every mutable business table."""
+    existing_tables = {
+        r["name"] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
+    }
+    for table in _AUDITED_TABLES:
+        if table not in existing_tables:
+            continue
+        info = conn.execute(f"PRAGMA table_info({_sql_ident(table)})").fetchall()
+        columns = [r["name"] for r in info]
+        pk_columns = [r["name"] for r in sorted(info, key=lambda r: r["pk"]) if r["pk"]]
+        table_ident = _sql_ident(table)
+        table_lit = _sql_literal(table)
+        old_json = _audit_json_expr(table, "OLD", columns)
+        new_json = _audit_json_expr(table, "NEW", columns)
+        old_id = _audit_entity_id_expr("OLD", pk_columns)
+        new_id = _audit_entity_id_expr("NEW", pk_columns)
+        compared = [c for c in columns if not (table == "Projects_Master" and c == "UpdatedDate")]
+        update_when = " OR ".join(
+            f"OLD.{_sql_ident(c)} IS NOT NEW.{_sql_ident(c)}" for c in compared
+        ) or "0"
+
+        for action in ("insert", "update", "delete"):
+            conn.execute(f"DROP TRIGGER IF EXISTS audit_{table}_{action}")
+
+        common_cols = (
+            "EventAt,UserID,Username,DisplayName,Action,EntityType,EntityID,Summary,"
+            "OldValues,NewValues"
+        )
+        actor_sql = "audit_user_id(),audit_username(),audit_display_name()"
+        event_sql = "strftime('%Y-%m-%dT%H:%M:%S','now','localtime')"
+        conn.executescript(
+            f"""
+            CREATE TRIGGER audit_{table}_insert AFTER INSERT ON {table_ident}
+            BEGIN
+                INSERT INTO Audit_Log({common_cols})
+                VALUES ({event_sql},{actor_sql},'INSERT',{table_lit},{new_id},
+                        'Created ' || {table_lit},NULL,{new_json});
+            END;
+            CREATE TRIGGER audit_{table}_update AFTER UPDATE ON {table_ident}
+            WHEN {update_when}
+            BEGIN
+                INSERT INTO Audit_Log({common_cols})
+                VALUES ({event_sql},{actor_sql},'UPDATE',{table_lit},{new_id},
+                        'Updated ' || {table_lit},{old_json},{new_json});
+            END;
+            CREATE TRIGGER audit_{table}_delete AFTER DELETE ON {table_ident}
+            BEGIN
+                INSERT INTO Audit_Log({common_cols})
+                VALUES ({event_sql},{actor_sql},'DELETE',{table_lit},{old_id},
+                        'Deleted ' || {table_lit},{old_json},NULL);
+            END;
+            """
+        )
+    conn.commit()
+
+
 def _backfill_imported_margins(conn: sqlite3.Connection) -> None:
     """One-time repair: replace imported trailing-cell values with price/cost margin."""
     migration_key = "migration_imported_margin_v2"
@@ -378,6 +591,9 @@ def init_db(db_path: str = DB_PATH) -> sqlite3.Connection:
     _migrate(conn)
     _backfill_tracking_quantities(conn)
     _backfill_catalog_price_dates(conn)
+    _backfill_project_updated_dates(conn)
+    _ensure_project_date_triggers(conn)
+    _ensure_audit_triggers(conn)
     _backfill_imported_margins(conn)
     conn.commit()
     return conn

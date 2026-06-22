@@ -465,7 +465,14 @@ def ingest_file(conn, path, stats):
         stats["skipped_no_boq"] += 1
         return
 
-    # Idempotent by full path: re-ingesting the same file replaces its prior copy.
+    # Idempotent by full path: re-ingesting the same file replaces its prior copy,
+    # but the original creation date remains fixed.
+    existing_project = conn.execute(
+        "SELECT CreationDate FROM Projects_Master WHERE SourceFile=?", (path,)
+    ).fetchone()
+    preserved_creation_date = (
+        _s(existing_project["CreationDate"]) if existing_project else None
+    )
     conn.execute("DELETE FROM Projects_Master WHERE SourceFile=?", (path,))
 
     # project-level metadata from the first system's Quotation sheet
@@ -482,6 +489,8 @@ def ingest_file(conn, path, stats):
         cdate = _parse_date_text(qd) or _parse_date_text(fname)
     if not cdate:
         cdate = dt.datetime.fromtimestamp(os.path.getmtime(path)).date().isoformat()
+    cdate = preserved_creation_date or cdate
+    updated_date = dt.date.today().isoformat()
     project_name = str(qmeta.get("project") or os.path.splitext(fname)[0]).strip()
 
     # Offer number + revision: base ref from the Quotation 'Reference' (else the
@@ -507,11 +516,11 @@ def ingest_file(conn, path, stats):
 
     cur = conn.execute(
         """INSERT INTO Projects_Master
-             (ProjectName,ClientName,ContactName,ContactPhone,SalesPerson,OfferNo,CreationDate,
-              RevisionNo,BaseName,SourceFile,IngestedAt,OfferTerms)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+             (ProjectName,ClientName,ContactName,ContactPhone,SalesPerson,OfferNo,
+              CreationDate,UpdatedDate,RevisionNo,BaseName,SourceFile,IngestedAt,OfferTerms)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         (project_name, client, _s(qmeta.get("contact")), _s(qmeta.get("phone")),
-         _s(qmeta.get("sales")), offer_no, cdate, revno or 0, base_name_val,
+          _s(qmeta.get("sales")), offer_no, cdate, updated_date, revno or 0, base_name_val,
          path, now, terms_json),
     )
     pid = cur.lastrowid

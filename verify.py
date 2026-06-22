@@ -3,8 +3,8 @@ c = dbmod.connect()
 q = lambda s, *a: c.execute(s, a).fetchall()
 
 print("=== PROJECTS (sample 8) ===")
-for r in q("SELECT ProjectID,ProjectName,ClientName,OfferNo,CreationDate,DiscountAmount,ConversionFactor FROM Projects_Master ORDER BY ProjectID LIMIT 8"):
-    print(f"  #{r['ProjectID']:>2} | {str(r['ProjectName'])[:26]:<26} | client={str(r['ClientName'])[:14]:<14} | offer={str(r['OfferNo'])[:18]:<18} | {r['CreationDate']} | disc={r['DiscountAmount']} | f={r['ConversionFactor']}")
+for r in q("SELECT ProjectID,ProjectName,ClientName,OfferNo,CreationDate,UpdatedDate,DiscountAmount,ConversionFactor FROM Projects_Master ORDER BY ProjectID LIMIT 8"):
+    print(f"  #{r['ProjectID']:>2} | {str(r['ProjectName'])[:26]:<26} | client={str(r['ClientName'])[:14]:<14} | offer={str(r['OfferNo'])[:18]:<18} | created={r['CreationDate']} updated={r['UpdatedDate']} | disc={r['DiscountAmount']} | f={r['ConversionFactor']}")
 
 print("\n=== CONVERSION FACTORS captured (sample) ===")
 for r in q("SELECT SheetName,SystemSuffix,Factor1,Factor2,Factor3 FROM Project_Sheets WHERE Factor1 IS NOT NULL LIMIT 8"):

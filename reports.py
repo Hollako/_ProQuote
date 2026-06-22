@@ -44,7 +44,8 @@ def offers_df(include_archived: bool = False) -> pd.DataFrame:
             GROUP BY ProjectID
         )
         SELECT p.ProjectID, p.ProjectName, p.ClientName, p.SalesPerson, p.PresalesEngineer,
-               p.ProjectManager, p.OfferNo, p.CreationDate, p.RevisionNo, p.OptionLabel,
+               p.ProjectManager, p.OfferNo, p.CreationDate, p.UpdatedDate,
+               p.RevisionNo, p.OptionLabel,
                IFNULL(p.Approved,0) AS Approved, IFNULL(p.Archived,0) AS Archived,
                IFNULL(p.DiscountAmount,0) AS DiscountAmount,
                IFNULL(p.CommissionAmount,0) AS CommissionAmount,
@@ -79,7 +80,8 @@ def offers_df(include_archived: bool = False) -> pd.DataFrame:
     df["System"] = df["System"].fillna("")
     df = df.rename(columns={"ClientName": "Client", "SalesPerson": "Sales Person",
                             "PresalesEngineer": "Pre-sales", "ProjectManager": "Project Mgr",
-                            "ProjectName": "Project", "OfferNo": "Offer #", "CreationDate": "Date"})
+                            "ProjectName": "Project", "OfferNo": "Offer #",
+                            "CreationDate": "Date", "UpdatedDate": "Updated Date"})
     return df
 
 
@@ -88,7 +90,7 @@ def lines_df(include_archived: bool = False) -> pd.DataFrame:
     archived_filter = "" if include_archived else "AND IFNULL(p.Archived,0)=0"
     sql = f"""
         SELECT p.ProjectName, p.ClientName, p.SalesPerson, p.PresalesEngineer, p.ProjectManager,
-               p.OfferNo, p.CreationDate, IFNULL(p.Approved,0) AS Approved,
+               p.OfferNo, p.CreationDate, p.UpdatedDate, IFNULL(p.Approved,0) AS Approved,
                IFNULL(p.Archived,0) AS Archived,
                l.System, l.Area, l.Description, l.Brand, l.Model, IFNULL(l.Qty,0) AS Qty,
                IFNULL(l.TotalCostUSD,0) AS TotalCostUSD, IFNULL(l.TPriceSAR,0) AS TPriceSAR,
@@ -112,7 +114,8 @@ def lines_df(include_archived: bool = False) -> pd.DataFrame:
         df[col] = df[col].fillna("")
     df = df.rename(columns={"ClientName": "Client", "SalesPerson": "Sales Person",
                             "PresalesEngineer": "Pre-sales", "ProjectManager": "Project Mgr",
-                            "ProjectName": "Project", "OfferNo": "Offer #", "CreationDate": "Date"})
+                            "ProjectName": "Project", "OfferNo": "Offer #",
+                            "CreationDate": "Date", "UpdatedDate": "Updated Date"})
     return df
 
 
@@ -149,7 +152,7 @@ DATASETS = {
         "date": "Date",
         "metrics": ["Subtotal SAR", "Discount SAR", "Commission SAR", "Grand Total SAR", "Cost SAR",
                     "Gross Profit SAR", "Margin %"],
-        "show": ["Offer #", "Project", "Client", "Sales Person", "System", "Status", "Date",
+        "show": ["Offer #", "Project", "Client", "Sales Person", "System", "Status", "Date", "Updated Date",
                  "Grand Total SAR", "Commission SAR", "Cost SAR", "Gross Profit SAR", "Margin %"],
     },
     "Line items": {
