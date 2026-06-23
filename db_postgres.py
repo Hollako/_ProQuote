@@ -8,6 +8,20 @@ import threading
 from collections.abc import Iterator
 
 
+_write_epoch: int = 0
+_write_epoch_lock = threading.Lock()
+
+
+def _bump_write_epoch() -> None:
+    global _write_epoch
+    with _write_epoch_lock:
+        _write_epoch += 1
+
+
+def write_epoch() -> int:
+    return _write_epoch
+
+
 TABLES_IN_LOAD_ORDER = (
     "Settings",
     "App_Assets",
@@ -235,6 +249,7 @@ class PostgresConnection:
 
     def commit(self):
         self._raw.commit()
+        _bump_write_epoch()
 
     def rollback(self):
         self._raw.rollback()

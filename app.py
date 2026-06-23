@@ -989,6 +989,7 @@ def _approve_offer_dialog(project_id: int, offer_label: str):
     yes_col, no_col = st.columns(2)
     if yes_col.button("Yes", type="primary", key="approve_modal_yes", width="stretch"):
         archived = repo.approve_offer(project_id)
+        st.cache_data.clear()
         st.toast(
             f"Approved. {archived} other entr{'y' if archived == 1 else 'ies'} archived."
             if archived else "Approved.",
@@ -1025,6 +1026,15 @@ def render_editable_grid(state_key: str, editor_key: str, in_fragment: bool = Fa
              "Set 0 to type U.Price $ manually.")
     order = column_order if column_order is not None else _builder_column_order(editor_key)
     display_grid = grid[BUILDER_COLS] if not grid.empty else grid
+
+    # Read the delta BEFORE the data_editor processes it. When the delta contains
+    # added_rows or deleted_rows we reconstruct the new state manually from base + delta
+    # instead of using the data_editor return value, which would have the stale delta
+    # re-applied to the already-updated source, creating phantom duplicate rows.
+    _raw_delta = st.session_state.get(editor_key)
+    _delta = _raw_delta if isinstance(_raw_delta, dict) else {}
+    _structural = bool(_delta.get("added_rows") or _delta.get("deleted_rows"))
+
     edited = st.data_editor(
         display_grid,
         column_config=colcfg, disabled=[c for c in COMPUTED if c in BUILDER_COLS],
@@ -1034,6 +1044,27 @@ def render_editable_grid(state_key: str, editor_key: str, in_fragment: bool = Fa
     ).reset_index(drop=True)
 
     base = st.session_state[state_key].reset_index(drop=True)
+
+    if _structural:
+        # Reconstruct correct state: apply delta fields to base directly.
+        rec = base.copy()
+        for row_idx, changes in _delta.get("edited_rows", {}).items():
+            idx = int(row_idx)
+            for col, val in changes.items():
+                if col in rec.columns and idx < len(rec):
+                    rec.at[idx, col] = val
+        for idx in sorted([int(i) for i in _delta.get("deleted_rows", [])], reverse=True):
+            rec = rec.drop(index=idx, errors="ignore")
+        rec = rec.reset_index(drop=True)
+        for new_row in _delta.get("added_rows", []):
+            blank = calc.blank_row()
+            blank.update({k: v for k, v in new_row.items() if k in blank})
+            rec = pd.concat([rec, pd.DataFrame([blank])], ignore_index=True)
+        new_grid = calc.recompute(rec)
+        st.session_state[state_key] = new_grid
+        st.session_state.pop(editor_key, None)   # clear stale delta before next render
+        st.rerun(scope="fragment") if in_fragment else st.rerun()
+
     new_grid = edited.copy()
     n = len(new_grid)
     new_grid["LineType"] = ["discount" if str(d).strip().lower() == "discount" else "item"
@@ -2568,7 +2599,11 @@ def _catalogue_df_from_zip(uploaded_bytes: bytes) -> pd.DataFrame:
 
 
 def _db_cache_stamp():
-    """Cache key that changes when SQLite data changes, including WAL writes."""
+    """Cache key that changes whenever the active database is written to."""
+    if os.environ.get("DATABASE_URL", "").startswith("postgres"):
+        import db_postgres
+        return ("pg", db_postgres.write_epoch())
+    # SQLite: use file mtime + WAL size
     stamp = []
     for path in (db.DB_PATH, f"{db.DB_PATH}-wal"):
         try:
@@ -3703,6 +3738,7 @@ elif mode == PROJECT_WORKSPACE_LABEL:
                 if meta.get("Approved"):
                     if can("approve") and apc2.button("↩️ Unapprove", width="stretch"):
                         r = repo.unapprove_offer(pid)
+                        st.cache_data.clear()
                         st.toast(f"Unapproved. {r} auto-archived entr{'y' if r == 1 else 'ies'} restored."
                                  if r else "Unapproved.", icon="↩️")
                         st.rerun()
