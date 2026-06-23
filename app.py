@@ -2434,6 +2434,7 @@ def _render_finance_tab(project_id: int, grand_total: float):
     # Cache the editor sources once per offer so in-progress edits stay consistent
     # (we never reload from the DB mid-edit; we just persist changes back to it).
     pay_src_key, pur_src_key = f"fin_pay_src_{project_id}", f"fin_pur_src_{project_id}"
+    sig_key = f"fin_sig_{project_id}"
     if pay_src_key not in st.session_state or pur_src_key not in st.session_state:
         pays, purs = repo.get_finance(project_id)
         st.session_state[pay_src_key] = pd.DataFrame(
@@ -2446,6 +2447,9 @@ def _render_finance_tab(project_id: int, grand_total: float):
               "PO #": r["PORef"] or ""} for r in purs]
             or [{"Description": "", "Cost (SAR)": 0.0, "PO #": ""}])
 
+    _pay_wkey = f"fin_pay_{project_id}"
+    _pur_wkey = f"fin_pur_{project_id}"
+
     col_pay, col_pur = st.columns(2)
     with col_pay:
         st.markdown("#### 💵 Payments / Invoices")
@@ -2456,7 +2460,7 @@ def _render_finance_tab(project_id: int, grand_total: float):
         }
         pay_edit = st.data_editor(st.session_state[pay_src_key], column_config=pay_cfg,
                                   num_rows="dynamic", hide_index=True, width="stretch",
-                                  key=f"fin_pay_{project_id}")
+                                  key=_pay_wkey)
         collected = pay_edit["Amount (SAR)"].map(calc._num).sum()
         remaining = gt - collected
         pct = (collected / gt * 100) if gt else 0.0
@@ -2474,7 +2478,7 @@ def _render_finance_tab(project_id: int, grand_total: float):
         }
         pur_edit = st.data_editor(st.session_state[pur_src_key], column_config=pur_cfg,
                                   num_rows="dynamic", hide_index=True, width="stretch",
-                                  key=f"fin_pur_{project_id}")
+                                  key=_pur_wkey)
         cost_total = pur_edit["Cost (SAR)"].map(calc._num).sum()
         vat = gt * calc.VAT_RATE
         internal_cost = cost_total + commission
@@ -2489,15 +2493,13 @@ def _render_finance_tab(project_id: int, grand_total: float):
                     "💰 Net Profit", f"SAR {net_profit:,.2f}",
                     positive=net_profit >= 0)
 
-    # Auto-save on any change (no Save button).
-    sig = (pay_edit.to_json(), pur_edit.to_json())
-    sig_key = f"fin_sig_{project_id}"
-    if sig_key not in st.session_state:
-        st.session_state[sig_key] = sig
-    elif st.session_state[sig_key] != sig:
+    if st.button("💾 Save Finance", type="primary"):
         repo.save_finance(project_id, pay_edit.to_dict("records"), pur_edit.to_dict("records"))
-        st.session_state[sig_key] = sig
+        # Clear source and widget state so next render reloads cleanly from DB.
+        for k in (pay_src_key, pur_src_key, _pay_wkey, _pur_wkey):
+            st.session_state.pop(k, None)
         st.toast("Finance saved", icon="💾")
+        st.rerun()
 
 
 def _company_dict():
@@ -4001,7 +4003,7 @@ elif mode == "Products Catalogue":
         res = pd.DataFrame()
     else:
         _cat_limit = 1000
-        res = repo.search_catalog(term, limit=_cat_limit).reset_index(drop=True)
+        res = repo.search_catalog(term, limit=_cat_limit, show_discontinued=True).reset_index(drop=True)
         st.caption(
             f"{len(res)} item(s)"
             + (f" shown - refine the search for more specific results" if len(res) >= _cat_limit else "")
@@ -4038,7 +4040,7 @@ elif mode == "Products Catalogue":
             disp["Price Updated"] = "01-2025"
         else:
             disp["Price Updated"] = disp["Price Updated"].map(_fmt_month_year)
-        base_cols = ["Brand", "Model", "Description", "Cur"] + edit_cols + ["Price Updated", "Times Quoted"]
+        base_cols = ["Brand", "Model", "Description", "Cur"] + edit_cols + ["Price Updated", "Times Quoted", "Discontinued"]
         colcfg = {c: st.column_config.NumberColumn(c, format="accounting", min_value=0.0)
                   for c in money_cols}
         colcfg["Cur"] = st.column_config.SelectboxColumn(
@@ -4054,6 +4056,12 @@ elif mode == "Products Catalogue":
         colcfg["Brand"] = st.column_config.TextColumn("Brand", width="medium")
         colcfg["Model"] = st.column_config.TextColumn("Model", width="medium")
         colcfg["Description"] = st.column_config.TextColumn("Description", width="large")
+        colcfg["Discontinued"] = st.column_config.CheckboxColumn(
+            "Discontinued", help="Discontinued items stay visible here but won't appear in offer searches")
+        if "Discontinued" not in disp.columns:
+            disp["Discontinued"] = False
+        else:
+            disp["Discontinued"] = disp["Discontinued"].fillna(0).astype(bool)
         if not _cat_edit:                              # read-only catalogue
             st.dataframe(disp[base_cols], width="stretch", hide_index=True,
                          column_config=colcfg)
@@ -4096,6 +4104,10 @@ elif mode == "Products Catalogue":
                     new_cur = str(edited.iloc[i]["Cur"])
                     if new_cur in calc.CURRENCIES and new_cur != str(disp.iloc[i]["Cur"]):
                         changes["Currency"] = new_cur
+                    new_disc = bool(edited.iloc[i].get("Discontinued", False))
+                    old_disc = bool(disp.iloc[i].get("Discontinued", False))
+                    if new_disc != old_disc:
+                        repo.catalog_set_discontinued(int(res.iloc[i]["ItemID"]), new_disc)
                     if changes:
                         if repo.update_catalog_item(int(res.iloc[i]["ItemID"]), changes):
                             n += 1

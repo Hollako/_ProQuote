@@ -288,6 +288,7 @@ CREATE TABLE IF NOT EXISTS items_catalog (
     unitcostusd DOUBLE PRECISION, defaultupriceusd DOUBLE PRECISION,
     defaultupricesar DOUBLE PRECISION, priceupdatedat TEXT DEFAULT '2025-01-01',
     timesquoted INTEGER DEFAULT 0, lastseenfile TEXT, lastseenat TEXT,
+    discontinued INTEGER DEFAULT 0,
     UNIQUE (brand, model, description)
 );
 
@@ -472,6 +473,24 @@ def connect(database_url: str, actor: dict | None = None) -> PostgresConnection:
     return PostgresConnection(database_url, actor)
 
 
+# Additive column migrations for existing databases (never drop or rename).
+_COLUMN_MIGRATIONS = [
+    "ALTER TABLE items_catalog ADD COLUMN IF NOT EXISTS discontinued INTEGER DEFAULT 0",
+]
+
+
+def _apply_column_migrations(conn) -> None:
+    conn.execute("SET lock_timeout = '5s'")
+    for stmt in _COLUMN_MIGRATIONS:
+        try:
+            conn.execute(stmt)
+            conn.commit()
+        except Exception:
+            conn.rollback()
+    conn.execute("SET lock_timeout = '0'")
+    conn.commit()
+
+
 def init_db(database_url: str, actor: dict | None = None) -> PostgresConnection:
     conn = connect(database_url, actor)
     if database_url in _SCHEMA_READY:
@@ -486,6 +505,8 @@ def init_db(database_url: str, actor: dict | None = None) -> PostgresConnection:
                 if not schema_exists:
                     conn.executescript(POSTGRES_SCHEMA)
                     conn.commit()
+                else:
+                    _apply_column_migrations(conn)
                 _SCHEMA_READY.add(database_url)
         return conn
     except Exception:

@@ -686,26 +686,30 @@ def _conn():
 
 # ---------- Catalogue (Workflow 2 type-ahead) ----------
 
-def search_catalog(term: str, limit: int = 25) -> pd.DataFrame:
-    """Type-ahead over Model or Description. Empty term -> most-quoted items."""
+def search_catalog(term: str, limit: int = 25, show_discontinued: bool = False) -> pd.DataFrame:
+    """Type-ahead over Model or Description. Empty term -> most-quoted items.
+    By default excludes discontinued items (used by BoQ search)."""
+    disc_filter = "" if show_discontinued else " AND IFNULL(Discontinued,0)=0"
     with _conn() as c:
         if term and term.strip():
             like = f"%{term.strip()}%"
             rows = c.execute(
-                """SELECT ItemID,Brand,Model,Description,ListPriceUSD,ExUnitCostUSD,Currency,
+                f"""SELECT ItemID,Brand,Model,Description,ListPriceUSD,ExUnitCostUSD,Currency,
                           ShippingPercent,UnitCostUSD,DefaultUPriceUSD,DefaultUPriceSAR,
-                          PriceUpdatedAt,TimesQuoted
+                          PriceUpdatedAt,TimesQuoted,IFNULL(Discontinued,0) Discontinued
                    FROM Items_Catalog
-                   WHERE Model LIKE ? OR Description LIKE ? OR Brand LIKE ?
+                   WHERE (Model LIKE ? OR Description LIKE ? OR Brand LIKE ?){disc_filter}
                    ORDER BY TimesQuoted DESC LIMIT ?""",
                 (like, like, like, limit),
             ).fetchall()
         else:
             rows = c.execute(
-                """SELECT ItemID,Brand,Model,Description,ListPriceUSD,ExUnitCostUSD,Currency,
+                f"""SELECT ItemID,Brand,Model,Description,ListPriceUSD,ExUnitCostUSD,Currency,
                           ShippingPercent,UnitCostUSD,DefaultUPriceUSD,DefaultUPriceSAR,
-                          PriceUpdatedAt,TimesQuoted
-                   FROM Items_Catalog ORDER BY TimesQuoted DESC LIMIT ?""",
+                          PriceUpdatedAt,TimesQuoted,IFNULL(Discontinued,0) Discontinued
+                   FROM Items_Catalog
+                   WHERE 1=1{disc_filter}
+                   ORDER BY TimesQuoted DESC LIMIT ?""",
                 (limit,),
             ).fetchall()
     return pd.DataFrame([dict(r) for r in rows])
@@ -811,6 +815,14 @@ def add_catalog_item(brand, model, description, list_price=None, ex_cost=None,
         return item_id
 
 
+def catalog_set_discontinued(item_id: int, discontinued: bool) -> None:
+    """Mark or unmark a catalogue item as discontinued."""
+    with _conn() as c:
+        c.execute("UPDATE Items_Catalog SET Discontinued=? WHERE ItemID=?",
+                  (1 if discontinued else 0, int(item_id)))
+        c.commit()
+
+
 def delete_catalog_items(ids) -> int:
     """Delete catalogue items; unlinks them from any offer lines first (lines keep
     their own data, just lose the catalogue reference)."""
@@ -828,7 +840,7 @@ def delete_catalog_items(ids) -> int:
 # Columns carried in a catalogue backup / restore file (ItemID is regenerated).
 CATALOG_BACKUP_COLS = ["Brand", "Model", "Description", "ListPriceUSD", "ExUnitCostUSD",
                        "Currency", "ShippingPercent", "UnitCostUSD", "DefaultUPriceUSD",
-                       "DefaultUPriceSAR", "PriceUpdatedAt", "TimesQuoted"]
+                       "DefaultUPriceSAR", "PriceUpdatedAt", "TimesQuoted", "Discontinued"]
 
 
 def catalog_all() -> pd.DataFrame:
@@ -1159,6 +1171,15 @@ def offer_grand_total(project_id: int) -> float:
     return offer_grand_totals([project_id]).get(int(project_id), 0.0)
 
 
+def _fstr(v) -> str:
+    """Safe string from a data_editor cell — treats None and NaN as empty."""
+    if v is None:
+        return ""
+    if isinstance(v, float) and v != v:   # NaN check (NaN is the only value != itself)
+        return ""
+    return str(v).strip()
+
+
 def get_finance(project_id: int) -> tuple[list[dict], list[dict]]:
     """Return (payments, purchases) rows stored for an offer."""
     with _conn() as c:
@@ -1168,7 +1189,10 @@ def get_finance(project_id: int) -> tuple[list[dict], list[dict]]:
         purs = [dict(r) for r in c.execute(
             "SELECT Description,AmountSAR,PORef FROM Finance_Purchases "
             "WHERE ProjectID=? ORDER BY RowOrder", (project_id,))]
-    return pays, purs
+    # Strip rows that were saved as NaN artifacts (description literally "nan", zero amount)
+    def _clean(rows, ref_key):
+        return [r for r in rows if not (r["Description"] in ("nan", "None") and r["AmountSAR"] == 0)]
+    return _clean(pays, "InvoiceNo"), _clean(purs, "PORef")
 
 
 def save_finance(project_id: int, payments: list[dict], purchases: list[dict]) -> None:
@@ -1178,9 +1202,9 @@ def save_finance(project_id: int, payments: list[dict], purchases: list[dict]) -
         c.execute("DELETE FROM Finance_Purchases WHERE ProjectID=?", (project_id,))
         order = 0
         for r in payments:
-            desc = str(r.get("Description") or "").strip()
+            desc = _fstr(r.get("Description"))
             amt = calc._num(r.get("Amount (SAR)"))
-            inv = str(r.get("Invoice #") or "").strip()
+            inv = _fstr(r.get("Invoice #"))
             if not desc and amt == 0 and not inv:
                 continue
             c.execute("INSERT INTO Finance_Payments(ProjectID,RowOrder,Description,AmountSAR,InvoiceNo)"
@@ -1188,9 +1212,9 @@ def save_finance(project_id: int, payments: list[dict], purchases: list[dict]) -
             order += 1
         order = 0
         for r in purchases:
-            desc = str(r.get("Description") or "").strip()
+            desc = _fstr(r.get("Description"))
             amt = calc._num(r.get("Cost (SAR)"))
-            po = str(r.get("PO #") or "").strip()
+            po = _fstr(r.get("PO #"))
             if not desc and amt == 0 and not po:
                 continue
             c.execute("INSERT INTO Finance_Purchases(ProjectID,RowOrder,Description,AmountSAR,PORef)"

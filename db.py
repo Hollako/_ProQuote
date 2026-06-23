@@ -419,6 +419,7 @@ MIGRATIONS = {
         "ShippingPercent": "REAL",
         "Currency": "TEXT DEFAULT 'USD'",
         "PriceUpdatedAt": "TEXT DEFAULT '2025-01-01'",
+        "Discontinued": "INTEGER DEFAULT 0",
     },
 }
 
