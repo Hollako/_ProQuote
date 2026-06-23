@@ -60,9 +60,10 @@ DEFAULT_ROLE_PERMS = {
 # ---------- configurable roles (DB-backed matrix) ----------
 
 def _seed_role(c, role) -> None:
-    c.execute("INSERT OR IGNORE INTO Roles(Role) VALUES(?)", (role,))
+    c.execute("INSERT INTO Roles(Role) VALUES(?) ON CONFLICT DO NOTHING", (role,))
     for p in DEFAULT_ROLE_PERMS.get(role, set()):
-        c.execute("INSERT OR IGNORE INTO RolePerms(Role,Permission) VALUES(?,?)", (role, p))
+        c.execute("INSERT INTO RolePerms(Role,Permission) VALUES(?,?) ON CONFLICT DO NOTHING",
+                  (role, p))
 
 
 def ensure_roles_seeded() -> None:
@@ -84,7 +85,9 @@ def ensure_roles_seeded() -> None:
                 continue
             if not first_run:
                 _seed_role(c, role)
-            c.execute("INSERT OR REPLACE INTO Settings(key,value) VALUES(?,?)", (flag, "1"))
+            c.execute(
+                "INSERT INTO Settings(key,value) VALUES(?,?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (flag, "1"))
         for permission, roles in _LATER_PERMISSION_GRANTS.items():
             flag = f"seeded_permission::{permission}"
             if c.execute("SELECT 1 FROM Settings WHERE key=?", (flag,)).fetchone():
@@ -92,10 +95,13 @@ def ensure_roles_seeded() -> None:
             for role in roles:
                 if c.execute("SELECT 1 FROM Roles WHERE Role=?", (role,)).fetchone():
                     c.execute(
-                        "INSERT OR IGNORE INTO RolePerms(Role,Permission) VALUES(?,?)",
+                        "INSERT INTO RolePerms(Role,Permission) VALUES(?,?) "
+                        "ON CONFLICT DO NOTHING",
                         (role, permission),
                     )
-            c.execute("INSERT OR REPLACE INTO Settings(key,value) VALUES(?,?)", (flag, "1"))
+            c.execute(
+                "INSERT INTO Settings(key,value) VALUES(?,?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (flag, "1"))
         c.commit()
 
 
@@ -126,7 +132,8 @@ def set_role_perms(role: str, perms) -> None:
     with dbmod.connect() as c:
         c.execute("DELETE FROM RolePerms WHERE Role=?", (role,))
         for p in keep:
-            c.execute("INSERT OR IGNORE INTO RolePerms(Role,Permission) VALUES(?,?)", (role, p))
+            c.execute("INSERT INTO RolePerms(Role,Permission) VALUES(?,?) "
+                      "ON CONFLICT DO NOTHING", (role, p))
         c.commit()
 
 
@@ -140,7 +147,8 @@ def add_role(name: str, perms=None) -> bool:
         c.execute("INSERT INTO Roles(Role) VALUES(?)", (name,))
         for p in (perms if perms is not None else {"load"}):
             if p in ALL_PERMS:
-                c.execute("INSERT OR IGNORE INTO RolePerms(Role,Permission) VALUES(?,?)", (name, p))
+                c.execute("INSERT INTO RolePerms(Role,Permission) VALUES(?,?) "
+                          "ON CONFLICT DO NOTHING", (name, p))
         c.commit()
     return True
 
@@ -228,10 +236,11 @@ def create_user(username: str, password: str, display_name: str = "", role: str 
             return None
         cur = c.execute(
             "INSERT INTO Users(Username,DisplayName,PasswordHash,Role,Active,CreatedAt) "
-            "VALUES(?,?,?,?,1,?)",
+            "VALUES(?,?,?,?,1,?) RETURNING UserID",
             (username, (display_name or "").strip() or username, _hash(password), role, now))
+        user_id = cur.fetchone()["UserID"]
         c.commit()
-        return cur.lastrowid
+        return user_id
 
 
 def verify_login(username: str, password: str):

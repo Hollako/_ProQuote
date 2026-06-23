@@ -3,7 +3,7 @@ setlocal
 title ProQuote (leave this window open)
 cd /d "%~dp0"
 
-set "COMPANY_DIR=%LocalAppData%\ProQuoteData\default"
+set "COMPANY_DIR=%LocalAppData%\ProQuoteData\company-a"
 set "PORT=8501"
 if not exist "%COMPANY_DIR%" mkdir "%COMPANY_DIR%"
 set "BOQ_DATA_DIR=%COMPANY_DIR%"

@@ -611,7 +611,7 @@ def project_cleanup_values(field_label: str) -> list[dict]:
             f"SELECT TRIM(COALESCE({column},'')) AS Value, COUNT(*) AS OfferCount "
             f"FROM Projects_Master WHERE TRIM(COALESCE({column},'')) <> '' "
             f"GROUP BY TRIM(COALESCE({column},'')) "
-            f"ORDER BY Value COLLATE NOCASE"
+            f"ORDER BY LOWER(TRIM(COALESCE({column},'')))"
         ).fetchall()
     return [dict(r) for r in rows]
 
@@ -799,15 +799,16 @@ def add_catalog_item(brand, model, description, list_price=None, ex_cost=None,
             return None
         cur = c.execute(
             """INSERT INTO Items_Catalog
-                 (Description,Brand,Model,ListPriceUSD,ExUnitCostUSD,Currency,ShippingPercent,
-                  UnitCostUSD,DefaultUPriceUSD,DefaultUPriceSAR,PriceUpdatedAt,TimesQuoted,
-                  LastSeenFile,LastSeenAt)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,0,?,?)""",
+                (Description,Brand,Model,ListPriceUSD,ExUnitCostUSD,Currency,ShippingPercent,
+                   UnitCostUSD,DefaultUPriceUSD,DefaultUPriceSAR,PriceUpdatedAt,TimesQuoted,
+                   LastSeenFile,LastSeenAt)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,0,?,?) RETURNING ItemID""",
             (description, brand, model, list_price, ex_cost, currency,
              ship, unit_cost,
              uprice_usd, uprice_sar, dt.date.today().isoformat(), "app://catalog-add", now))
+        item_id = cur.fetchone()["ItemID"]
         c.commit()
-        return cur.lastrowid
+        return item_id
 
 
 def delete_catalog_items(ids) -> int:
@@ -861,10 +862,10 @@ def replace_catalog(df: pd.DataFrame) -> int:
         c.execute("UPDATE Project_BoQ_Lines SET ItemID=NULL")
         c.execute("DELETE FROM Items_Catalog")
         c.executemany(
-            """INSERT OR IGNORE INTO Items_Catalog
+            """INSERT INTO Items_Catalog
                  (Description,Brand,Model,ListPriceUSD,ExUnitCostUSD,Currency,ShippingPercent,
-                  UnitCostUSD,DefaultUPriceUSD,DefaultUPriceSAR,PriceUpdatedAt,TimesQuoted,LastSeenAt)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""", recs)
+                   UnitCostUSD,DefaultUPriceUSD,DefaultUPriceSAR,PriceUpdatedAt,TimesQuoted,LastSeenAt)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT DO NOTHING""", recs)
         n = c.execute("SELECT COUNT(*) FROM Items_Catalog").fetchone()[0]
         c.commit()
     return n
@@ -1064,7 +1065,8 @@ def delete_projects(ids: list[int]) -> int:
 def list_systems(project_id: int) -> list[str]:
     with _conn() as c:
         rows = c.execute(
-            "SELECT DISTINCT SheetName FROM Project_Sheets WHERE ProjectID=? ORDER BY SheetID",
+            "SELECT SheetName, MIN(SheetID) AS SortID FROM Project_Sheets "
+            "WHERE ProjectID=? GROUP BY SheetName ORDER BY SortID",
             (project_id,),
         ).fetchall()
     return [r["SheetName"] for r in rows]
@@ -1311,8 +1313,8 @@ def save_offer(name, client, contact, offer_no, system_suffix, grid: pd.DataFram
                  (ProjectName,ClientName,ContactName,ContactPhone,
                   Contractor,Region,SalesPerson,PresalesEngineer,ProjectManager,
                    OfferNo,CreationDate,UpdatedDate,DiscountAmount,CommissionAmount,CommissionPercent,CommissionMode,ConversionFactor,SourceFile,IngestedAt,
-                   RevisionNo,BaseName,OfferTerms,ProjectSheetInfo,OptionLabel)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    RevisionNo,BaseName,OfferTerms,ProjectSheetInfo,OptionLabel)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) RETURNING ProjectID""",
             (name, client, contact, _str(phone), _str(contractor), _str(region),
              sales_person, presales_engineer, project_manager, offer_no,
               today, today, discount_sar, commission_sar, commission_percent, commission_mode,
@@ -1320,7 +1322,7 @@ def save_offer(name, client, contact, offer_no, system_suffix, grid: pd.DataFram
              revision_no, base,
              terms_json, ps_json, option_label or ""),
         )
-        pid = cur.lastrowid
+        pid = cur.fetchone()["ProjectID"]
         _write_sheet_and_lines(c, pid, system_suffix, discount_sar, factors, grid)
         c.commit()
     return pid
@@ -1332,10 +1334,10 @@ def _write_sheet_and_lines(c, pid, system_suffix, discount_sar, factors, grid) -
     scur = c.execute(
         """INSERT INTO Project_Sheets
              (ProjectID,SheetName,SystemSuffix,DiscountAmount,Factor1,Factor2,Factor3)
-           VALUES (?,?,?,?,?,?,?)""",
+           VALUES (?,?,?,?,?,?,?) RETURNING SheetID""",
         (pid, f"BOQ {system_suffix}", system_suffix, discount_sar, *factors),
     )
-    sid = scur.lastrowid
+    sid = scur.fetchone()["SheetID"]
     discount_rows = []
     item_rows = []
     for order, (_, r) in enumerate(grid.iterrows(), 1):

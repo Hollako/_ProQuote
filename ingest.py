@@ -441,14 +441,14 @@ def upsert_item(conn, ln, src_file, now):
         return iid
     cur = conn.execute(
         """INSERT INTO Items_Catalog
-             (Description,Brand,Model,ListPriceUSD,ExUnitCostUSD,ShippingPercent,UnitCostUSD,
-              DefaultUPriceUSD,DefaultUPriceSAR,PriceUpdatedAt,TimesQuoted,LastSeenFile,LastSeenAt)
-           VALUES (?,?,?,?,?,?,?,?,?,?,1,?,?)""",
+              (Description,Brand,Model,ListPriceUSD,ExUnitCostUSD,ShippingPercent,UnitCostUSD,
+               DefaultUPriceUSD,DefaultUPriceSAR,PriceUpdatedAt,TimesQuoted,LastSeenFile,LastSeenAt)
+            VALUES (?,?,?,?,?,?,?,?,?,?,1,?,?) RETURNING ItemID""",
         (ln.get("description"), ln.get("brand"), ln.get("model"), ln.get("list_price"),
          ln.get("ex_unit_cost"), ln.get("shipping_percent"), ln.get("unit_cost"), ln.get("u_price"),
          ln.get("u_price_sar"), repo.CATALOG_INITIAL_PRICE_DATE, src_file, now),
     )
-    return cur.lastrowid
+    return cur.fetchone()["ItemID"]
 
 
 def ingest_file(conn, path, stats):
@@ -517,13 +517,13 @@ def ingest_file(conn, path, stats):
     cur = conn.execute(
         """INSERT INTO Projects_Master
              (ProjectName,ClientName,ContactName,ContactPhone,SalesPerson,OfferNo,
-              CreationDate,UpdatedDate,RevisionNo,BaseName,SourceFile,IngestedAt,OfferTerms)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+               CreationDate,UpdatedDate,RevisionNo,BaseName,SourceFile,IngestedAt,OfferTerms)
+             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?) RETURNING ProjectID""",
         (project_name, client, _s(qmeta.get("contact")), _s(qmeta.get("phone")),
           _s(qmeta.get("sales")), offer_no, cdate, updated_date, revno or 0, base_name_val,
          path, now, terms_json),
     )
-    pid = cur.lastrowid
+    pid = cur.fetchone()["ProjectID"]
     primary_discount = None
     primary_factor = None
 
@@ -537,10 +537,10 @@ def ingest_file(conn, path, stats):
         scur = conn.execute(
             """INSERT INTO Project_Sheets
                  (ProjectID,SheetName,SystemSuffix,DiscountAmount,Factor1,Factor2,Factor3,SubtotalSAR)
-               VALUES (?,?,?,?,?,?,?,?)""",
+               VALUES (?,?,?,?,?,?,?,?) RETURNING SheetID""",
             (pid, sheet, suffix, meta["discount"], f[0], f[1], f[2], meta.get("subtotal_sar")),
         )
-        sid = scur.lastrowid
+        sid = scur.fetchone()["SheetID"]
         if primary_discount is None:
             primary_discount = meta["discount"]
             primary_factor = f[0]

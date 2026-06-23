@@ -1,13 +1,10 @@
-"""
-ProQuote System - SQLite schema & connection layer.
-
-Single-file relational database for the centralized Bill of Quantities engine.
-All money is stored exactly as found in the source sheets (no rounding on ingest).
-"""
+"""ProQuote database layer with SQLite fallback and PostgreSQL production support."""
 import os
 import math
 import sqlite3
 import contextvars
+import datetime as dt
+import mimetypes
 
 # The database + assets live in a per-company DATA DIRECTORY. Set the env var
 # BOQ_DATA_DIR to give each company its own DB + logo/banner (Model A: one shared
@@ -19,6 +16,14 @@ ASSETS_DIR = os.path.join(DATA_DIR, "assets")
 os.makedirs(DATA_DIR, exist_ok=True)
 os.makedirs(ASSETS_DIR, exist_ok=True)
 DB_PATH = os.path.join(DATA_DIR, "proquote.db")
+
+
+def database_url() -> str:
+    return os.environ.get("DATABASE_URL", "").strip()
+
+
+def is_postgres() -> bool:
+    return database_url().lower().startswith(("postgres://", "postgresql://"))
 
 if "_AUDIT_ACTOR" not in globals():
     _AUDIT_ACTOR = contextvars.ContextVar(
@@ -88,6 +93,82 @@ def footer_middle_path() -> str:
 def footer_right_path() -> str:
     """Path to this company's right footer section image (PNG)."""
     return os.path.join(ASSETS_DIR, "footer_right.png")
+
+
+def _asset_key(path: str) -> str:
+    return os.path.relpath(os.path.abspath(path), ASSETS_DIR).replace("\\", "/")
+
+
+def save_asset(path: str, content: bytes, mime_type: str | None = None) -> None:
+    """Persist an app branding asset locally and, under PostgreSQL, in the database."""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "wb") as out:
+        out.write(content)
+    if is_postgres():
+        key = _asset_key(path)
+        with connect() as conn:
+            conn.execute(
+                "INSERT INTO App_Assets(AssetKey,FileName,MimeType,Content,UpdatedAt,Deleted) "
+                "VALUES(?,?,?,?,?,0) ON CONFLICT(AssetKey) DO UPDATE SET "
+                "FileName=excluded.FileName,MimeType=excluded.MimeType,Content=excluded.Content," 
+                "UpdatedAt=excluded.UpdatedAt,Deleted=0",
+                (key, os.path.basename(path), mime_type or mimetypes.guess_type(path)[0]
+                 or "application/octet-stream", bytes(content),
+                 dt.datetime.now().isoformat(timespec="seconds")),
+            )
+            conn.commit()
+
+
+def delete_asset(path: str) -> None:
+    """Remove an asset and persist the deletion across cloud container restarts."""
+    try:
+        os.remove(path)
+    except FileNotFoundError:
+        pass
+    if is_postgres():
+        key = _asset_key(path)
+        with connect() as conn:
+            conn.execute(
+                "INSERT INTO App_Assets(AssetKey,FileName,MimeType,Content,UpdatedAt,Deleted) "
+                "VALUES(?,?,?,?,?,1) ON CONFLICT(AssetKey) DO UPDATE SET "
+                "Content=excluded.Content,UpdatedAt=excluded.UpdatedAt,Deleted=1",
+                (key, os.path.basename(path), mimetypes.guess_type(path)[0]
+                 or "application/octet-stream", b"",
+                 dt.datetime.now().isoformat(timespec="seconds")),
+            )
+            conn.commit()
+
+
+def _sync_postgres_assets(conn) -> None:
+    rows = conn.execute(
+        "SELECT AssetKey,Content,Deleted FROM App_Assets ORDER BY AssetKey"
+    ).fetchall()
+    if not rows:
+        for root, _dirs, files in os.walk(ASSETS_DIR):
+            for filename in files:
+                path = os.path.join(root, filename)
+                with open(path, "rb") as src:
+                    content = src.read()
+                key = _asset_key(path)
+                conn.execute(
+                    "INSERT INTO App_Assets(AssetKey,FileName,MimeType,Content,UpdatedAt,Deleted) "
+                    "VALUES(?,?,?,?,?,0) ON CONFLICT(AssetKey) DO NOTHING",
+                    (key, filename, mimetypes.guess_type(path)[0] or "application/octet-stream",
+                     content, dt.datetime.now().isoformat(timespec="seconds")),
+                )
+        conn.commit()
+        return
+    for row in rows:
+        path = os.path.join(ASSETS_DIR, str(row["AssetKey"]).replace("/", os.sep))
+        if row["Deleted"]:
+            try:
+                os.remove(path)
+            except FileNotFoundError:
+                pass
+            continue
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "wb") as out:
+            out.write(bytes(row["Content"]))
 
 SCHEMA = r"""
 PRAGMA foreign_keys = ON;
@@ -273,7 +354,7 @@ CREATE INDEX IF NOT EXISTS idx_audit_entity ON Audit_Log(EntityType, EntityID, E
 """
 
 
-def connect(db_path: str = DB_PATH) -> sqlite3.Connection:
+def connect_sqlite(db_path: str = DB_PATH) -> sqlite3.Connection:
     # timeout = how long a blocked writer waits for the lock before erroring.
     conn = sqlite3.connect(db_path, timeout=30)
     conn.row_factory = sqlite3.Row
@@ -287,6 +368,14 @@ def connect(db_path: str = DB_PATH) -> sqlite3.Connection:
         "audit_display_name", 0, lambda: _AUDIT_ACTOR.get().get("display_name")
     )
     return conn
+
+
+def connect(db_path: str = DB_PATH):
+    if is_postgres():
+        import db_postgres
+
+        return db_postgres.connect(database_url(), get_audit_actor())
+    return connect_sqlite(db_path)
 
 
 # Columns added after the first release - applied to pre-existing databases.
@@ -585,7 +674,13 @@ def _backfill_imported_margins(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
-def init_db(db_path: str = DB_PATH) -> sqlite3.Connection:
+def init_db(db_path: str = DB_PATH):
+    if is_postgres():
+        import db_postgres
+
+        conn = db_postgres.init_db(database_url(), get_audit_actor())
+        _sync_postgres_assets(conn)
+        return conn
     conn = connect(db_path)
     conn.executescript(SCHEMA)
     _migrate(conn)
@@ -601,9 +696,16 @@ def init_db(db_path: str = DB_PATH) -> sqlite3.Connection:
 
 if __name__ == "__main__":
     c = init_db()
-    print(f"Initialized schema at: {DB_PATH}")
-    for (name,) in c.execute(
-        "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"
-    ):
+    if is_postgres():
+        print("Initialized PostgreSQL schema.")
+        rows = c.execute(
+            "SELECT table_name AS name FROM information_schema.tables "
+            "WHERE table_schema='public' ORDER BY table_name"
+        )
+    else:
+        print(f"Initialized schema at: {DB_PATH}")
+        rows = c.execute("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
+    for row in rows:
+        name = row["name"]
         print("  table:", name)
     c.close()

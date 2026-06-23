@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import datetime as dt
 import pandas as pd
 
 import db
@@ -34,16 +35,18 @@ def record_event(action: str, entity_type: str, entity_id="", summary="",
             """INSERT INTO Audit_Log
                    (EventAt,UserID,Username,DisplayName,Action,EntityType,EntityID,
                     Summary,OldValues,NewValues)
-               VALUES (strftime('%Y-%m-%dT%H:%M:%S','now','localtime'),?,?,?,?,?,?,?,?,?)""",
+               VALUES (?,?,?,?,?,?,?,?,?,?) RETURNING AuditID""",
             (
-                actor.get("user_id"), actor.get("username"), actor.get("display_name"),
+                dt.datetime.now().isoformat(timespec="seconds"), actor.get("user_id"),
+                actor.get("username"), actor.get("display_name"),
                 str(action or "EVENT").upper(), entity_type, str(entity_id or ""), summary,
                 json.dumps(old_values, default=str) if old_values is not None else None,
                 json.dumps(new_values, default=str) if new_values is not None else None,
             ),
         )
+        audit_id = cur.fetchone()["AuditID"]
         conn.commit()
-        return int(cur.lastrowid)
+        return int(audit_id)
 
 
 def filter_options() -> dict:

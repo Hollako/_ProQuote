@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import os
 import re
+import json
 import shutil
 import sqlite3
 import tempfile
@@ -11,6 +12,7 @@ from datetime import datetime
 from pathlib import Path
 
 import db
+import db_transfer
 
 
 BACKUP_DIR = os.path.join(db.DATA_DIR, "backups")
@@ -56,6 +58,8 @@ def _safe_zip_names(zf: zipfile.ZipFile) -> tuple[bool, str]:
 
 
 def _checkpoint_current_db() -> None:
+    if db.is_postgres():
+        return
     if not os.path.exists(db.DB_PATH):
         return
     conn = sqlite3.connect(db.DB_PATH, timeout=30)
@@ -92,6 +96,8 @@ def validate_database(path: str) -> tuple[bool, str]:
 
 
 def create_backup(label: str = "manual") -> str:
+    if db.is_postgres():
+        return create_profile_backup(label)
     os.makedirs(BACKUP_DIR, exist_ok=True)
     conn = db.init_db()
     conn.close()
@@ -123,6 +129,22 @@ def create_profile_backup(label: str = "manual") -> str:
     os.makedirs(BACKUP_DIR, exist_ok=True)
     conn = db.init_db()
     conn.close()
+    if db.is_postgres():
+        label = _safe_label(label)
+        dest = os.path.join(BACKUP_DIR, f"proquote-profile-{label}-{_timestamp()}.zip")
+        asset_paths = [
+            (str(path), f"assets/{path.relative_to(db.ASSETS_DIR).as_posix()}")
+            for path in _asset_files()
+        ]
+        with db.connect() as pg_conn:
+            db_transfer.write_portable_backup(dest, pg_conn, asset_paths)
+        ok, message = validate_profile_backup(dest)
+        if not ok:
+            try:
+                os.remove(dest)
+            finally:
+                raise RuntimeError(message)
+        return dest
     _checkpoint_current_db()
 
     label = _safe_label(label)
@@ -160,6 +182,8 @@ def create_profile_backup(label: str = "manual") -> str:
 
 
 def restore_from_bytes(uploaded_bytes: bytes) -> tuple[str, str]:
+    if db.is_postgres():
+        raise RuntimeError("PostgreSQL restores require a ProQuote profile ZIP backup.")
     if not uploaded_bytes:
         raise ValueError("Uploaded backup is empty.")
 
@@ -201,6 +225,15 @@ def validate_profile_backup(path: str) -> tuple[bool, str]:
             ok, message = _safe_zip_names(zf)
             if not ok:
                 return False, message
+            if db_transfer.PORTABLE_MANIFEST in zf.namelist():
+                try:
+                    manifest = db_transfer.read_portable_manifest(zf)
+                    for table, meta in manifest["tables"].items():
+                        if meta.get("entry") not in zf.namelist():
+                            return False, f"Portable backup is missing data for {table}."
+                    return True, "OK"
+                except (ValueError, KeyError, json.JSONDecodeError) as exc:
+                    return False, str(exc)
             if "proquote.db" not in zf.namelist():
                 return False, "Profile backup is missing proquote.db."
             with tempfile.TemporaryDirectory(prefix="proquote-validate-", dir=db.DATA_DIR) as tmp_dir:
@@ -226,6 +259,28 @@ def restore_profile_from_bytes(uploaded_bytes: bytes) -> tuple[str, str]:
         ok, message = validate_profile_backup(temp_path)
         if not ok:
             raise RuntimeError(message)
+
+        if db.is_postgres():
+            with zipfile.ZipFile(temp_path) as zf:
+                if db_transfer.PORTABLE_MANIFEST not in zf.namelist():
+                    raise RuntimeError(
+                        "PostgreSQL requires a portable ProQuote profile backup. "
+                        "Legacy SQLite profile ZIPs must be migrated with migrate_to_postgres.py."
+                    )
+            safety_backup = create_profile_backup("before-profile-restore")
+            db_transfer.restore_portable_backup(temp_path, db.database_url())
+            with zipfile.ZipFile(temp_path) as zf:
+                shutil.rmtree(db.ASSETS_DIR, ignore_errors=True)
+                os.makedirs(db.ASSETS_DIR, exist_ok=True)
+                for info in zf.infolist():
+                    name = info.filename.replace("\\", "/")
+                    if info.is_dir() or not name.startswith("assets/"):
+                        continue
+                    target = os.path.join(db.ASSETS_DIR, name[len("assets/"):])
+                    os.makedirs(os.path.dirname(target), exist_ok=True)
+                    with zf.open(info) as src, open(target, "wb") as out:
+                        shutil.copyfileobj(src, out)
+            return "PostgreSQL", safety_backup
 
         safety_backup = create_profile_backup("before-profile-restore") if os.path.exists(db.DB_PATH) else ""
         with zipfile.ZipFile(temp_path) as zf, tempfile.TemporaryDirectory(

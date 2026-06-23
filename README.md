@@ -1,6 +1,6 @@
 # ProQuote - BoQ pricing & quotation engine
 
-Python + SQLite system that ingests the historical project workbooks under
+Python + PostgreSQL/SQLite system that ingests the historical project workbooks under
 `J:\My Drive\1-Projects`, builds a deduplicated item catalogue, and powers a
 Streamlit interface for creating new offers and exporting client-facing
 Quotation PDFs (SAR, VAT, no internal costs).
@@ -8,7 +8,9 @@ Quotation PDFs (SAR, VAT, no internal costs).
 ## Layout
 | File | Role |
 |------|------|
-| `db.py` | SQLite schema + connection (`proquote.db`) |
+| `db.py` | Database selector: PostgreSQL via `DATABASE_URL`, otherwise local SQLite |
+| `db_postgres.py` | PostgreSQL schema, pooled connections, triggers and SQL compatibility |
+| `db_transfer.py` | Portable backups and SQLite-to-PostgreSQL migration |
 | `ingest.py` | Folder-wide Excel scanner → catalogue + project history |
 | `calc.py` | Pricing formulas (single source of truth) |
 | `repo.py` | Catalogue search + project load/save |
@@ -28,6 +30,40 @@ cd "J:\My Drive\1-Projects\_ProQuote"
 py -m streamlit run app.py
 ```
 Then open http://localhost:8501.
+
+## Persistent PostgreSQL deployment
+
+ProQuote uses PostgreSQL whenever `DATABASE_URL` is configured. Without it, the
+app retains the local `proquote.db` fallback. For Streamlit Community Cloud, add
+the **pooled** runtime URL in the app's Secrets panel:
+
+```toml
+DATABASE_URL = "postgresql://USER:PASSWORD@HOST-pooler/DATABASE?sslmode=require"
+POSTGRES_MIGRATION_URL = "postgresql://USER:PASSWORD@DIRECT-HOST/DATABASE?sslmode=require"
+```
+
+Never commit a real database URL or password to GitHub. For a local PostgreSQL
+run, set `DATABASE_URL` in the environment before starting Streamlit.
+
+### One-time SQLite migration
+
+1. Create an empty PostgreSQL database.
+2. Put its **direct** (non-pooled) URL in `POSTGRES_MIGRATION_URL` locally.
+3. Run:
+
+```powershell
+py migrate_to_postgres.py --sqlite "C:\path\to\proquote.db"
+```
+
+The migration preserves IDs, users/password hashes, roles, offers, sheets,
+catalogue items, line items, finance, audit history and branding assets. It
+verifies every table count and the aggregate offer value before reporting
+success. Use `--replace` only when intentionally replacing an already populated
+PostgreSQL target.
+
+For normal Streamlit traffic, switch `DATABASE_URL` back to the provider's
+**pooled** URL. PostgreSQL profile backups remain downloadable ZIP files and can
+be restored from Settings > Backup & Restore.
 
 ## Re-ingest when new projects are added
 `py ingest.py` is **idempotent** - it re-reads every workbook and refreshes

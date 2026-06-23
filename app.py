@@ -20,6 +20,17 @@ import datetime as dt
 import pandas as pd
 import streamlit as st
 
+# Streamlit Community Cloud stores production credentials in its Secrets panel.
+# Promote the database URL before importing the persistence modules so CLI/local
+# runs can use DATABASE_URL while cloud runs use the same backend transparently.
+if not os.environ.get("DATABASE_URL"):
+    try:
+        _secret_database_url = str(st.secrets.get("DATABASE_URL", "")).strip()
+        if _secret_database_url:
+            os.environ["DATABASE_URL"] = _secret_database_url
+    except Exception:
+        pass
+
 import calc
 import repo
 import pdf_export
@@ -3264,7 +3275,8 @@ def _render_login():
 
 # ----------------------------- UI -----------------------------
 if "db_init" not in st.session_state:
-    db.init_db()                       # create Users table + apply migrations
+    _init_conn = db.init_db()          # create tables + apply backend migrations
+    _init_conn.close()
     auth.ensure_roles_seeded()         # seed default roles/permissions on first run
     st.session_state.db_init = True
 
@@ -4495,12 +4507,11 @@ elif mode == "Settings":
             up_b = st.file_uploader("Upload / replace banner (PNG)", type=["png"], key="banner_up")
             bb1, bb2 = st.columns(2)
             if up_b is not None and bb1.button("Save banner", key="save_banner"):
-                with open(db.banner_path(), "wb") as f:
-                    f.write(up_b.getbuffer())
+                db.save_asset(db.banner_path(), bytes(up_b.getbuffer()), "image/png")
                 st.success("Banner updated. (Reload to see it in the header/sidebar.)")
                 st.rerun()
             if os.path.exists(db.banner_path()) and bb2.button("Remove banner", key="remove_banner"):
-                os.remove(db.banner_path())
+                db.delete_asset(db.banner_path())
                 st.success("Banner removed. PDF header sections will be used if configured.")
                 st.rerun()
         with lcol:
@@ -4511,8 +4522,7 @@ elif mode == "Settings":
                 st.info("No logo yet.")
             up_l = st.file_uploader("Upload / replace logo (PNG)", type=["png"], key="logo_up")
             if up_l is not None and st.button("Save logo", key="save_logo"):
-                with open(db.logo_path(), "wb") as f:
-                    f.write(up_l.getbuffer())
+                db.save_asset(db.logo_path(), bytes(up_l.getbuffer()), "image/png")
                 st.success("Logo updated.")
                 st.rerun()
         st.caption("Banner: wide and shallow PNG, about 1400x155 px. Logo: square transparent PNG works best.")
@@ -4548,12 +4558,11 @@ elif mode == "Settings":
                     key=upload_key,
                 )
                 if up is not None and st.button(f"Save {label.lower()} image", key=save_key):
-                    with open(path, "wb") as f:
-                        f.write(up.getbuffer())
+                    db.save_asset(path, bytes(up.getbuffer()), "image/png")
                     st.success(f"{label} header image updated.")
                     st.rerun()
                 if os.path.exists(path) and st.button(f"Remove {label.lower()} image", key=remove_key):
-                    os.remove(path)
+                    db.delete_asset(path)
                     st.success(f"{label} header image removed.")
                     st.rerun()
 
@@ -4578,12 +4587,11 @@ elif mode == "Settings":
             )
             ffu1, ffu2 = st.columns(2)
             if up_footer_full is not None and ffu1.button("Save full footer", key="save_footer_full"):
-                with open(db.footer_full_path(), "wb") as f:
-                    f.write(up_footer_full.getbuffer())
+                db.save_asset(db.footer_full_path(), bytes(up_footer_full.getbuffer()), "image/png")
                 st.success("Full footer image updated.")
                 st.rerun()
             if os.path.exists(db.footer_full_path()) and ffu2.button("Remove full footer", key="remove_footer_full"):
-                os.remove(db.footer_full_path())
+                db.delete_asset(db.footer_full_path())
                 st.success("Full footer image removed.")
                 st.rerun()
         with preview_col:
@@ -4608,12 +4616,11 @@ elif mode == "Settings":
                     key=upload_key,
                 )
                 if up is not None and st.button(f"Save {label.lower()} image", key=save_key):
-                    with open(path, "wb") as f:
-                        f.write(up.getbuffer())
+                    db.save_asset(path, bytes(up.getbuffer()), "image/png")
                     st.success(f"{label} footer image updated.")
                     st.rerun()
                 if os.path.exists(path) and st.button(f"Remove {label.lower()} image", key=remove_key):
-                    os.remove(path)
+                    db.delete_asset(path)
                     st.success(f"{label} footer image removed.")
                     st.rerun()
 
