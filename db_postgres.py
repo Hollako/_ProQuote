@@ -162,6 +162,11 @@ _SCHEMA_READY = set()
 _SCHEMA_LOCK = threading.Lock()
 
 
+def _configure_connection(conn) -> None:
+    """Keep read-only calls out of transactions so pool return is network-free."""
+    conn.autocommit = True
+
+
 def close_pool() -> None:
     global _POOL, _POOL_URL
     if _POOL is not None:
@@ -188,7 +193,7 @@ def _pool(database_url: str):
         ) from exc
     _POOL = ConnectionPool(
         conninfo=database_url,
-        min_size=1,
+        min_size=max(1, int(os.environ.get("PROQUOTE_DB_POOL_MIN_SIZE", "2"))),
         max_size=max(2, int(os.environ.get("PROQUOTE_DB_POOL_SIZE", "10"))),
         timeout=30,
         kwargs={
@@ -198,7 +203,7 @@ def _pool(database_url: str):
             "keepalives_interval": 10,
             "keepalives_count": 5,
         },
-        check=ConnectionPool.check_connection,
+        configure=_configure_connection,
         open=True,
     )
     _POOL_URL = database_url
@@ -207,56 +212,136 @@ def _pool(database_url: str):
 
 class PostgresConnection:
     def __init__(self, database_url: str, actor: dict | None = None):
-        import psycopg.errors as _pgerr
         self._database_url = database_url
-        actor = actor or {}
-        for _attempt in range(2):
-            try:
-                self._context = _pool(database_url).connection(timeout=30)
-                self._raw = self._context.__enter__()
-                self._closed = False
-                self._raw.execute(
-                    "SELECT set_config('proquote.user_id', %s, false), "
-                    "set_config('proquote.username', %s, false), "
-                    "set_config('proquote.display_name', %s, false)",
-                    (
-                        "" if actor.get("user_id") is None else str(actor.get("user_id")),
-                        str(actor.get("username") or "system"),
-                        str(actor.get("display_name") or actor.get("username") or "System"),
-                    ),
-                )
-                break
-            except (_pgerr.AdminShutdown, _pgerr.OperationalError, OSError):
-                if _attempt == 1:
-                    raise
-                # Neon compute woke up; pool had stale connections — retry once
-                _pool(database_url).check()
+        self._actor = actor or {}
+        self._closed = False
+        self._dirty = False
+        self._actor_ready = False
+        self._checkout()
+
+    def _checkout(self) -> None:
+        self._context = _pool(self._database_url).connection(timeout=30)
+        self._raw = self._context.__enter__()
+
+    @staticmethod
+    def _is_write(sql: str) -> bool:
+        clean = re.sub(r"^\s*(?:--[^\n]*\n|/\*.*?\*/\s*)*", "", sql, flags=re.S)
+        match = re.match(r"([A-Za-z]+)", clean)
+        keyword = match.group(1).upper() if match else ""
+        if keyword == "WITH":
+            return bool(re.search(r"\b(?:INSERT|UPDATE|DELETE|MERGE)\b", clean, flags=re.I))
+        return keyword not in {"SELECT", "SHOW", "EXPLAIN", "VALUES"}
+
+    def _begin_write(self) -> None:
+        if not self._dirty:
+            self._raw.autocommit = False
+            self._dirty = True
+        if self._actor_ready:
+            return
+        actor = self._actor
+        self._raw.execute(
+            "SELECT set_config('proquote.user_id', %s, true), "
+            "set_config('proquote.username', %s, true), "
+            "set_config('proquote.display_name', %s, true)",
+            (
+                "" if actor.get("user_id") is None else str(actor.get("user_id")),
+                str(actor.get("username") or "system"),
+                str(actor.get("display_name") or actor.get("username") or "System"),
+            ),
+        )
+        self._actor_ready = True
+
+    def _replace_failed_read_connection(self, exc) -> None:
+        """Discard one stale idle connection; the next attempt gets a fresh one."""
+        try:
+            self._context.__exit__(type(exc), exc, exc.__traceback__)
+        finally:
+            self._checkout()
 
     def execute(self, sql: str, params=None):
         converted = postgres_sql(sql)
         values = tuple(params or ())
-        cur = self._raw.execute(converted, values) if values else self._raw.execute(converted)
-        return CompatCursor(cur)
+        is_write = self._is_write(converted)
+        if is_write:
+            self._begin_write()
+        for attempt in range(2):
+            try:
+                cur = (self._raw.execute(converted, values)
+                       if values else self._raw.execute(converted))
+                return CompatCursor(cur)
+            except Exception as exc:
+                if is_write or attempt or self._dirty:
+                    raise
+                try:
+                    import psycopg.errors as pg_errors
+                    retryable = isinstance(
+                        exc, (pg_errors.AdminShutdown, pg_errors.OperationalError, OSError)
+                    )
+                except ImportError:
+                    retryable = isinstance(exc, OSError)
+                if not retryable:
+                    raise
+                self._replace_failed_read_connection(exc)
+
+    def query_many(self, statements):
+        """Run independent reads in one PostgreSQL pipeline/network round trip."""
+        prepared = []
+        for sql, params in statements:
+            converted = postgres_sql(sql)
+            if self._is_write(converted):
+                raise ValueError("query_many accepts read-only statements")
+            prepared.append((converted, tuple(params or ())))
+        cursors = []
+        with self._raw.pipeline():
+            for converted, values in prepared:
+                cursors.append(
+                    self._raw.execute(converted, values)
+                    if values else self._raw.execute(converted)
+                )
+        return [CompatCursor(cur) for cur in cursors]
+
+    def begin_transaction(self) -> None:
+        """Start an explicit transaction for pooled-connection maintenance work."""
+        self._begin_write()
+
+    def begin_bulk_write(self) -> None:
+        """Suppress row-by-row child audit/touch work for one offer transaction."""
+        self._begin_write()
+        self._raw.execute("SELECT set_config('proquote.bulk_write', '1', true)")
 
     def executemany(self, sql: str, params_seq):
+        self._begin_write()
         cur = self._raw.cursor()
         cur.executemany(postgres_sql(sql), params_seq)
         return CompatCursor(cur)
 
     def executescript(self, sql: str):
+        self._begin_write()
         cur = self._raw.execute(sql, prepare=False)
         return CompatCursor(cur)
 
     def commit(self):
+        if not self._dirty:
+            return
         self._raw.commit()
+        self._raw.autocommit = True
+        self._dirty = False
+        self._actor_ready = False
         _bump_write_epoch()
 
     def rollback(self):
+        if not self._dirty:
+            return
         self._raw.rollback()
+        self._raw.autocommit = True
+        self._dirty = False
+        self._actor_ready = False
 
     def close(self):
         if self._closed:
             return
+        if self._dirty:
+            self.commit()
         self._context.__exit__(None, None, None)
         self._closed = True
 
@@ -266,7 +351,9 @@ class PostgresConnection:
     def __exit__(self, exc_type, exc, tb):
         if self._closed:
             return False
-        self._context.__exit__(exc_type, exc, tb)
+        if self._dirty:
+            self.rollback() if exc_type else self.commit()
+        self._context.__exit__(None, None, None)
         self._closed = True
         return False
 
@@ -462,10 +549,14 @@ BEFORE UPDATE ON projects_master FOR EACH ROW EXECUTE FUNCTION proquote_master_u
 
 DROP TRIGGER IF EXISTS trg_project_sheets_touch ON project_sheets;
 CREATE TRIGGER trg_project_sheets_touch
-AFTER INSERT OR UPDATE OR DELETE ON project_sheets FOR EACH ROW EXECUTE FUNCTION proquote_touch_project();
+AFTER INSERT OR UPDATE OR DELETE ON project_sheets FOR EACH ROW
+WHEN (COALESCE(current_setting('proquote.bulk_write', true),'') <> '1')
+EXECUTE FUNCTION proquote_touch_project();
 DROP TRIGGER IF EXISTS trg_project_lines_touch ON project_boq_lines;
 CREATE TRIGGER trg_project_lines_touch
-AFTER INSERT OR UPDATE OR DELETE ON project_boq_lines FOR EACH ROW EXECUTE FUNCTION proquote_touch_project();
+AFTER INSERT OR UPDATE OR DELETE ON project_boq_lines FOR EACH ROW
+WHEN (COALESCE(current_setting('proquote.bulk_write', true),'') <> '1')
+EXECUTE FUNCTION proquote_touch_project();
 
 DO $$
 DECLARE table_name TEXT;
@@ -477,12 +568,43 @@ BEGIN
         EXECUTE format('DROP TRIGGER IF EXISTS audit_%s_row ON %I', table_name, table_name);
         EXECUTE format(
             'CREATE TRIGGER audit_%s_row AFTER INSERT OR UPDATE OR DELETE ON %I '
-            'FOR EACH ROW EXECUTE FUNCTION proquote_audit_row()', table_name, table_name
+            'FOR EACH ROW WHEN (COALESCE(current_setting(''proquote.bulk_write'', true),'''') <> ''1'') '
+            'EXECUTE FUNCTION proquote_audit_row()', table_name, table_name
         );
     END LOOP;
 END $$;
 """
 
+
+POSTGRES_PERFORMANCE_SCHEMA = r"""
+DROP TRIGGER IF EXISTS trg_project_sheets_touch ON project_sheets;
+CREATE TRIGGER trg_project_sheets_touch
+AFTER INSERT OR UPDATE OR DELETE ON project_sheets FOR EACH ROW
+WHEN (COALESCE(current_setting('proquote.bulk_write', true),'') <> '1')
+EXECUTE FUNCTION proquote_touch_project();
+
+DROP TRIGGER IF EXISTS trg_project_lines_touch ON project_boq_lines;
+CREATE TRIGGER trg_project_lines_touch
+AFTER INSERT OR UPDATE OR DELETE ON project_boq_lines FOR EACH ROW
+WHEN (COALESCE(current_setting('proquote.bulk_write', true),'') <> '1')
+EXECUTE FUNCTION proquote_touch_project();
+
+DO $$
+DECLARE table_name TEXT;
+BEGIN
+    FOREACH table_name IN ARRAY ARRAY[
+        'projects_master','project_sheets','project_boq_lines','items_catalog',
+        'finance_payments','finance_purchases','settings','users','roles','roleperms'
+    ] LOOP
+        EXECUTE format('DROP TRIGGER IF EXISTS audit_%s_row ON %I', table_name, table_name);
+        EXECUTE format(
+            'CREATE TRIGGER audit_%s_row AFTER INSERT OR UPDATE OR DELETE ON %I '
+            'FOR EACH ROW WHEN (COALESCE(current_setting(''proquote.bulk_write'', true),'''') <> ''1'') '
+            'EXECUTE FUNCTION proquote_audit_row()', table_name, table_name
+        );
+    END LOOP;
+END $$;
+"""
 
 def connect(database_url: str, actor: dict | None = None) -> PostgresConnection:
     return PostgresConnection(database_url, actor)
@@ -492,6 +614,36 @@ def connect(database_url: str, actor: dict | None = None) -> PostgresConnection:
 _COLUMN_MIGRATIONS = [
     "ALTER TABLE items_catalog ADD COLUMN IF NOT EXISTS discontinued INTEGER DEFAULT 0",
 ]
+
+
+def _apply_performance_migration(conn) -> None:
+    version_key = "schema::postgres_performance"
+    expected = "2"
+    current = conn.execute(
+        "SELECT value FROM Settings WHERE key=?", (version_key,)
+    ).fetchone()
+    if current and current["value"] == expected:
+        return
+
+    conn.begin_transaction()
+    try:
+        conn.execute("SELECT pg_advisory_xact_lock(hashtext('proquote_schema_migration'))")
+        current = conn.execute(
+            "SELECT value FROM Settings WHERE key=?", (version_key,)
+        ).fetchone()
+        if current and current["value"] == expected:
+            conn.commit()
+            return
+        conn.executescript(POSTGRES_PERFORMANCE_SCHEMA)
+        conn.execute(
+            "INSERT INTO Settings(key,value) VALUES(?,?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (version_key, expected),
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
 
 
 def _apply_column_migrations(conn) -> None:
@@ -504,6 +656,7 @@ def _apply_column_migrations(conn) -> None:
             conn.rollback()
     conn.execute("SET lock_timeout = '0'")
     conn.commit()
+    _apply_performance_migration(conn)
 
 
 def init_db(database_url: str, actor: dict | None = None) -> PostgresConnection:
@@ -520,8 +673,7 @@ def init_db(database_url: str, actor: dict | None = None) -> PostgresConnection:
                 if not schema_exists:
                     conn.executescript(POSTGRES_SCHEMA)
                     conn.commit()
-                else:
-                    _apply_column_migrations(conn)
+                _apply_column_migrations(conn)
                 _SCHEMA_READY.add(database_url)
         return conn
     except Exception:

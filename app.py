@@ -367,7 +367,9 @@ def _role_label(role) -> str:
 
 def _ps_enabled() -> bool:
     """Project Sheet (info section + Excel export) is on unless disabled in Settings."""
-    return repo.get_setting("project_sheet_enabled") != "0"
+    if "cached_ps_enabled" not in st.session_state:
+        st.session_state.cached_ps_enabled = repo.get_setting("project_sheet_enabled") != "0"
+    return st.session_state.cached_ps_enabled
 
 
 @st.fragment
@@ -1002,11 +1004,13 @@ def _approve_offer_dialog(project_id: int, offer_label: str):
 
 def render_editable_grid(state_key: str, editor_key: str, in_fragment: bool = False,
                          column_order=None):
-    """Full editable grid (all columns) with live recompute + one auto-rerun on change.
+    """Full editable grid (all columns) with live recompute.
 
-    in_fragment: when True the auto-rerun is scoped to the calling st.fragment, so a
-    cell edit refreshes only the grid area instead of re-running the whole page."""
-    grid = calc.recompute(st.session_state[state_key])
+    Pre-applies the pending delta before rendering so computed columns are correct in
+    the single auto-rerun that data_editor already fires — no second rerun needed."""
+    original_base = st.session_state[state_key].reset_index(drop=True)
+    n_base = len(original_base)
+
     colcfg = {c: st.column_config.NumberColumn(c, format="accounting") for c in MONEY_COLS}
     colcfg["Qty"] = st.column_config.NumberColumn("Qty", format="%d", min_value=0)
     colcfg["Cur"] = st.column_config.SelectboxColumn(
@@ -1025,16 +1029,52 @@ def render_editable_grid(state_key: str, editor_key: str, in_fragment: bool = Fa
         help="Multiplier on landed Unit Cost. U.Price $ = ⌈Unit Cost x Margin⌉. "
              "Set 0 to type U.Price $ manually.")
     order = column_order if column_order is not None else _builder_column_order(editor_key)
-    display_grid = grid[BUILDER_COLS] if not grid.empty else grid
 
-    # Read the delta BEFORE the data_editor processes it. When the delta contains
-    # added_rows or deleted_rows we reconstruct the new state manually from base + delta
-    # instead of using the data_editor return value, which would have the stale delta
-    # re-applied to the already-updated source, creating phantom duplicate rows.
-    _raw_delta = st.session_state.get(editor_key)
-    _delta = _raw_delta if isinstance(_raw_delta, dict) else {}
-    _structural = bool(_delta.get("added_rows") or _delta.get("deleted_rows"))
+    # Read the delta BEFORE data_editor processes it.
+    raw_delta = st.session_state.get(editor_key)
+    delta = raw_delta if isinstance(raw_delta, dict) else {}
+    _structural = bool(delta.get("added_rows") or delta.get("deleted_rows"))
 
+    if _structural:
+        # Structural change (add/delete row): reconstruct from base + delta, clear delta, rerun.
+        rec = original_base.copy()
+        for row_idx, changes in delta.get("edited_rows", {}).items():
+            idx = int(row_idx)
+            for col, val in changes.items():
+                if col in rec.columns and idx < len(rec):
+                    rec.at[idx, col] = val
+        for idx in sorted([int(i) for i in delta.get("deleted_rows", [])], reverse=True):
+            rec = rec.drop(index=idx, errors="ignore")
+        rec = rec.reset_index(drop=True)
+        for new_row in delta.get("added_rows", []):
+            blank = calc.blank_row()
+            blank.update({k: v for k, v in new_row.items() if k in blank})
+            rec = pd.concat([rec, pd.DataFrame([blank])], ignore_index=True)
+        new_grid = calc.recompute(rec)
+        st.session_state[state_key] = new_grid
+        st.session_state.pop(editor_key, None)
+        st.rerun(scope="fragment") if in_fragment else st.rerun()
+
+    # Pre-apply any pending cell edits to the base so the recomputed columns
+    # (Total SAR, U.Price etc.) are already correct when data_editor renders.
+    # Streamlit re-applies the same delta on top, which is idempotent for cell edits
+    # (absolute values, not deltas), so no second rerun is needed.
+    working = original_base.copy()
+    for row_idx, changes in delta.get("edited_rows", {}).items():
+        idx = int(row_idx)
+        for col, val in changes.items():
+            if col in working.columns and idx < len(working):
+                working.at[idx, col] = val
+    n = len(working)
+    working["LineType"] = ["discount" if str(d).strip().lower() == "discount" else "item"
+                           for d in working.get("Description", pd.Series([""] * n))]
+    working["_ItemID"] = [original_base["_ItemID"].iloc[i] if (i < n_base and "_ItemID" in original_base.columns)
+                          else None for i in range(n)]
+    working = calc.recompute(working)
+    # Store now so the Totals section rendered after this call sees the updated values.
+    st.session_state[state_key] = working
+
+    display_grid = working[BUILDER_COLS] if not working.empty else working
     edited = st.data_editor(
         display_grid,
         column_config=colcfg, disabled=[c for c in COMPUTED if c in BUILDER_COLS],
@@ -1043,48 +1083,16 @@ def render_editable_grid(state_key: str, editor_key: str, in_fragment: bool = Fa
         row_height=35, key=editor_key, hide_index=True,
     ).reset_index(drop=True)
 
-    base = st.session_state[state_key].reset_index(drop=True)
-
-    if _structural:
-        # Reconstruct correct state: apply delta fields to base directly.
-        rec = base.copy()
-        for row_idx, changes in _delta.get("edited_rows", {}).items():
-            idx = int(row_idx)
-            for col, val in changes.items():
-                if col in rec.columns and idx < len(rec):
-                    rec.at[idx, col] = val
-        for idx in sorted([int(i) for i in _delta.get("deleted_rows", [])], reverse=True):
-            rec = rec.drop(index=idx, errors="ignore")
-        rec = rec.reset_index(drop=True)
-        for new_row in _delta.get("added_rows", []):
-            blank = calc.blank_row()
-            blank.update({k: v for k, v in new_row.items() if k in blank})
-            rec = pd.concat([rec, pd.DataFrame([blank])], ignore_index=True)
-        new_grid = calc.recompute(rec)
-        st.session_state[state_key] = new_grid
-        st.session_state.pop(editor_key, None)   # clear stale delta before next render
-        st.rerun(scope="fragment") if in_fragment else st.rerun()
-
-    new_grid = edited.copy()
-    n = len(new_grid)
-    new_grid["LineType"] = ["discount" if str(d).strip().lower() == "discount" else "item"
-                            for d in new_grid.get("Description", pd.Series([""] * n))]
-    new_grid["_ItemID"] = [base["_ItemID"].iloc[i] if (i < len(base) and "_ItemID" in base.columns)
-                           else None for i in range(n)]
-    new_grid = calc.recompute(new_grid)
-    prev = calc.recompute(base)
-    drivers = [c for c in NUM_DRIVERS if c in new_grid.columns and c in prev.columns]
-    same_len = len(new_grid) == len(prev)
-    cur_changed = same_len and "Cur" in new_grid.columns and "Cur" in prev.columns and not (
-        new_grid["Cur"].astype(str).reset_index(drop=True)
-        .equals(prev["Cur"].astype(str).reset_index(drop=True)))
-    changed = (not same_len) or cur_changed or not (
-        new_grid[drivers].fillna(0).round(4).reset_index(drop=True)
-        .equals(prev[drivers].fillna(0).round(4).reset_index(drop=True)))
-    st.session_state[state_key] = new_grid
-    if changed:
-        st.rerun(scope="fragment") if in_fragment else st.rerun()
-    return new_grid
+    # Incorporate what data_editor actually returned (handles any edge-case divergence
+    # between our pre-apply and Streamlit's delta re-application; idempotent for normal edits).
+    n = len(edited)
+    edited["LineType"] = ["discount" if str(d).strip().lower() == "discount" else "item"
+                          for d in edited.get("Description", pd.Series([""] * n))]
+    edited["_ItemID"] = [original_base["_ItemID"].iloc[i] if (i < n_base and "_ItemID" in original_base.columns)
+                         else None for i in range(n)]
+    final_grid = calc.recompute(edited)
+    st.session_state[state_key] = final_grid
+    return final_grid
 
 
 @st.fragment
@@ -1092,7 +1100,10 @@ def _edit_panel(meta):
     # -------------------- EDIT: all columns -> new revision OR new option --------------------
     base = meta.get("BaseName") or repo.base_name(meta.get("ProjectName") or "Offer")
     src_rev = int(meta.get("RevisionNo") or 0)
-    nextrev = repo.next_revision(base)
+    _nrk = f"_nextrev_{base}"
+    if _nrk not in st.session_state:
+        st.session_state[_nrk] = repo.next_revision(base)
+    nextrev = st.session_state[_nrk]
     if "edit_terms" not in st.session_state:
         st.session_state.edit_terms = {**DEFAULT_TERMS, **repo.load_terms(meta)}
     if "edit_header" not in st.session_state:
@@ -1192,7 +1203,9 @@ def _edit_panel(meta):
     if _ps_enabled():
         project_sheet_info_form(edit_header_for_ps, "ed_ps")
         st.session_state.edit_project_sheet = edit_header_for_ps["project_sheet"]
-    catalogue_add("edit_grid", float(repo.get_setting("default_margin") or 1.6), "ed",
+    if "cached_default_margin" not in st.session_state:
+        st.session_state.cached_default_margin = float(repo.get_setting("default_margin") or 1.6)
+    catalogue_add("edit_grid", st.session_state.cached_default_margin, "ed",
                   st.session_state.get("edit_system", ""))
     col_pick, option_col, _ = st.columns([0.9, 2.0, 3.1], vertical_alignment="bottom")
     edit_column_order = _builder_column_order("edit_editor", host=col_pick, width="stretch")
@@ -1510,7 +1523,9 @@ def _new_project_editor():
     st.session_state.header = h
 
     # ---- Add items from catalogue ----
-    _dm = float(repo.get_setting("default_margin") or 1.6)   # default margin from Settings
+    if "cached_default_margin" not in st.session_state:
+        st.session_state.cached_default_margin = float(repo.get_setting("default_margin") or 1.6)
+    _dm = st.session_state.cached_default_margin
     catalogue_add("grid", _dm, "no", st.session_state.header["system"], show_clear=True)
 
     # ---- Editable grid (builder always shows costs) ----
@@ -1547,7 +1562,7 @@ def catalogue_add(state_key: str, default_margin: float, kp: str, default_system
     st.markdown("##### Add item from catalogue")
     term = st.text_input("Search Model / Description / Brand", key=f"{kp}_term",
                          placeholder="e.g. PDEG, keypad, Dynalite…").strip()
-    results = repo.search_catalog(term, limit=20) if term else pd.DataFrame()
+    results = _cached_search_catalog(term, 20, _db_cache_stamp()) if term else pd.DataFrame()
     if not results.empty:
         results = results.assign(_label=results.apply(
             lambda r: f"{r['Model']} - {str(r['Description'])[:48]} ({r['Brand']})  ·x{r['TimesQuoted']}", axis=1))
@@ -2634,9 +2649,12 @@ def _cached_project_grid(project_id: int, sheet_name: str | None, db_stamp):
     return repo.load_project_grid(project_id, sheet_name)
 
 
-@st.cache_data(show_spinner=False, max_entries=4)
-def _cached_project_index(db_stamp):
-    projects = repo.list_projects()
+@st.cache_data(show_spinner=False, max_entries=100)
+def _cached_search_catalog(term: str, limit: int, db_stamp):
+    return repo.search_catalog(term, limit=limit)
+
+
+def _build_project_index(projects):
     if projects.empty:
         return projects, []
 
@@ -2720,6 +2738,29 @@ def _cached_project_index(db_stamp):
         })
     fams.sort(key=lambda f: (f["updated_date"], f["created_date"]), reverse=True)
     return projects, fams
+
+
+@st.cache_data(show_spinner=False, max_entries=4)
+def _cached_project_index(db_stamp):
+    people = repo.project_people()
+    if people.empty:
+        people = pd.DataFrame([{
+            "SalesPerson": None, "PresalesEngineer": None, "ProjectManager": None
+        }])
+    return people, []
+
+
+@st.cache_data(show_spinner=False, max_entries=100)
+def _cached_project_search(name: str, offer: str, sales: tuple,
+                           presales: tuple, project_managers: tuple, db_stamp):
+    return _build_project_index(
+        repo.search_projects(name, offer, sales, presales, project_managers)
+    )
+
+
+@st.cache_data(show_spinner=False, max_entries=48)
+def _cached_project_bundle(project_id: int, family_project_ids: tuple, db_stamp):
+    return repo.load_project_bundle(project_id, family_project_ids)
 
 
 def _render_report_builder(company):
@@ -3561,6 +3602,10 @@ elif mode == PROJECT_WORKSPACE_LABEL:
             )
             st.stop()
 
+        projects, fams = _cached_project_search(
+            q_name, q_offer, tuple(q_sales), tuple(q_presales), tuple(q_pm),
+            _db_cache_stamp(),
+        )
         matches = [
             f for f in fams
             if (not q_name or q_name in f["name_search"])
@@ -3656,11 +3701,17 @@ elif mode == PROJECT_WORKSPACE_LABEL:
             st.session_state.view_pid = default_id
 
         # Revisions grouped first, then the options inside each revision.
-        st.markdown("**Revisions & options**")
-        widths = [0.35, 1.3, 1.65, 0.8, 0.8, 1.2, 0.45, 0.9, 0.8]
         shown_opts = shown.copy()
         shown_opts["_rev_sort"] = shown_opts["RevisionNo"].fillna(0).astype(int)
-        totals_by_pid = repo.offer_grand_totals(shown_opts["ProjectID"].tolist())
+        pid = int(st.session_state.view_pid)
+        family_project_ids = tuple(int(value) for value in shown_opts["ProjectID"].tolist())
+        systems, meta, grid, totals_by_pid = _cached_project_bundle(
+            pid, family_project_ids, _db_cache_stamp()
+        )
+        grid = grid.copy()
+
+        st.markdown("**Revisions & options**")
+        widths = [0.35, 1.3, 1.65, 0.8, 0.8, 1.2, 0.45, 0.9, 0.8]
         for rn, rev_grp in shown_opts.groupby("_rev_sort", sort=True):
             rev_label = repo.revision_token(rn) if rn > 0 else "Original"
             opt_count = len(rev_grp)
@@ -3697,17 +3748,13 @@ elif mode == PROJECT_WORKSPACE_LABEL:
                     _request_scroll_top()
                     st.rerun()
 
-        pid = int(st.session_state.view_pid)
-        systems = repo.list_systems(pid)
         sheet = systems[0] if systems else None      # auto-pick the system sheet
-        meta = repo.project_meta(pid)
         cur_key = f"{pid}::{sheet}"
         editing = (st.session_state.get("edit_mode")
                    and st.session_state.get("edit_key") == cur_key)
 
         if not editing:
             # -------------------- VIEW: tabbed offer view --------------------
-            grid = _cached_project_grid(pid, sheet, _db_cache_stamp()).copy()
             disp = grid.copy()
             for col in MONEY_COLS:
                 if col in disp.columns:
@@ -4279,6 +4326,7 @@ elif mode == "Settings":
                 repo.set_setting("revision_separator", sep_opts[rev_sep_lbl])
                 repo.set_setting("eur_to_usd", float(eur_rate))
                 repo.set_setting("vat_percent", float(vat_pct))
+                st.session_state.pop("cached_default_margin", None)
                 st.success("Offer and pricing settings saved.")
 
         st.divider()
@@ -4380,6 +4428,7 @@ elif mode == "Settings":
                 repo.set_setting("company_cr_number", company_cr_number.strip())
                 repo.set_setting("company_brand_color", brand_color)
                 repo.set_setting("project_sheet_enabled", "1" if ps_enabled else "0")
+                st.session_state.pop("cached_ps_enabled", None)
                 st.success("Company settings saved. (Page title updates on next reload.)")
 
         st.divider()

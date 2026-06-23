@@ -5,6 +5,8 @@ from __future__ import annotations
 import re
 import json
 import datetime as dt
+import threading
+import time
 from functools import lru_cache
 import pandas as pd
 
@@ -187,15 +189,43 @@ DEFAULT_SETTINGS = {
     "github_repo": "_ProQuote",
 }
 
+_SETTINGS_CACHE: dict[str, str] = {}
+_SETTINGS_CACHE_EXPIRES = 0.0
+_SETTINGS_CACHE_LOCK = threading.Lock()
+_SETTINGS_CACHE_TTL = 30.0
+
+
+def _settings_values() -> dict[str, str]:
+    """Load the tiny settings table once per process window, not once per key."""
+    global _SETTINGS_CACHE, _SETTINGS_CACHE_EXPIRES
+    now = time.monotonic()
+    if now < _SETTINGS_CACHE_EXPIRES:
+        return _SETTINGS_CACHE
+    with _SETTINGS_CACHE_LOCK:
+        now = time.monotonic()
+        if now < _SETTINGS_CACHE_EXPIRES:
+            return _SETTINGS_CACHE
+        try:
+            with _conn() as c:
+                rows = c.execute("SELECT key,value FROM Settings").fetchall()
+            values = {str(r["key"]): r["value"] for r in rows}
+        except Exception:
+            values = {}
+        _SETTINGS_CACHE = values
+        _SETTINGS_CACHE_EXPIRES = now + _SETTINGS_CACHE_TTL
+        return _SETTINGS_CACHE
+
+
+def _invalidate_settings_cache() -> None:
+    global _SETTINGS_CACHE_EXPIRES
+    with _SETTINGS_CACHE_LOCK:
+        _SETTINGS_CACHE_EXPIRES = 0.0
+
 
 def get_setting(key: str, default=None):
-    with _conn() as c:
-        try:
-            r = c.execute("SELECT value FROM Settings WHERE key=?", (key,)).fetchone()
-        except Exception:
-            r = None
-    if r and r["value"] is not None:
-        return r["value"]
+    value = _settings_values().get(key)
+    if value is not None:
+        return value
     return default if default is not None else DEFAULT_SETTINGS.get(key)
 
 
@@ -204,6 +234,7 @@ def set_setting(key: str, value) -> None:
         c.execute("INSERT INTO Settings(key,value) VALUES(?,?) "
                   "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, str(value)))
         c.commit()
+    _invalidate_settings_cache()
     if key == "revision_format":
         _revision_strip_pattern.cache_clear()
     if key in {"systems", "offer_types"}:
@@ -214,6 +245,7 @@ def delete_setting(key: str) -> None:
     with _conn() as c:
         c.execute("DELETE FROM Settings WHERE key=?", (key,))
         c.commit()
+    _invalidate_settings_cache()
     if key == "revision_format":
         _revision_strip_pattern.cache_clear()
     if key in {"systems", "offer_types"}:
@@ -684,6 +716,12 @@ def _conn():
     return dbmod.connect()
 
 
+def _begin_bulk_write(conn) -> None:
+    bulk = getattr(conn, "begin_bulk_write", None)
+    if bulk is not None:
+        bulk()
+
+
 # ---------- Catalogue (Workflow 2 type-ahead) ----------
 
 def search_catalog(term: str, limit: int = 25, show_discontinued: bool = False) -> pd.DataFrame:
@@ -966,6 +1004,98 @@ def list_projects() -> pd.DataFrame:
     return pd.DataFrame([dict(r) for r in rows])
 
 
+def project_people() -> pd.DataFrame:
+    """Distinct stored assignees for the three Load Project filters."""
+    with _conn() as c:
+        rows = c.execute(
+            """SELECT 'SalesPerson' AS Kind, SalesPerson AS Value
+                 FROM Projects_Master
+                WHERE TRIM(COALESCE(SalesPerson,''))<>''
+                GROUP BY SalesPerson
+                UNION ALL
+               SELECT 'PresalesEngineer', PresalesEngineer
+                 FROM Projects_Master
+                WHERE TRIM(COALESCE(PresalesEngineer,''))<>''
+                GROUP BY PresalesEngineer
+                UNION ALL
+               SELECT 'ProjectManager', ProjectManager
+                 FROM Projects_Master
+                WHERE TRIM(COALESCE(ProjectManager,''))<>''
+                GROUP BY ProjectManager"""
+        ).fetchall()
+    values = {"SalesPerson": [], "PresalesEngineer": [], "ProjectManager": []}
+    for row in rows:
+        kind = str(row["Kind"])
+        if kind in values:
+            values[kind].append(row["Value"])
+    return pd.DataFrame({key: pd.Series(items, dtype=object) for key, items in values.items()})
+
+
+def search_projects(name="", offer="", sales=(), presales=(), project_managers=(),
+                    limit_families: int = 200) -> pd.DataFrame:
+    """Search on the server, then return every revision/option in matched families."""
+    conditions, params = [], []
+    name = _str(name).strip().lower()
+    offer = _str(offer).strip().lower()
+    if name:
+        token = f"%{name}%"
+        conditions.append(
+            "(LOWER(COALESCE(p.ProjectName,'')) LIKE ? OR "
+            "LOWER(COALESCE(p.ClientName,'')) LIKE ?)"
+        )
+        params.extend([token, token])
+    if offer:
+        conditions.append("LOWER(COALESCE(p.OfferNo,'')) LIKE ?")
+        params.append(f"%{offer}%")
+
+    for column, selected in (
+        ("SalesPerson", sales),
+        ("PresalesEngineer", presales),
+        ("ProjectManager", project_managers),
+    ):
+        values = [_str(value).strip().lower() for value in selected if _str(value).strip()]
+        if values:
+            conditions.append(
+                f"LOWER(COALESCE(p.{column},'')) IN ({','.join('?' * len(values))})"
+            )
+            params.extend(values)
+
+    if not conditions:
+        return pd.DataFrame()
+
+    family_expr = (
+        "LOWER(COALESCE(NULLIF(TRIM(p.BaseName),''),"
+        "NULLIF(TRIM(p.OfferNo),''),NULLIF(TRIM(p.ProjectName),''),''))"
+    )
+    where = " AND ".join(conditions)
+    sql = f"""
+        WITH matching_families AS (
+            SELECT {family_expr} AS FamilyKey,
+                   MAX(COALESCE(p.UpdatedDate,p.CreationDate,'')) AS SortDate,
+                   MAX(p.ProjectID) AS SortID
+              FROM Projects_Master p
+             WHERE {where}
+             GROUP BY {family_expr}
+             ORDER BY SortDate DESC, SortID DESC
+             LIMIT ?
+        )
+        SELECT p.ProjectID,p.ProjectName,p.ClientName,p.SalesPerson,p.PresalesEngineer,
+               p.ProjectManager,p.Region,p.OfferNo,p.CreationDate,p.UpdatedDate,
+               p.ConversionFactor,p.Approved,p.RevisionNo,p.BaseName,p.OptionLabel,p.Archived,
+               (SELECT s.SystemSuffix
+                  FROM Project_Sheets s
+                 WHERE s.ProjectID=p.ProjectID
+                 ORDER BY s.SheetID LIMIT 1) AS System
+          FROM Projects_Master p
+          JOIN matching_families f ON {family_expr}=f.FamilyKey
+         ORDER BY f.SortDate DESC, f.SortID DESC,
+                  COALESCE(p.UpdatedDate,p.CreationDate) DESC, p.ProjectID DESC
+    """
+    with _conn() as c:
+        rows = c.execute(sql, [*params, max(1, int(limit_families))]).fetchall()
+    return pd.DataFrame([dict(row) for row in rows])
+
+
 def family_key(offer_no, project_name) -> str:
     """Groups an offer with its revisions (by offer-number base, else name base)."""
     off = _str(offer_no).strip()
@@ -1100,6 +1230,10 @@ def load_project_grid(project_id: int, sheet_name: str | None = None) -> pd.Data
     sql += " ORDER BY l.RowOrder"
     with _conn() as c:
         rows = [dict(r) for r in c.execute(sql, params).fetchall()]
+    return _grid_from_rows(rows)
+
+
+def _grid_from_rows(rows) -> pd.DataFrame:
     df = pd.DataFrame(rows)
     if df.empty:
         return pd.DataFrame(columns=calc.GRID_COLUMNS + ["LineType", "_ItemID"])
@@ -1119,13 +1253,80 @@ def load_project_grid(project_id: int, sheet_name: str | None = None) -> pd.Data
     ]
     # MarginExtra is the persisted pricing driver and must round-trip exactly.
     # Only legacy rows that predate the stored margin fall back to the effective
-    # price/cost ratio.  An explicit zero is meaningful (manual selling price).
+    # price/cost ratio. An explicit zero is meaningful (manual selling price).
     stored_margin = pd.to_numeric(df["Margin x"], errors="coerce")
     uc = df["Unit Cost $"].map(calc._num)
     up = df["U. Price $"].map(calc._num)
     legacy_margin = (up / uc.where(uc > 0)).round(4)
     df["Margin x"] = stored_margin.where(stored_margin.notna(), legacy_margin).fillna(0.0)
     return df[[c for c in calc.GRID_COLUMNS] + ["LineType", "_ItemID"]]
+
+
+def load_project_bundle(project_id: int, family_project_ids=()):
+    """Fetch revision totals, selected metadata, systems, and BoQ in one PG trip."""
+    project_id = int(project_id)
+    ids = list(dict.fromkeys(
+        int(value) for value in family_project_ids if value is not None
+    )) or [project_id]
+    placeholders = ",".join("?" * len(ids))
+    statements = [
+        (
+            "SELECT SheetName, MIN(SheetID) AS SortID FROM Project_Sheets "
+            "WHERE ProjectID=? GROUP BY SheetName ORDER BY SortID",
+            (project_id,),
+        ),
+        (
+            "SELECT * FROM Projects_Master WHERE ProjectID=?",
+            (project_id,),
+        ),
+        (
+            """SELECT Area,System,Description,Brand,Model,Qty,
+                      ListPriceUSD,ExUnitCostUSD,Currency,ShippingPercent,
+                      FinalUnitCostUSD,TotalCostUSD,FinalUPriceUSD,TPriceUSD,
+                      FinalUPriceSAR,TPriceSAR,MarginExtra,LineType,ItemID
+                 FROM Project_BoQ_Lines l
+                 JOIN Project_Sheets s ON l.SheetID=s.SheetID
+                WHERE l.ProjectID=?
+                  AND l.LineType NOT IN ('spare','discount')
+                  AND s.SheetName=(
+                      SELECT s0.SheetName FROM Project_Sheets s0
+                       WHERE s0.ProjectID=? ORDER BY s0.SheetID LIMIT 1
+                  )
+                ORDER BY l.RowOrder""",
+            (project_id, project_id),
+        ),
+        (
+            f"""SELECT p.ProjectID,
+                        IFNULL(p.DiscountAmount,0) AS DiscountAmount,
+                        IFNULL(SUM(l.TPriceSAR),0) AS SubtotalSAR
+                   FROM Projects_Master p
+                   LEFT JOIN Project_BoQ_Lines l
+                     ON l.ProjectID=p.ProjectID
+                    AND IFNULL(l.LineType,'item') NOT IN ('spare','discount')
+                  WHERE p.ProjectID IN ({placeholders})
+                  GROUP BY p.ProjectID,p.DiscountAmount""",
+            ids,
+        ),
+    ]
+    with _conn() as c:
+        cursors = (c.query_many(statements) if hasattr(c, "query_many")
+                   else [c.execute(sql, params) for sql, params in statements])
+        system_rows = cursors[0].fetchall()
+        meta_row = cursors[1].fetchone()
+        line_rows = [dict(row) for row in cursors[2].fetchall()]
+        total_rows = cursors[3].fetchall()
+
+    totals = {}
+    for row in total_rows:
+        subtotal = float(row["SubtotalSAR"] or 0)
+        discount = min(abs(float(row["DiscountAmount"] or 0)), subtotal)
+        totals[int(row["ProjectID"])] = round((subtotal - discount) * (1 + calc.VAT_RATE), 2)
+    return (
+        [row["SheetName"] for row in system_rows],
+        dict(meta_row) if meta_row else {},
+        _grid_from_rows(line_rows),
+        totals,
+    )
 
 
 # ---------------- Finance (per approved offer) ----------------
@@ -1347,6 +1548,7 @@ def save_offer(name, client, contact, offer_no, system_suffix, grid: pd.DataFram
              terms_json, ps_json, option_label or ""),
         )
         pid = cur.fetchone()["ProjectID"]
+        _begin_bulk_write(c)
         _write_sheet_and_lines(c, pid, system_suffix, discount_sar, factors, grid)
         c.commit()
     return pid
@@ -1457,9 +1659,14 @@ def update_offer(base_project_id: int, grid: pd.DataFrame, discount_sar=0.0,
                 "UPDATE Projects_Master SET BaseName=? WHERE ProjectID=?",
                 (base_name(family_source), base_project_id),
             )
+        _begin_bulk_write(c)
         c.execute("DELETE FROM Project_BoQ_Lines WHERE ProjectID=?", (base_project_id,))
         c.execute("DELETE FROM Project_Sheets WHERE ProjectID=?", (base_project_id,))
         _write_sheet_and_lines(c, base_project_id, system_suffix, discount_sar, factors, grid)
+        c.execute(
+            "UPDATE Projects_Master SET UpdatedDate=? WHERE ProjectID=?",
+            (dt.date.today().isoformat(), base_project_id),
+        )
         c.commit()
     return base_project_id
 

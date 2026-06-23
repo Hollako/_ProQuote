@@ -7,6 +7,8 @@ import hashlib
 import hmac
 import secrets
 import datetime as dt
+import threading
+import time
 
 import db as dbmod
 
@@ -57,6 +59,38 @@ DEFAULT_ROLE_PERMS = {
 }
 
 
+_AUTH_CACHE_TTL = 30.0
+_AUTH_CACHE_LOCK = threading.Lock()
+_ROLE_PERMS_CACHE: dict[str, tuple[float, frozenset[str]]] = {}
+_ACTIVE_USERS_CACHE: tuple[float, tuple[dict, ...]] = (0.0, ())
+
+
+def _invalidate_auth_cache() -> None:
+    global _ACTIVE_USERS_CACHE
+    with _AUTH_CACHE_LOCK:
+        _ROLE_PERMS_CACHE.clear()
+        _ACTIVE_USERS_CACHE = (0.0, ())
+
+
+def _active_users() -> tuple[dict, ...]:
+    global _ACTIVE_USERS_CACHE
+    now = time.monotonic()
+    if now < _ACTIVE_USERS_CACHE[0]:
+        return _ACTIVE_USERS_CACHE[1]
+    with _AUTH_CACHE_LOCK:
+        now = time.monotonic()
+        if now < _ACTIVE_USERS_CACHE[0]:
+            return _ACTIVE_USERS_CACHE[1]
+        with dbmod.connect() as c:
+            rows = c.execute(
+                "SELECT DisplayName,Username,Role FROM Users WHERE Active=1 "
+                "ORDER BY DisplayName,Username"
+            ).fetchall()
+        values = tuple(dict(row) for row in rows)
+        _ACTIVE_USERS_CACHE = (now + _AUTH_CACHE_TTL, values)
+        return values
+
+
 # ---------- configurable roles (DB-backed matrix) ----------
 
 def _seed_role(c, role) -> None:
@@ -103,6 +137,7 @@ def ensure_roles_seeded() -> None:
                 "INSERT INTO Settings(key,value) VALUES(?,?) "
                 "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (flag, "1"))
         c.commit()
+    _invalidate_auth_cache()
 
 
 def list_roles() -> list[str]:
@@ -115,9 +150,21 @@ def list_roles() -> list[str]:
 def role_perms(role: str) -> set:
     if role == PROTECTED_ROLE:
         return set(ALL_PERMS)
-    with dbmod.connect() as c:
-        return {r["Permission"] for r in
-                c.execute("SELECT Permission FROM RolePerms WHERE Role=?", (role,))}
+    now = time.monotonic()
+    cached = _ROLE_PERMS_CACHE.get(role)
+    if cached and now < cached[0]:
+        return set(cached[1])
+    with _AUTH_CACHE_LOCK:
+        cached = _ROLE_PERMS_CACHE.get(role)
+        if cached and now < cached[0]:
+            return set(cached[1])
+        with dbmod.connect() as c:
+            values = frozenset(
+                r["Permission"]
+                for r in c.execute("SELECT Permission FROM RolePerms WHERE Role=?", (role,))
+            )
+        _ROLE_PERMS_CACHE[role] = (now + _AUTH_CACHE_TTL, values)
+        return set(values)
 
 
 def has_perm(role: str, perm: str) -> bool:
@@ -135,6 +182,7 @@ def set_role_perms(role: str, perms) -> None:
             c.execute("INSERT INTO RolePerms(Role,Permission) VALUES(?,?) "
                       "ON CONFLICT DO NOTHING", (role, p))
         c.commit()
+    _invalidate_auth_cache()
 
 
 def add_role(name: str, perms=None) -> bool:
@@ -150,6 +198,7 @@ def add_role(name: str, perms=None) -> bool:
                 c.execute("INSERT INTO RolePerms(Role,Permission) VALUES(?,?) "
                           "ON CONFLICT DO NOTHING", (name, p))
         c.commit()
+    _invalidate_auth_cache()
     return True
 
 
@@ -160,6 +209,7 @@ def delete_role(name: str) -> bool:
         c.execute("DELETE FROM RolePerms WHERE Role=?", (name,))
         c.execute("DELETE FROM Roles WHERE Role=?", (name,))
         c.commit()
+    _invalidate_auth_cache()
     return True
 
 
@@ -169,12 +219,12 @@ def role_user_count(role: str) -> int:
 
 
 def users_in_role(role: str) -> list[str]:
-    """Display names of active users holding `role` - used for offer people-pickers."""
-    with dbmod.connect() as c:
-        rows = c.execute(
-            "SELECT DisplayName, Username FROM Users WHERE Role=? AND Active=1 "
-            "ORDER BY DisplayName, Username", (role,)).fetchall()
-    return [((r["DisplayName"] or "").strip() or r["Username"]) for r in rows]
+    """Display names of active users holding the role for offer people-pickers."""
+    return [
+        ((row["DisplayName"] or "").strip() or row["Username"])
+        for row in _active_users()
+        if row["Role"] == role
+    ]
 
 
 def users_in_roles(roles) -> list[str]:
@@ -185,10 +235,7 @@ def users_in_roles(roles) -> list[str]:
     wanted = {str(r).strip().lower() for r in (roles or []) if str(r).strip()}
     if not wanted:
         return []
-    with dbmod.connect() as c:
-        rows = c.execute(
-            "SELECT DisplayName, Username, Role FROM Users WHERE Active=1 "
-            "ORDER BY DisplayName, Username").fetchall()
+    rows = _active_users()
     seen, out = set(), []
     for r in rows:
         if str(r["Role"] or "").strip().lower() in wanted:
@@ -240,6 +287,7 @@ def create_user(username: str, password: str, display_name: str = "", role: str 
             (username, (display_name or "").strip() or username, _hash(password), role, now))
         user_id = cur.fetchone()["UserID"]
         c.commit()
+        _invalidate_auth_cache()
         return user_id
 
 
@@ -271,6 +319,7 @@ def update_user(user_id: int, display_name=None, role=None, active=None) -> None
     with dbmod.connect() as c:
         c.execute(f"UPDATE Users SET {','.join(sets)} WHERE UserID=?", (*vals, user_id))
         c.commit()
+    _invalidate_auth_cache()
 
 
 def set_password(user_id: int, password: str) -> None:
@@ -283,3 +332,4 @@ def delete_user(user_id: int) -> None:
     with dbmod.connect() as c:
         c.execute("DELETE FROM Users WHERE UserID=?", (user_id,))
         c.commit()
+    _invalidate_auth_cache()
