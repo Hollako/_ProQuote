@@ -3503,7 +3503,7 @@ if mode == PROJECT_WORKSPACE_LABEL and project_workspace_view == "new":
 
 # ============================ LOAD EXISTING ============================
 elif mode == PROJECT_WORKSPACE_LABEL:
-    lt1, lt2 = st.columns([4, 1])
+    lt1, lt2 = st.columns([4, 1], vertical_alignment="center")
     lt1.subheader("Load Project")
     if can("new_offer") and lt2.button(
         "➕ New Project / Offer", type="primary", width="stretch", key="open_new_project"
