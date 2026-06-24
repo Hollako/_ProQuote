@@ -210,10 +210,15 @@ def increase_margins(df: pd.DataFrame, percentage: float) -> tuple[pd.DataFrame,
 def summarize(df: pd.DataFrame, discount_sar: float = 0.0,
               commission_sar: float = 0.0) -> dict:
     """Client totals plus internal commission-adjusted profit metrics."""
-    items = df[~df.get("LineType", "item").astype(str).isin({"discount", "included"})] if "LineType" in df else df
-    product_cost_usd = items["Total Cost $"].map(_num).sum()
-    total_sell_usd = items["T. Price $"].map(_num).sum()
-    subtotal_sar = items["T. Price SAR"].map(_num).sum()
+    if "LineType" in df:
+        lt = df["LineType"].astype(str)
+        cost_items = df[lt != "discount"]                    # cost includes included rows
+        sell_items = df[~lt.isin({"discount", "included"})] # selling excludes included rows
+    else:
+        cost_items = sell_items = df
+    product_cost_usd = cost_items["Total Cost $"].map(_num).sum()
+    total_sell_usd = sell_items["T. Price $"].map(_num).sum()
+    subtotal_sar = sell_items["T. Price SAR"].map(_num).sum()
 
     discount_sar = min(abs(_num(discount_sar)), subtotal_sar)
     discount_percent = (discount_sar / subtotal_sar * 100) if subtotal_sar else 0.0

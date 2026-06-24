@@ -58,6 +58,16 @@ _COMPANY = repo.get_setting("company_name") or "Company Name"
 st.set_page_config(page_title=f"ProQuote - {_COMPANY}", layout="wide",
                    initial_sidebar_state="expanded")
 
+st.markdown("""<style>
+[data-testid="stMetric"] { text-align: center !important; }
+[data-testid="stMetricLabel"] { justify-content: center !important; }
+[data-testid="stMetricLabel"] > div { text-align: center !important; width: 100% !important; }
+[data-testid="stMetricLabel"] p { text-align: center !important; }
+[data-testid="stMetricValue"] { justify-content: center !important; }
+[data-testid="stMetricValue"] > div { text-align: center !important; }
+[data-testid="stMetricDelta"] { justify-content: center !important; }
+</style>""", unsafe_allow_html=True)
+
 
 def _request_scroll_top():
     st.session_state["_scroll_to_top"] = True
@@ -669,6 +679,7 @@ def _next_offer_no() -> str:
 
 def _add_row_to(state_key: str, row: dict):
     g = st.session_state[state_key]
+    row["_RowOrder"] = int(g["_RowOrder"].max()) + 1 if "_RowOrder" in g.columns and len(g) else 1
     st.session_state[state_key] = pd.concat([g, pd.DataFrame([row])], ignore_index=True)
 
 
@@ -730,7 +741,7 @@ def _builder_column_order(editor_key: str, host=st, width="content", show_includ
         st.markdown("<div style='min-width:320px'></div>", unsafe_allow_html=True)
         cc = st.columns(2)
         all_cols = (["_IncludedInItems"] if show_include else []) + list(BUILDER_COLS)
-        labels = {"_IncludedInItems": "Include"}
+        labels = {"_IncludedInItems": "Included"}
         visible = [col for i, col in enumerate(all_cols)
                    if cc[i % 2].checkbox(labels.get(col, col), value=True,
                                          key=f"{editor_key}_show_{col}")]
@@ -1046,15 +1057,13 @@ def _close_edit_mode():
     # If we were editing a just-saved offer, navigate to the load view so the
     # user lands on the offer page (not the empty new-offer form).
     _fam = st.session_state.pop("_just_saved_fam", None)
-    _pid = st.session_state.pop("_just_saved_pid", None)
+    st.session_state.pop("_just_saved_pid", None)
     st.session_state.pop("_just_saved_meta", None)
     if _fam:
         for _k in ("load_search_snapshot", "load_search_name", "load_search_offer",
-                   "load_filter_sales", "load_filter_presales", "load_filter_pm"):
+                   "load_filter_sales", "load_filter_presales", "load_filter_pm",
+                   "load_fam", "view_pid"):
             st.session_state.pop(_k, None)
-        st.session_state["load_fam"] = _fam
-        if _pid:
-            st.session_state["view_pid"] = _pid
         st.session_state["project_workspace_view"] = "load"
 
 
@@ -1121,44 +1130,60 @@ def render_editable_grid(state_key: str, editor_key: str, in_fragment: bool = Fa
     colcfg["Qty"] = st.column_config.NumberColumn("Qty", format="%d", min_value=0)
     colcfg["Cur"] = st.column_config.SelectboxColumn(
         "Cur", options=calc.CURRENCIES, required=False, width="small",
-        help="Currency of List Price & Ex Unit Cost. The Unit Cost is converted to "
-             "USD automatically (EUR rate from Settings; SAR pegged at 3.75).")
+        help="Currency of the buy price (List Price & Ex Unit Cost).\n"
+             "Unit Cost is always converted to USD automatically.\n"
+             "**EUR rate is set in Settings. SAR and AED are fixed pegs.**")
     # List Price & Ex Unit Cost are in the row's chosen currency (drop the misleading $).
-    colcfg["List Price $"] = st.column_config.NumberColumn("List Price", format="accounting")
-    colcfg["Ex Unit Cost $"] = st.column_config.NumberColumn("Ex Unit Cost", format="accounting")
+    colcfg["List Price $"] = st.column_config.NumberColumn(
+        "List Price", format="accounting",
+        help="Supplier list price in the row's selected currency.\n"
+             "**Optional reference - not used in any formula.**")
+    colcfg["Ex Unit Cost $"] = st.column_config.NumberColumn(
+        "Ex Unit Cost", format="accounting",
+        help="Your buy price in the row's selected currency.\n"
+             "**When filled, Unit Cost is computed automatically as ⌈Ex Unit Cost × (1 + Shipping%)⌉.**")
     colcfg["Unit Cost $"] = st.column_config.NumberColumn(
         "Unit Cost (USD)", format="accounting",
-        help="⚡ Conditional: editable only when Ex Unit Cost is blank. "
-             "If Ex Unit Cost is filled, Unit Cost is computed automatically.")
+        help="**⚡ Editable only when Ex Unit Cost is blank.**\n"
+             "When Ex Unit Cost is filled, this is computed and cannot be overridden.")
     colcfg["Shipping %"] = st.column_config.NumberColumn(
         "Shipping %", format="%.2f", min_value=0.0, step=5.0,
-        help="Added to Ex Unit Cost. Unit Cost = Ex Unit Cost × (1 + Shipping% / 100), in USD.")
+        help="Landed-cost buffer added on top of Ex Unit Cost.\n"
+             "Unit Cost = ⌈Ex Unit Cost × (1 + Shipping% ÷ 100)⌉.\n"
+             "**Default: 30%.**")
     colcfg["Markup x"] = st.column_config.NumberColumn(
         "Markup x", format="plain", min_value=0.0, step=None,
-        help="Multiplier on Unit Cost → U. Price $. Set to 0 to enter U. Price $ manually.")
+        help="Multiplier applied to Unit Cost to get U. Price $.\n"
+             "**Set to 0 to enter U. Price $ manually.**")
     colcfg["U. Price $"] = st.column_config.NumberColumn(
         "U. Price $", format="accounting",
-        help="⚡ Conditional: editable only when Markup x = 0. "
-             "If Markup x > 0, this is computed as ⌈Unit Cost × Markup x⌉.")
+        help="**⚡ Editable only when Markup x = 0.**\n"
+             "When Markup x > 0, computed as ⌈Unit Cost × Markup x⌉ and cannot be overridden.")
     colcfg["Total Cost $"] = st.column_config.NumberColumn(
         "Total Cost $", format="accounting",
-        help="🔒 Computed: Qty × Unit Cost $. Cannot be edited.")
+        help="**🔒 Always computed - cannot be edited.**\n"
+             "= Qty × Unit Cost $.")
     colcfg["T. Price $"] = st.column_config.NumberColumn(
         "T. Price $", format="accounting",
-        help="🔒 Computed: Qty × U. Price $. Cannot be edited.")
+        help="**🔒 Always computed - cannot be edited.**\n"
+             "= Qty × U. Price $.")
     colcfg["U. Price SAR"] = st.column_config.NumberColumn(
         "U. Price SAR", format="accounting",
-        help="🔒 Computed: U. Price $ × 3.75, rounded up to next multiple of 10. Cannot be edited.")
+        help="**🔒 Always computed - cannot be edited.**\n"
+             "= U. Price $ × 3.75, rounded up to the next multiple of 10.")
     colcfg["T. Price SAR"] = st.column_config.NumberColumn(
         "T. Price SAR", format="accounting",
-        help="🔒 Computed: Qty × U. Price SAR. Cannot be edited.")
+        help="**🔒 Always computed - cannot be edited.**\n"
+             "= Qty × U. Price SAR.")
     if show_included_col:
         colcfg["_IncludedInItems"] = st.column_config.CheckboxColumn(
-            "Include", default=False,
-            help="When checked, this row's cost is distributed proportionally to other item prices.")
+            "Included", default=False,
+            help="Mark this row as included in the installation price.\n"
+                 "**Selling price is zeroed - cost is still counted in the total cost.**")
     colcfg["_RowOrder"] = st.column_config.NumberColumn(
         "#", min_value=1, step=1, format="%d",
-        help="Row position. Change the number to reorder; lower = higher up.")
+        help="Row order. Change the number to reorder.\n"
+             "**Lower number = higher position in the table.**")
     _base_order = column_order if column_order is not None else _builder_column_order(editor_key)
     order = ("_RowOrder",) + tuple(c for c in _base_order if c != "_RowOrder")
 
@@ -1210,11 +1235,21 @@ def render_editable_grid(state_key: str, editor_key: str, in_fragment: bool = Fa
         working["_IncludedInItems"] = working["_IncludedInItems"].fillna(False).astype(bool)
     if show_included_col:
         incl_mask = working["_IncludedInItems"].astype(bool)
-        working.loc[incl_mask, "Markup x"] = 0.0
+        working.loc[incl_mask, ["Markup x", "U. Price $"]] = 0.0
     if "_RowOrder" not in working.columns:
         working["_RowOrder"] = range(1, len(working) + 1)
     else:
-        working = working.sort_values("_RowOrder", kind="stable").reset_index(drop=True)
+        # Rows whose _RowOrder was just changed by the user get priority=1 so they
+        # sort AFTER any unchanged row with the same value (e.g. typing "4" on row 3
+        # inserts it after the existing row 4, not before it).
+        orig_ro = original_base["_RowOrder"].values if "_RowOrder" in original_base.columns else None
+        if orig_ro is not None and len(orig_ro) == len(working):
+            changed = (working["_RowOrder"].values != orig_ro).astype(int)
+        else:
+            changed = [0] * len(working)
+        working["_sort_pri"] = changed
+        working = working.sort_values(["_RowOrder", "_sort_pri"], kind="stable").reset_index(drop=True)
+        working = working.drop(columns=["_sort_pri"])
         working["_RowOrder"] = range(1, len(working) + 1)
     working = calc.recompute(working)
     # Store now so the Totals section rendered after this call sees the updated values.
@@ -1371,7 +1406,7 @@ def _edit_panel(meta):
         st.session_state.cached_default_margin = float(repo.get_setting("default_margin") or 1.6)
     catalogue_add("edit_grid", st.session_state.cached_default_margin, "ed",
                   st.session_state.get("edit_system", ""))
-    col_pick, option_col, inc_c1 = st.columns([0.9, 1.8, 1.8], vertical_alignment="bottom")
+    col_pick, option_col, inc_c1, eur_col = st.columns([0.9, 1.8, 1.8, 0.7], vertical_alignment="bottom")
     _show_incl = _inclusion_enabled() and st.session_state.get("ed_inclusion_mode") == "included"
     edit_column_order = _builder_column_order("edit_editor", host=col_pick, width="stretch",
                                               show_include=_show_incl)
@@ -1394,6 +1429,7 @@ def _edit_panel(meta):
         )
     else:
         inc_mode = "excluded"
+    _eur_rate_input(eur_col, "ed_eur_rate")
 
 
 
@@ -1418,8 +1454,8 @@ def _edit_panel(meta):
     s = calc.summarize(edit_totals_grid, edit_discount, edit_commission)
     m1, m2, m3 = st.columns(3)
     _subtotal_metric(m1, s)
-    m2.metric(f"VAT {calc.VAT_RATE * 100:g}% (SAR)", f"{s['vat_amount_sar']:,.2f}")
-    m3.metric("Grand Total (SAR)", f"{s['grand_total_sar']:,.2f}")
+    _centered_metric(m2, f"VAT {calc.VAT_RATE * 100:g}% (SAR)", f"{s['vat_amount_sar']:,.2f}")
+    _centered_metric(m3, "Grand Total (SAR)", f"{s['grand_total_sar']:,.2f}")
     _profit_banner(s)
 
     edit_terms = st.session_state.get("edit_terms", dict(DEFAULT_TERMS))
@@ -1479,11 +1515,7 @@ def _edit_panel(meta):
         _post_save(st.session_state.edit_pid,
                    edit_header.get("project") or meta.get("ProjectName"), _cur_rev)
         _name = edit_header.get("project") or meta.get("ProjectName")
-        st.toast(f"Updated {_name}", icon="✅")
-        st.success(
-            f"Updated **{_name}** in place. Option label saved as "
-            f"**{saved_option_label or 'Main'}**."
-        )
+        st.toast(f"Offer saved — {_name}", icon="✅")
         if close_after_save:
             _close_edit_mode()
             st.rerun(scope="app")
@@ -1503,11 +1535,7 @@ def _edit_panel(meta):
         _clear_offer_data_caches()
         saved_option_label = _text(repo.project_meta(npid).get("OptionLabel"))
         _post_save(npid, nname, nrev)
-        st.toast(f"Saved {nname} as ProjectID {npid}.", icon="✅")
-        st.success(
-            f"Saved **{nname}** as ProjectID {npid}. Option label: "
-            f"**{saved_option_label or 'Main'}**."
-        )
+        st.toast(f"New revision saved — {nname}", icon="✅")
         _mark_edit_clean()
     elif pending == "option":
         if not pending_option_label:
@@ -1528,11 +1556,7 @@ def _edit_panel(meta):
             _clear_offer_data_caches()
             saved_option_label = _text(repo.project_meta(npid).get("OptionLabel"))
             _post_save(npid, nname, nrev)
-            st.toast(f"Saved option {nname} as ProjectID {npid}.", icon="✅")
-            st.success(
-                f"Saved option **{nname}** as ProjectID {npid}. Option label: "
-                f"**{saved_option_label or 'Main'}**."
-            )
+            st.toast(f"Option saved — {nname}", icon="✅")
             _mark_edit_clean()
 
     if st.session_state.pop("pending_close_edit", False):
@@ -1644,6 +1668,7 @@ def _new_offer_actions():
             _init_edit_state(pid, _meta, _grid, _sheet)
             _prime_new_offer_form()
             _clear_offer_data_caches()
+            st.toast(f"Offer saved — {_meta.get('ProjectName') or name}", icon="✅")
             st.session_state["_just_saved_meta"] = _meta
             st.session_state["_just_saved_fam"] = repo.family_key(
                 _meta.get("OfferNo") or "", _meta.get("ProjectName") or "")
@@ -1726,9 +1751,9 @@ def _new_project_editor():
     _dm = st.session_state.cached_default_margin
     catalogue_add("grid", _dm, "no", st.session_state.header["system"])
 
-    # ---- Columns / Option label / Installation pricing row (same layout as Edit Offer) ----
+    # ---- Columns / Option label / Installation pricing / EUR rate row ----
     _show_incl = _inclusion_enabled() and h.get("inclusion_mode") == "included"
-    col_pick, option_col, inc_c1 = st.columns([0.9, 1.8, 1.8], vertical_alignment="bottom")
+    col_pick, option_col, inc_c1, eur_col = st.columns([0.9, 1.8, 1.8, 0.7], vertical_alignment="bottom")
     no_column_order = _builder_column_order("editor", host=col_pick, width="stretch",
                                             show_include=_show_incl)
     h["option"] = option_col.text_input(
@@ -1748,6 +1773,7 @@ def _new_project_editor():
         )
     else:
         h["inclusion_mode"] = "excluded"
+    _eur_rate_input(eur_col, "no_eur_rate")
     st.session_state.header = h
 
     # ---- Editable grid (builder always shows costs) ----
@@ -1769,8 +1795,8 @@ def _new_project_editor():
 
     m1, m2, m3 = st.columns(3)
     _subtotal_metric(m1, s)
-    m2.metric(f"VAT {calc.VAT_RATE * 100:g}% (SAR)", f"{s['vat_amount_sar']:,.2f}")
-    m3.metric("Grand Total (SAR)", f"{s['grand_total_sar']:,.2f}")
+    _centered_metric(m2, f"VAT {calc.VAT_RATE * 100:g}% (SAR)", f"{s['vat_amount_sar']:,.2f}")
+    _centered_metric(m3, "Grand Total (SAR)", f"{s['grand_total_sar']:,.2f}")
     _profit_banner(s)
     if admin:
         a1, a2, a3 = st.columns(3)
@@ -2147,7 +2173,7 @@ def revision_options(base_pid):
 
 
 def _profit_banner(s: dict):
-    """Profit bubble: profit big (left) with Margin/markup beneath, cost big (right)."""
+    """Profit bubble: cost (left), markup/margin (center), gross profit (right)."""
     profit = s.get("gross_margin_sar") or 0.0
     profit_usd = s.get("gross_margin_usd") or 0.0
     sub = s.get("discounted_subtotal_sar") or 0.0
@@ -2208,30 +2234,43 @@ def _fin_bubble(left_label, left_val, middle_lines, right_label, right_val, posi
         f"<div style='{big}'>{right_val}</div></div></div>", unsafe_allow_html=True)
 
 
+def _centered_metric(col, label, value, delta=None):
+    lbl_s = "font-size:0.875rem;color:var(--text-color,#555);margin-bottom:2px"
+    val_s = "font-size:2rem;font-weight:700;line-height:1.2"
+    dlt_s = "font-size:0.8rem;color:#e05;margin-top:2px"
+    delta_html = f"<div style='{dlt_s}'>{delta}</div>" if delta else ""
+    col.markdown(
+        f"<div style='text-align:center'>"
+        f"<div style='{lbl_s}'>{label}</div>"
+        f"<div style='{val_s}'>{value}</div>"
+        f"{delta_html}</div>",
+        unsafe_allow_html=True)
+
+
 def _subtotal_metric(col, s: dict):
     discount = s.get("discount_sar") or 0.0
     if discount:
-        col.metric("Subtotal after discount (SAR)",
-                   f"{s['discounted_subtotal_sar']:,.2f}",
-                   delta=f"-{discount:,.2f} discount", delta_color="inverse")
+        _centered_metric(col, "Subtotal after discount (SAR)",
+                         f"{s['discounted_subtotal_sar']:,.2f}",
+                         delta=f"−{discount:,.2f} discount")
     else:
-        col.metric("Subtotal (SAR)", f"{s['subtotal_sar']:,.2f}")
+        _centered_metric(col, "Subtotal (SAR)", f"{s['subtotal_sar']:,.2f}")
 
 
 def _summary_metrics(s: dict):
     commission = s.get("commission_sar", 0) or 0.0
+    vat_lbl = f"VAT {calc.VAT_RATE * 100:g}% (SAR)"
     if commission:
         m1, m2, m3, m4 = st.columns(4)
         _subtotal_metric(m1, s)
-        m2.metric("Internal Commission (SAR)", f"{commission:,.2f}",
-                  help="Internal expense only; excluded from the client quotation and profit.")
-        m3.metric(f"VAT {calc.VAT_RATE * 100:g}% (SAR)", f"{s['vat_amount_sar']:,.2f}")
-        m4.metric("Grand Total (SAR)", f"{s['grand_total_sar']:,.2f}")
+        _centered_metric(m2, "Internal Commission (SAR)", f"{commission:,.2f}")
+        _centered_metric(m3, vat_lbl, f"{s['vat_amount_sar']:,.2f}")
+        _centered_metric(m4, "Grand Total (SAR)", f"{s['grand_total_sar']:,.2f}")
     else:
         m1, m2, m3 = st.columns(3)
         _subtotal_metric(m1, s)
-        m2.metric(f"VAT {calc.VAT_RATE * 100:g}% (SAR)", f"{s['vat_amount_sar']:,.2f}")
-        m3.metric("Grand Total (SAR)", f"{s['grand_total_sar']:,.2f}")
+        _centered_metric(m2, vat_lbl, f"{s['vat_amount_sar']:,.2f}")
+        _centered_metric(m3, "Grand Total (SAR)", f"{s['grand_total_sar']:,.2f}")
 
 
 def _project_details_readonly(meta: dict, system=""):
@@ -3669,6 +3708,23 @@ try:
     calc.CURRENCY_RATES["EUR"] = float(repo.get_setting("eur_to_usd") or 1.08)
 except (TypeError, ValueError):
     pass
+
+
+def _eur_rate_input(col, key: str):
+    """Inline EUR->USD rate widget. Saves to settings on change."""
+    def _save():
+        rate = float(st.session_state.get(key) or 1.08)
+        calc.CURRENCY_RATES["EUR"] = rate
+        repo.set_setting("eur_to_usd", rate)
+    col.number_input(
+        "1 EUR = ? USD",
+        min_value=0.5, max_value=2.5, step=0.01,
+        value=float(calc.CURRENCY_RATES.get("EUR", 1.08)),
+        format="%.4f",
+        key=key,
+        on_change=_save,
+        help="EUR to USD conversion rate used when pricing rows with EUR currency.",
+    )
 calc.CURRENCY_RATES["SAR"] = 1.0 / calc.SAR_PER_USD
 calc.CURRENCY_RATES["AED"] = 1.0 / calc.AED_PER_USD
 try:
@@ -4038,8 +4094,6 @@ elif mode == PROJECT_WORKSPACE_LABEL:
                 meta, repo.base_name(sheet or "").replace("BOQ", "").strip())
             active_tab = _offer_tab_selector(pid, bool(meta.get("Approved")))
             if active_tab == "BoQ":
-                _summary_metrics(s)
-
                 # Approval + archive controls (BoQ tab only).
                 apc1, apc2, apc3 = st.columns([2.2, 1, 1], vertical_alignment="center")
                 if meta.get("Archived"):
@@ -4072,6 +4126,7 @@ elif mode == PROJECT_WORKSPACE_LABEL:
                     elif apc3.button("📦 Archive", width="stretch"):
                         repo.archive_project(pid)
                         st.rerun()
+                _summary_metrics(s)
                 if admin:                   # gross-profit line (internal cost view) - BoQ tab only
                     _profit_banner(s)
                 cfg = {c: st.column_config.NumberColumn(c, format="accounting") for c in MONEY_COLS}
@@ -4079,8 +4134,8 @@ elif mode == PROJECT_WORKSPACE_LABEL:
                 cfg["Shipping %"] = st.column_config.NumberColumn("Shipping %", format="%.2f")
                 view_grid = disp[[c for c in BUILDER_COLS if c in disp.columns]].copy()
                 if meta.get("InclusionMode") == "included" and "_IncludedInItems" in disp.columns:
-                    view_grid.insert(0, "Include", disp["_IncludedInItems"].fillna(False).astype(bool))
-                    cfg["Include"] = st.column_config.CheckboxColumn("Include", disabled=True)
+                    view_grid.insert(0, "Included", disp["_IncludedInItems"].fillna(False).astype(bool))
+                    cfg["Included"] = st.column_config.CheckboxColumn("Included", disabled=True)
                 st.dataframe(view_grid, width="stretch", hide_index=True, column_config=cfg,
                              height=_editor_full_height(len(view_grid)), row_height=35)
             elif active_tab == "Tracking":
@@ -4499,20 +4554,10 @@ elif mode == "Settings":
                 "and the Finance tab. Changing it re-computes VAT on all offers."
             )
 
-            st.markdown("**Currencies / exchange rates**")
-            ecol1, ecol2 = st.columns([1, 2])
-            eur_rate = ecol1.number_input(
-                "1 EUR = ? USD",
-                min_value=0.0,
-                step=0.01,
-                format="%.4f",
-                value=float(repo.get_setting("eur_to_usd") or 1.08),
-                help="Converts EUR buy prices to USD when computing the Unit Cost.",
-            )
-            ecol2.caption(
-                f"Pegged (fixed, not editable): 1 USD = {calc.SAR_PER_USD:g} SAR "
-                f"(1 SAR ~= {1 / calc.SAR_PER_USD:.4f} USD)  |  "
-                f"1 USD = {calc.AED_PER_USD:g} AED (1 AED ~= {1 / calc.AED_PER_USD:.4f} USD)."
+            st.caption(
+                f"Pegged rates (fixed): 1 USD = {calc.SAR_PER_USD:g} SAR  |  "
+                f"1 USD = {calc.AED_PER_USD:g} AED. "
+                f"EUR rate is set directly in the offer editor."
             )
 
             saved_offer = st.form_submit_button("Save offer and pricing settings", type="primary")
@@ -4522,7 +4567,6 @@ elif mode == "Settings":
                 repo.set_setting("default_margin", float(dmargin))
                 repo.set_setting("revision_format", rev_fmt.strip() or "Rev.x")
                 repo.set_setting("revision_separator", sep_opts[rev_sep_lbl])
-                repo.set_setting("eur_to_usd", float(eur_rate))
                 repo.set_setting("vat_percent", float(vat_pct))
                 st.session_state.pop("cached_default_margin", None)
                 st.success("Offer and pricing settings saved.")
