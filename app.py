@@ -3956,7 +3956,6 @@ elif mode == PROJECT_WORKSPACE_LABEL:
             for col in MONEY_COLS:
                 if col in disp.columns:
                     disp[col] = disp[col].map(lambda v: calc.roundup(v, 0))
-            st.caption(f"DEBUG: InclusionMode={meta.get('InclusionMode')!r}")
             if meta.get("InclusionMode") == "included":
                 disp = calc.apply_inclusion(disp, float(meta.get("InclusionMarkup") or 1.6))
             s = calc.summarize(

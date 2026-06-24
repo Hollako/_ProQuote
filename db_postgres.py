@@ -59,7 +59,7 @@ ItemID Description Brand Model ListPriceUSD ExUnitCostUSD Currency ShippingPerce
 DefaultUPriceUSD DefaultUPriceSAR PriceUpdatedAt TimesQuoted LastSeenFile LastSeenAt LineID
 RowOrder Area System Qty FinalUnitCostUSD TotalCostUSD FinalUPriceUSD TPriceUSD FinalUPriceSAR
 TPriceSAR MarginExtra LineType Paid Received ReceivedQty Delivered DeliveredQty PONumber
-DeliveryNote PaidAt ReceivedAt DeliveredAt key value UserID Username DisplayName PasswordHash
+DeliveryNote PaidAt ReceivedAt DeliveredAt ReceivedRegion IncludedInItems InclusionMode InclusionMarkup key value UserID Username DisplayName PasswordHash
 Role Active CreatedAt Permission PayID AmountSAR InvoiceNo PurID PORef AuditID EventAt Action
 EntityType EntityID Summary OldValues NewValues Value Collected PO_Spend Count m n
 OfferCount CurrentValue Margin
