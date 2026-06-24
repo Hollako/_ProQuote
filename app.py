@@ -1126,14 +1126,32 @@ def render_editable_grid(state_key: str, editor_key: str, in_fragment: bool = Fa
     # List Price & Ex Unit Cost are in the row's chosen currency (drop the misleading $).
     colcfg["List Price $"] = st.column_config.NumberColumn("List Price", format="accounting")
     colcfg["Ex Unit Cost $"] = st.column_config.NumberColumn("Ex Unit Cost", format="accounting")
-    colcfg["Unit Cost $"] = st.column_config.NumberColumn("Unit Cost (USD)", format="accounting")
+    colcfg["Unit Cost $"] = st.column_config.NumberColumn(
+        "Unit Cost (USD)", format="accounting",
+        help="⚡ Conditional: editable only when Ex Unit Cost is blank. "
+             "If Ex Unit Cost is filled, Unit Cost is computed automatically.")
     colcfg["Shipping %"] = st.column_config.NumberColumn(
         "Shipping %", format="%.2f", min_value=0.0, step=5.0,
-        help="Added to Ex Unit Cost. Unit Cost = Ex Unit Cost x (1 + Shipping % / 100), in USD.")
+        help="Added to Ex Unit Cost. Unit Cost = Ex Unit Cost × (1 + Shipping% / 100), in USD.")
     colcfg["Markup x"] = st.column_config.NumberColumn(
         "Markup x", format="plain", min_value=0.0, step=None,
-        help="Multiplier on landed Unit Cost. U.Price $ = ⌈Unit Cost x Margin⌉. "
-             "Set 0 to type U.Price $ manually.")
+        help="Multiplier on Unit Cost → U. Price $. Set to 0 to enter U. Price $ manually.")
+    colcfg["U. Price $"] = st.column_config.NumberColumn(
+        "U. Price $", format="accounting",
+        help="⚡ Conditional: editable only when Markup x = 0. "
+             "If Markup x > 0, this is computed as ⌈Unit Cost × Markup x⌉.")
+    colcfg["Total Cost $"] = st.column_config.NumberColumn(
+        "Total Cost $", format="accounting",
+        help="🔒 Computed: Qty × Unit Cost $. Cannot be edited.")
+    colcfg["T. Price $"] = st.column_config.NumberColumn(
+        "T. Price $", format="accounting",
+        help="🔒 Computed: Qty × U. Price $. Cannot be edited.")
+    colcfg["U. Price SAR"] = st.column_config.NumberColumn(
+        "U. Price SAR", format="accounting",
+        help="🔒 Computed: U. Price $ × 3.75, rounded up to next multiple of 10. Cannot be edited.")
+    colcfg["T. Price SAR"] = st.column_config.NumberColumn(
+        "T. Price SAR", format="accounting",
+        help="🔒 Computed: Qty × U. Price SAR. Cannot be edited.")
     if show_included_col:
         colcfg["_IncludedInItems"] = st.column_config.CheckboxColumn(
             "Include", default=False,
@@ -1706,7 +1724,7 @@ def _new_project_editor():
     if "cached_default_margin" not in st.session_state:
         st.session_state.cached_default_margin = float(repo.get_setting("default_margin") or 1.6)
     _dm = st.session_state.cached_default_margin
-    catalogue_add("grid", _dm, "no", st.session_state.header["system"], show_clear=True)
+    catalogue_add("grid", _dm, "no", st.session_state.header["system"])
 
     # ---- Columns / Option label / Installation pricing row (same layout as Edit Offer) ----
     _show_incl = _inclusion_enabled() and h.get("inclusion_mode") == "included"
@@ -1714,7 +1732,7 @@ def _new_project_editor():
     no_column_order = _builder_column_order("editor", host=col_pick, width="stretch",
                                             show_include=_show_incl)
     h["option"] = option_col.text_input(
-        "Option label (optional)",
+        "Option label",
         key="no_option",
         placeholder="e.g. Dynalite, KNX",
         help="Name this alternative. Leave blank for a single-option offer.",
@@ -1733,8 +1751,6 @@ def _new_project_editor():
     st.session_state.header = h
 
     # ---- Editable grid (builder always shows costs) ----
-    st.caption("Edit **Qty · Ex Unit Cost · Shipping % · Markup x** → prices recalc automatically. "
-               "Locked columns are computed.")
     grid = render_editable_grid("grid", "editor", in_fragment=True,
                                 column_order=no_column_order,
                                 show_included_col=_show_incl)
