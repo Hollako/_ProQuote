@@ -952,7 +952,8 @@ def _copy_edit_system_widget():
 def _clear_offer_data_caches():
     """Ensure a just-saved offer is re-read when the editor closes or the page reruns."""
     for name in ("_cached_project_index", "_cached_project_grid", "_cached_offers_df",
-                 "_cached_finance_df", "_cached_report_dataset", "_cached_project_bundle"):
+                 "_cached_finance_df", "_cached_report_dataset", "_cached_project_bundle",
+                 "_cached_project_search", "_pg_db_stamp"):
         cached = globals().get(name)
         if cached is not None and hasattr(cached, "clear"):
             cached.clear()
@@ -2894,11 +2895,31 @@ def _catalogue_df_from_zip(uploaded_bytes: bytes) -> pd.DataFrame:
         raise ValueError("Not a valid catalogue ZIP backup.") from exc
 
 
+@st.cache_data(ttl=8, show_spinner=False, max_entries=1)
+def _pg_db_stamp():
+    """DB-side change stamp — consistent across all Streamlit workers.
+    Cached for 8 s to avoid a round-trip on every render.
+    """
+    url = os.environ.get("DATABASE_URL", "")
+    if not url:
+        return ("0",)
+    try:
+        import psycopg
+        with psycopg.connect(url) as conn:
+            row = conn.execute(
+                "SELECT MAX(projectid), COUNT(*), "
+                "MAX(COALESCE(updateddate, creationdate, '1970-01-01')) "
+                "FROM projects_master"
+            ).fetchone()
+        return tuple(str(v) for v in row) if row else ("0", "0", "")
+    except Exception:
+        return ("0",)
+
+
 def _db_cache_stamp():
     """Cache key that changes whenever the active database is written to."""
     if os.environ.get("DATABASE_URL", "").startswith("postgres"):
-        import db_postgres
-        return ("pg", db_postgres.write_epoch())
+        return ("pg", _pg_db_stamp())
     # SQLite: use file mtime + WAL size
     stamp = []
     for path in (db.DB_PATH, f"{db.DB_PATH}-wal"):
@@ -4064,6 +4085,9 @@ elif mode == PROJECT_WORKSPACE_LABEL:
                     st.session_state.view_pid = rid
                     st.session_state.pop("pdf_bytes", None)
                     st.session_state.pop("project_sheet_bytes", None)
+                    st.session_state.pop("del_expander_open", None)
+                    st.session_state.pop("del_confirm", None)
+                    st.session_state.pop("del_scope", None)
                     _clear_edit_widget_state()
                     st.session_state.edit_mode = False
                     _request_scroll_top()
@@ -4246,27 +4270,34 @@ elif mode == PROJECT_WORKSPACE_LABEL:
                     b6.button("⬇️ Download Project Sheet", disabled=True, width="stretch")
 
             if can("delete"):
-              with st.expander("Delete..."):
-                _rn = int(meta.get("RevisionNo") or 0)
-                _rlbl = repo.revision_token(_rn) if _rn > 0 else "Original"
-                _opt = meta.get("OptionLabel") or "-"
-                scopes = {
-                    f"This option only  ({_rlbl} · option {_opt})": "option",
-                    f"This revision  ({_rlbl} and all its options)": "revision",
-                    "This entire offer  (all revisions & options)": "offer",
-                }
-                pick = st.radio("What to delete", list(scopes), key="del_scope")
-                ids = repo.deletion_ids(pid, scopes[pick])
-                st.warning(f"Permanently deletes **{len(ids)}** entr"
-                           f"{'y' if len(ids) == 1 else 'ies'} (and their line items). "
-                           "This cannot be undone.")
-                ok = st.checkbox("Yes, permanently delete", key="del_confirm")
-                if st.button("Delete now", type="primary", disabled=not ok):
-                    n = repo.delete_projects(ids)
-                    st.session_state.pop("view_pid", None)
-                    st.session_state["_del_reset"] = True
-                    st.success(f"Deleted {n} entr{'y' if n == 1 else 'ies'}.")
-                    st.rerun()
+                def _del_keep_open():
+                    st.session_state["del_expander_open"] = True
+                with st.expander("Delete...", expanded=st.session_state.get("del_expander_open", False)):
+                    _rn = int(meta.get("RevisionNo") or 0)
+                    _rlbl = repo.revision_token(_rn) if _rn > 0 else "Original"
+                    _opt = meta.get("OptionLabel") or "-"
+                    scopes = {
+                        f"This option only  ({_rlbl} · option {_opt})": "option",
+                        f"This revision  ({_rlbl} and all its options)": "revision",
+                        "This entire offer  (all revisions & options)": "offer",
+                    }
+                    pick = st.radio("What to delete", list(scopes), key="del_scope",
+                                    on_change=_del_keep_open)
+                    ids = repo.deletion_ids(pid, scopes[pick])
+                    st.warning(f"Permanently deletes **{len(ids)}** entr"
+                               f"{'y' if len(ids) == 1 else 'ies'} (and their line items). "
+                               "This cannot be undone.")
+                    ok = st.checkbox("Yes, permanently delete", key="del_confirm",
+                                     on_change=_del_keep_open)
+                    if st.button("Delete now", type="primary", disabled=not ok):
+                        n = repo.delete_projects(ids)
+                        st.session_state.pop("view_pid", None)
+                        st.session_state.pop("del_confirm", None)
+                        st.session_state.pop("del_expander_open", None)
+                        st.session_state.pop("del_scope", None)
+                        st.session_state["_del_reset"] = True
+                        st.toast(f"Deleted {n} entr{'y' if n == 1 else 'ies'}.", icon="🗑️")
+                        st.rerun()
         else:
             _edit_panel(meta)
 

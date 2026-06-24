@@ -22,6 +22,28 @@ def write_epoch() -> int:
     return _write_epoch
 
 
+def db_stamp() -> tuple:
+    """DB-side change detector: consistent across all Streamlit workers.
+
+    Returns a tuple that changes whenever Projects_Master is inserted,
+    updated, or deleted — safe to use as a @st.cache_data key.
+    """
+    url = os.environ.get("DATABASE_URL", "")
+    if not url:
+        return (0,)
+    try:
+        import psycopg
+        with psycopg.connect(url) as conn:
+            row = conn.execute(
+                "SELECT MAX(projectid), COUNT(*), "
+                "MAX(COALESCE(updateddate, creationdate, '1970-01-01')) "
+                "FROM projects_master"
+            ).fetchone()
+        return tuple(str(v) for v in row) if row else ("0", "0", "")
+    except Exception:
+        return (str(_write_epoch),)
+
+
 TABLES_IN_LOAD_ORDER = (
     "Settings",
     "App_Assets",
