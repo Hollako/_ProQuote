@@ -613,6 +613,10 @@ def connect(database_url: str, actor: dict | None = None) -> PostgresConnection:
 # Additive column migrations for existing databases (never drop or rename).
 _COLUMN_MIGRATIONS = [
     "ALTER TABLE items_catalog ADD COLUMN IF NOT EXISTS discontinued INTEGER DEFAULT 0",
+    "ALTER TABLE project_boq_lines ADD COLUMN IF NOT EXISTS receivedregion TEXT",
+    "ALTER TABLE project_boq_lines ADD COLUMN IF NOT EXISTS includedinItems INTEGER DEFAULT 0",
+    "ALTER TABLE projects_master ADD COLUMN IF NOT EXISTS inclusionmode TEXT",
+    "ALTER TABLE projects_master ADD COLUMN IF NOT EXISTS inclusionmarkup DOUBLE PRECISION",
 ]
 
 
