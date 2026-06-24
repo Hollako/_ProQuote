@@ -1251,9 +1251,10 @@ def _edit_panel(meta):
     if ea4.button("X", key="ed_cancel", width="stretch", help="Close editor"):
         if st.session_state.pop("_edit_just_saved", False):
             _close_edit_mode()
+            st.rerun(scope="app")
         else:
             st.session_state.pending_close_edit = True
-        st.rerun()
+            st.rerun()
     if st.session_state.get("edit_show_cancel_dialog"):
         _cancel_edit_dialog()
 
@@ -1444,7 +1445,7 @@ def _edit_panel(meta):
         )
         if close_after_save:
             _close_edit_mode()
-            st.rerun()
+            st.rerun(scope="app")
         _mark_edit_clean()
     elif pending == "revision":
         npid, nname, nrev = repo.save_revision(
@@ -1496,9 +1497,10 @@ def _edit_panel(meta):
     if st.session_state.pop("pending_close_edit", False):
         if _edit_has_unsaved_changes():
             st.session_state.edit_show_cancel_dialog = True
+            st.rerun()
         else:
             _close_edit_mode()
-        st.rerun()
+            st.rerun(scope="app")
 
     if st.session_state.get("saved_rev"):
         pdf_col, download_col = st.columns(2)
