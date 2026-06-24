@@ -585,6 +585,7 @@ def _new_offer_header(overrides: dict | None = None) -> dict:
         "offer": _next_offer_no(), "system": _default_system(),
         "date": dt.date.today().isoformat(), "margin": 1.60,
         "project_sheet": dict(DEFAULT_PROJECT_SHEET_INFO),
+        "inclusion_mode": "excluded",
     }
     if overrides:
         header.update(overrides)
@@ -758,7 +759,7 @@ EDIT_WIDGET_KEYS = (
     "ed_ps_job_reference", "ed_ps_sheet_date", "ed_ps_lead_source", "ed_ps_commission",
     "ed_ps_shipment_by", "ed_ps_downpayment_date", "ed_ps_invoice_to",
     "ed_ps_delivery_instructions", "ed_ps_gm_signature",
-    "ed_inclusion_mode", "ed_inclusion_markup",
+    "ed_inclusion_mode",
     "_edit_just_saved",
 )
 
@@ -805,7 +806,6 @@ def _edit_snapshot() -> dict:
         "commission_mode": _snapshot_value(st.session_state.get("ed_commission_mode")),
         "option": _snapshot_value(st.session_state.get("ed_option")),
         "inclusion_mode": _snapshot_value(st.session_state.get("ed_inclusion_mode")),
-        "inclusion_markup": _snapshot_value(st.session_state.get("ed_inclusion_markup")),
     }
 
 
@@ -1023,7 +1023,6 @@ def _init_edit_state(pid: int, meta: dict, grid, sheet):
     # Read inclusion fields directly from DB to bypass any stale cache in meta
     _incl_meta = repo.project_meta(pid)
     st.session_state["ed_inclusion_mode"] = _incl_meta.get("InclusionMode") or "excluded"
-    st.session_state["ed_inclusion_markup"] = float(_incl_meta.get("InclusionMarkup") or 1.6)
     for k in ("ed_discount_percent", "ed_discount_driver", "ed_discount_subtotal"):
         st.session_state.pop(k, None)
     st.session_state.edit_dirty_snapshot = _edit_snapshot()
@@ -1044,6 +1043,19 @@ def _close_edit_mode():
         "saved_export_header", "saved_export_grid", "saved_export_summary",
     ):
         st.session_state.pop(key, None)
+    # If we were editing a just-saved offer, navigate to the load view so the
+    # user lands on the offer page (not the empty new-offer form).
+    _fam = st.session_state.pop("_just_saved_fam", None)
+    _pid = st.session_state.pop("_just_saved_pid", None)
+    st.session_state.pop("_just_saved_meta", None)
+    if _fam:
+        for _k in ("load_search_snapshot", "load_search_name", "load_search_offer",
+                   "load_filter_sales", "load_filter_presales", "load_filter_pm"):
+            st.session_state.pop(_k, None)
+        st.session_state["load_fam"] = _fam
+        if _pid:
+            st.session_state["view_pid"] = _pid
+        st.session_state["project_workspace_view"] = "load"
 
 
 @st.dialog("Unsaved changes", width="small", dismissible=False)
@@ -1101,6 +1113,8 @@ def render_editable_grid(state_key: str, editor_key: str, in_fragment: bool = Fa
     Pre-applies the pending delta before rendering so computed columns are correct in
     the single auto-rerun that data_editor already fires — no second rerun needed."""
     original_base = st.session_state[state_key].reset_index(drop=True)
+    if "_RowOrder" not in original_base.columns:
+        original_base["_RowOrder"] = range(1, len(original_base) + 1)
     n_base = len(original_base)
 
     colcfg = {c: st.column_config.NumberColumn(c, format="accounting") for c in MONEY_COLS}
@@ -1124,7 +1138,11 @@ def render_editable_grid(state_key: str, editor_key: str, in_fragment: bool = Fa
         colcfg["_IncludedInItems"] = st.column_config.CheckboxColumn(
             "Include", default=False,
             help="When checked, this row's cost is distributed proportionally to other item prices.")
-    order = column_order if column_order is not None else _builder_column_order(editor_key)
+    colcfg["_RowOrder"] = st.column_config.NumberColumn(
+        "#", min_value=1, step=1, format="%d",
+        help="Row position. Change the number to reorder; lower = higher up.")
+    _base_order = column_order if column_order is not None else _builder_column_order(editor_key)
+    order = ("_RowOrder",) + tuple(c for c in _base_order if c != "_RowOrder")
 
     # Read the delta BEFORE data_editor processes it.
     raw_delta = st.session_state.get(editor_key)
@@ -1145,7 +1163,9 @@ def render_editable_grid(state_key: str, editor_key: str, in_fragment: bool = Fa
         for new_row in delta.get("added_rows", []):
             blank = calc.blank_row()
             blank.update({k: v for k, v in new_row.items() if k in blank})
+            blank["_RowOrder"] = len(rec) + 1
             rec = pd.concat([rec, pd.DataFrame([blank])], ignore_index=True)
+        rec["_RowOrder"] = range(1, len(rec) + 1)
         new_grid = calc.recompute(rec)
         st.session_state[state_key] = new_grid
         st.session_state.pop(editor_key, None)
@@ -1170,11 +1190,19 @@ def render_editable_grid(state_key: str, editor_key: str, in_fragment: bool = Fa
         working["_IncludedInItems"] = False
     else:
         working["_IncludedInItems"] = working["_IncludedInItems"].fillna(False).astype(bool)
+    if show_included_col:
+        incl_mask = working["_IncludedInItems"].astype(bool)
+        working.loc[incl_mask, "Markup x"] = 0.0
+    if "_RowOrder" not in working.columns:
+        working["_RowOrder"] = range(1, len(working) + 1)
+    else:
+        working = working.sort_values("_RowOrder", kind="stable").reset_index(drop=True)
+        working["_RowOrder"] = range(1, len(working) + 1)
     working = calc.recompute(working)
     # Store now so the Totals section rendered after this call sees the updated values.
     st.session_state[state_key] = working
 
-    display_cols = BUILDER_COLS + (["_IncludedInItems"] if show_included_col else [])
+    display_cols = BUILDER_COLS + (["_IncludedInItems"] if show_included_col else []) + ["_RowOrder"]
     display_grid = working[display_cols] if not working.empty else working
     edited = st.data_editor(
         display_grid,
@@ -1198,6 +1226,12 @@ def render_editable_grid(state_key: str, editor_key: str, in_fragment: bool = Fa
             bool(working["_IncludedInItems"].iloc[i]) if i < m else False
             for i in range(n)
         ]
+    # _RowOrder from edited (user may have changed it); fall back to working.
+    if "_RowOrder" in edited.columns:
+        edited["_RowOrder"] = pd.to_numeric(edited["_RowOrder"], errors="coerce").fillna(0).astype(int)
+    else:
+        m = len(working)
+        edited["_RowOrder"] = [int(working["_RowOrder"].iloc[i]) if i < m else n + 1 for i in range(n)]
     final_grid = calc.recompute(edited)
     st.session_state[state_key] = final_grid
     return final_grid
@@ -1319,7 +1353,7 @@ def _edit_panel(meta):
         st.session_state.cached_default_margin = float(repo.get_setting("default_margin") or 1.6)
     catalogue_add("edit_grid", st.session_state.cached_default_margin, "ed",
                   st.session_state.get("edit_system", ""))
-    col_pick, option_col, inc_c1, inc_c2 = st.columns([0.9, 1.8, 1.8, 0.8], vertical_alignment="bottom")
+    col_pick, option_col, inc_c1 = st.columns([0.9, 1.8, 1.8], vertical_alignment="bottom")
     _show_incl = _inclusion_enabled() and st.session_state.get("ed_inclusion_mode") == "included"
     edit_column_order = _builder_column_order("edit_editor", host=col_pick, width="stretch",
                                               show_include=_show_incl)
@@ -1332,8 +1366,6 @@ def _edit_panel(meta):
 
     if "ed_inclusion_mode" not in st.session_state:
         st.session_state["ed_inclusion_mode"] = "excluded"
-    if "ed_inclusion_markup" not in st.session_state:
-        st.session_state["ed_inclusion_markup"] = 1.6
     if _inclusion_enabled():
         inc_mode = inc_c1.selectbox(
             "Installation pricing",
@@ -1342,17 +1374,8 @@ def _edit_panel(meta):
                                   else "Installation Included in item prices",
             key="ed_inclusion_mode",
         )
-        if inc_mode == "included":
-            inc_markup = inc_c2.number_input(
-                "Markup ×", min_value=0.01, step=0.1, format="%.2f",
-                key="ed_inclusion_markup",
-                help="Included rows' selling price = Total Cost × this markup, then distributed to items.",
-            )
-        else:
-            inc_markup = float(st.session_state.get("ed_inclusion_markup") or 1.6)
     else:
         inc_mode = "excluded"
-        inc_markup = float(st.session_state.get("ed_inclusion_markup") or 1.6)
 
 
 
@@ -1363,7 +1386,7 @@ def _edit_panel(meta):
     st.markdown("##### Totals")
     edit_calc_grid = calc.recompute(st.session_state.edit_grid)
     if inc_mode == "included":
-        edit_totals_grid = calc.apply_inclusion(edit_calc_grid, inc_markup)
+        edit_totals_grid = calc.apply_inclusion(edit_calc_grid)
     else:
         edit_totals_grid = edit_calc_grid
     edit_base_summary = calc.summarize(edit_totals_grid, 0)
@@ -1400,7 +1423,7 @@ def _edit_panel(meta):
         st.session_state.saved_export_header = h
         raw_grid = calc.recompute(st.session_state.edit_grid)
         if inc_mode == "included":
-            st.session_state.saved_export_grid = calc.apply_inclusion(raw_grid, inc_markup)
+            st.session_state.saved_export_grid = calc.apply_inclusion(raw_grid)
         else:
             st.session_state.saved_export_grid = raw_grid
         st.session_state.saved_export_summary = dict(s)
@@ -1430,7 +1453,7 @@ def _edit_panel(meta):
             system_suffix=st.session_state.get("edit_system") or _default_system(), terms=edit_terms,
             project_sheet_info=edit_project_sheet, header=edit_header,
             option_label=pending_option_label,
-            inclusion_mode=inc_mode, inclusion_markup=inc_markup)
+            inclusion_mode=inc_mode)
         _clear_offer_data_caches()
         saved_option_label = _text(
             repo.project_meta(st.session_state.edit_pid).get("OptionLabel")
@@ -1458,7 +1481,7 @@ def _edit_panel(meta):
             system_suffix=st.session_state.get("edit_system") or _default_system(),
             terms=edit_terms, option_label=pending_option_label,
             project_sheet_info=edit_project_sheet, header=edit_header,
-            inclusion_mode=inc_mode, inclusion_markup=inc_markup)
+            inclusion_mode=inc_mode)
         _clear_offer_data_caches()
         saved_option_label = _text(repo.project_meta(npid).get("OptionLabel"))
         _post_save(npid, nname, nrev)
@@ -1483,7 +1506,7 @@ def _edit_panel(meta):
                 factors=(s["markup_factor"], None, None),
                 system_suffix=st.session_state.get("edit_system") or _default_system(), terms=edit_terms,
                 project_sheet_info=edit_project_sheet, header=edit_header,
-                inclusion_mode=inc_mode, inclusion_markup=inc_markup)
+                inclusion_mode=inc_mode)
             _clear_offer_data_caches()
             saved_option_label = _text(repo.project_meta(npid).get("OptionLabel"))
             _post_save(npid, nname, nrev)
@@ -1564,6 +1587,10 @@ def _new_offer_actions():
         _done = st.session_state.get("no_saved_options", [])
         if st.session_state.grid.empty:
             st.warning("Grid is empty.")
+        elif not h.get("project", "").strip():
+            st.warning("Project name is required.")
+        elif not h.get("client", "").strip():
+            st.warning("Client name is required.")
         elif _locked_now and not _optname:
             st.warning("Enter an Option label for this alternative (e.g. KNX).")
         elif _optname and _optname in _done:
@@ -1591,6 +1618,7 @@ def _new_offer_actions():
                 phone=h.get("phone"),
                 contractor=h.get("contractor"),
                 region=h.get("region"),
+                inclusion_mode=h.get("inclusion_mode", "excluded"),
             )
             # Load the saved offer and open it directly in edit mode.
             _sys, _meta, _grid, _ = _cached_project_bundle(pid, (pid,), _db_cache_stamp())
@@ -1598,10 +1626,10 @@ def _new_offer_actions():
             _init_edit_state(pid, _meta, _grid, _sheet)
             _prime_new_offer_form()
             _clear_offer_data_caches()
-            st.session_state["project_workspace_view"] = "load"
-            st.session_state["load_fam"] = repo.family_key(
+            st.session_state["_just_saved_meta"] = _meta
+            st.session_state["_just_saved_fam"] = repo.family_key(
                 _meta.get("OfferNo") or "", _meta.get("ProjectName") or "")
-            st.session_state["view_pid"] = pid
+            st.session_state["_just_saved_pid"] = pid
             _request_scroll_top()
             st.rerun()
 
@@ -1673,13 +1701,6 @@ def _new_offer_actions():
 def _new_project_editor():
     _sync_new_header_from_widgets()
     h = st.session_state.header
-    opt_col, _ = st.columns([1.4, 3.6])
-    h["option"] = opt_col.text_input(
-        "Option label (optional)",
-        key="no_option",
-        help="Name this alternative (e.g. Dynalite, KNX). Leave blank for a single-option offer.",
-    )
-    st.session_state.header = h
 
     # ---- Add items from catalogue ----
     if "cached_default_margin" not in st.session_state:
@@ -1687,10 +1708,36 @@ def _new_project_editor():
     _dm = st.session_state.cached_default_margin
     catalogue_add("grid", _dm, "no", st.session_state.header["system"], show_clear=True)
 
+    # ---- Columns / Option label / Installation pricing row (same layout as Edit Offer) ----
+    _show_incl = _inclusion_enabled() and h.get("inclusion_mode") == "included"
+    col_pick, option_col, inc_c1 = st.columns([0.9, 1.8, 1.8], vertical_alignment="bottom")
+    no_column_order = _builder_column_order("editor", host=col_pick, width="stretch",
+                                            show_include=_show_incl)
+    h["option"] = option_col.text_input(
+        "Option label (optional)",
+        key="no_option",
+        placeholder="e.g. Dynalite, KNX",
+        help="Name this alternative. Leave blank for a single-option offer.",
+    )
+    if _inclusion_enabled():
+        h["inclusion_mode"] = inc_c1.selectbox(
+            "Installation pricing",
+            options=["excluded", "included"],
+            index=0 if h.get("inclusion_mode", "excluded") == "excluded" else 1,
+            format_func=lambda x: "Installation Excluded (standard)" if x == "excluded"
+                                  else "Installation Included in item prices",
+            key="no_inclusion_mode",
+        )
+    else:
+        h["inclusion_mode"] = "excluded"
+    st.session_state.header = h
+
     # ---- Editable grid (builder always shows costs) ----
     st.caption("Edit **Qty · Ex Unit Cost · Shipping % · Markup x** → prices recalc automatically. "
                "Locked columns are computed.")
-    grid = render_editable_grid("grid", "editor", in_fragment=True)
+    grid = render_editable_grid("grid", "editor", in_fragment=True,
+                                column_order=no_column_order,
+                                show_included_col=_show_incl)
 
     # ---- Discount + totals ----
     st.markdown("##### Totals")
@@ -1732,7 +1779,7 @@ def catalogue_add(state_key: str, default_margin: float, kp: str, default_system
         a2.text_input("Updated On", _fmt_month_year(chosen.get("PriceUpdatedAt")),
                       disabled=True, key=f"{kp}_price_updated_{chosen.get('ItemID')}")
         qty = a3.number_input("Qty", min_value=1, value=1, step=1, key=f"{kp}_qty")
-        area = a4.text_input("Area", value=default_system, key=f"{kp}_area")
+        area = a4.text_input("Area", value="All Areas", key=f"{kp}_area")
         system = a5.text_input("System", value=default_system, key=f"{kp}_system")
         if a6.button("➕ Add", width="stretch", key=f"{kp}_add"):
             _add_row_to(state_key, repo.item_to_grid_row(
@@ -2076,7 +2123,7 @@ def revision_options(base_pid):
             if col in g.columns:
                 g[col] = g[col].map(lambda v: calc.roundup(v, 0))
         if m.get("InclusionMode") == "included":
-            g = calc.apply_inclusion(g, float(m.get("InclusionMarkup") or 1.6))
+            g = calc.apply_inclusion(g)
         out.append({"label": m.get("OptionLabel") or "",
                     "grid": g, "summary": calc.summarize(
                         g, m.get("DiscountAmount") or 0, m.get("CommissionAmount") or 0)})
@@ -3624,6 +3671,11 @@ st.session_state["project_workspace_view"] = project_workspace_view
 
 # ============================ NEW OFFER ============================
 if mode == PROJECT_WORKSPACE_LABEL and project_workspace_view == "new":
+    # If a new offer was just saved, show the edit panel directly instead of the form.
+    if st.session_state.get("edit_mode") and st.session_state.get("_just_saved_meta") is not None:
+        _edit_panel(st.session_state["_just_saved_meta"])
+        st.stop()
+
     duplicate = st.session_state.pop("_duplicate_offer", None)
     if duplicate:
         _prime_new_offer_form(
@@ -3957,7 +4009,7 @@ elif mode == PROJECT_WORKSPACE_LABEL:
                 if col in disp.columns:
                     disp[col] = disp[col].map(lambda v: calc.roundup(v, 0))
             if meta.get("InclusionMode") == "included":
-                disp = calc.apply_inclusion(disp, float(meta.get("InclusionMarkup") or 1.6))
+                disp = calc.apply_inclusion(disp)
             s = calc.summarize(
                 disp, meta.get("DiscountAmount") or 0, meta.get("CommissionAmount") or 0)
 

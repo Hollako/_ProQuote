@@ -1215,7 +1215,7 @@ def list_systems(project_id: int) -> list[str]:
 
 def load_project_grid(project_id: int, sheet_name: str | None = None) -> pd.DataFrame:
     """Load a project's lines into a UI/PDF-ready grid DataFrame."""
-    sql = """SELECT Area,System,Description,Brand,Model,Qty,
+    sql = """SELECT l.RowOrder,Area,System,Description,Brand,Model,Qty,
                     ListPriceUSD,ExUnitCostUSD,Currency,ShippingPercent,FinalUnitCostUSD,TotalCostUSD,
                     FinalUPriceUSD,TPriceUSD,FinalUPriceSAR,TPriceSAR,MarginExtra,
                     LineType,ItemID,IFNULL(IncludedInItems,0) IncludedInItems
@@ -1245,6 +1245,7 @@ def _grid_from_rows(rows) -> pd.DataFrame:
         "MarginExtra": "Markup x",
         "ItemID": "_ItemID",
         "IncludedInItems": "_IncludedInItems",
+        "RowOrder": "_RowOrder",
     })
     df["Cur"] = df["Cur"].apply(lambda v: v if str(v) in calc.CURRENCIES else "USD")
     df["Shipping %"] = [
@@ -1263,7 +1264,11 @@ def _grid_from_rows(rows) -> pd.DataFrame:
         df["_IncludedInItems"] = False
     else:
         df["_IncludedInItems"] = df["_IncludedInItems"].fillna(0).astype(bool)
-    return df[[c for c in calc.GRID_COLUMNS] + ["LineType", "_ItemID", "_IncludedInItems"]]
+    if "_RowOrder" not in df.columns:
+        df["_RowOrder"] = range(1, len(df) + 1)
+    else:
+        df["_RowOrder"] = pd.to_numeric(df["_RowOrder"], errors="coerce").fillna(0).astype(int)
+    return df[[c for c in calc.GRID_COLUMNS] + ["LineType", "_ItemID", "_IncludedInItems", "_RowOrder"]]
 
 
 def load_project_bundle(project_id: int, family_project_ids=()):
@@ -1284,7 +1289,7 @@ def load_project_bundle(project_id: int, family_project_ids=()):
             (project_id,),
         ),
         (
-            """SELECT Area,System,Description,Brand,Model,Qty,
+            """SELECT l.RowOrder,Area,System,Description,Brand,Model,Qty,
                       ListPriceUSD,ExUnitCostUSD,Currency,ShippingPercent,
                       FinalUnitCostUSD,TotalCostUSD,FinalUPriceUSD,TPriceUSD,
                       FinalUPriceSAR,TPriceSAR,MarginExtra,LineType,ItemID,

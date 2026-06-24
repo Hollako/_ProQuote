@@ -259,54 +259,17 @@ def blank_row(area="", system="", line_type="item") -> dict:
     row["Shipping %"] = DEFAULT_SHIPPING_PERCENT
     row["LineType"] = line_type
     row["_IncludedInItems"] = False
+    row["_RowOrder"] = 0
     return row
 
 
-def apply_inclusion(df: pd.DataFrame, markup: float) -> pd.DataFrame:
-    """Distribute included rows' selling price proportionally across regular rows.
-
-    Included rows (where _IncludedInItems is True) have their selling price computed
-    as TotalCost$ × markup, then that total is distributed to regular item rows in
-    proportion to each regular row's T. Price $. The included rows get LineType
-    "included" and their price columns are zeroed (PDF renders them as "Included").
-    """
+def apply_inclusion(df: pd.DataFrame, markup: float = 1.0) -> pd.DataFrame:
+    """Zero selling prices for included rows and mark them as LineType='included'."""
     df = df.copy()
     if "_IncludedInItems" not in df.columns:
         return df
-
-    markup = max(_num(markup), 0.001)
     included_mask = df["_IncludedInItems"].fillna(False).astype(bool)
-    regular_mask = ~included_mask & (df.get("LineType", "item").astype(str) != "discount")
-
-    included_df = df[included_mask]
-    regular_df = df[regular_mask]
-
-    # Mark included rows regardless of whether there's anything to distribute
     df.loc[included_mask, "LineType"] = "included"
-    for col in ["U. Price $", "T. Price $", "U. Price SAR", "T. Price SAR"]:
+    for col in ["Markup x", "U. Price $", "T. Price $", "U. Price SAR", "T. Price SAR"]:
         df.loc[included_mask, col] = 0.0
-
-    if included_df.empty or regular_df.empty:
-        return df
-
-    included_selling_usd = float((included_df["Total Cost $"].map(_num) * markup).sum())
-    if included_selling_usd <= 0:
-        return df
-
-    regular_t_total = float(regular_df["T. Price $"].map(_num).sum())
-    if regular_t_total <= 0:
-        return df
-
-    for idx in regular_df.index:
-        row = df.loc[idx]
-        share = _num(row["T. Price $"]) / regular_t_total
-        qty = max(_num(row["Qty"]), 1.0)
-        additional_per_unit = (included_selling_usd * share) / qty
-        new_u = roundup(_num(row["U. Price $"]) + additional_per_unit, 0)
-        new_u_sar = roundup_to(new_u * SAR_PER_USD, SAR_ROUND_TO)
-        df.at[idx, "U. Price $"] = new_u
-        df.at[idx, "T. Price $"] = roundup(qty * new_u, 0)
-        df.at[idx, "U. Price SAR"] = new_u_sar
-        df.at[idx, "T. Price SAR"] = roundup(qty * new_u_sar, 0)
-
     return df
