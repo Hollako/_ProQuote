@@ -275,7 +275,7 @@ div[data-testid="stPopover"] button p { font-size: 1.05rem; }
   width: 100%;
   text-align: center;
   white-space: nowrap;
-  font-size: 0.74rem;
+  font-size: 0.82rem;
   color: #7b8490;
   line-height: 1.2;
   min-height: 0.95rem;
@@ -291,6 +291,10 @@ div[data-testid="stPopover"] button p { font-size: 1.05rem; }
   border-top: 1px solid #e3e8ef;
   margin: 0.28rem 0 0.42rem 0;
 }
+[data-testid="stHorizontalBlock"]:has(.tracking-header),
+[data-testid="stHorizontalBlock"]:has(.tracking-stamp) {
+  gap: 0.4rem !important;
+}
 [class*="price_updated_"] input:disabled {
   color: #172033 !important;
   -webkit-text-fill-color: #172033 !important;
@@ -305,14 +309,14 @@ div[data-testid="stPopover"] button p { font-size: 1.05rem; }
 # Full internal grid (builder always sees costs; the client PDF never shows costs).
 BUILDER_COLS = ["Area", "System", "Description", "Brand", "Model", "Qty",
                 "Cur", "List Price $", "Ex Unit Cost $", "Shipping %", "Unit Cost $", "Total Cost $",
-                "Margin x", "U. Price $", "T. Price $", "U. Price SAR", "T. Price SAR"]
+                "Markup x", "U. Price $", "T. Price $", "U. Price SAR", "T. Price SAR"]
 # Pure outputs - locked in the editor (everything else is an input/driver).
 COMPUTED = ["Total Cost $", "T. Price $", "U. Price SAR", "T. Price SAR"]
 MONEY_COLS = ["List Price $", "Ex Unit Cost $", "Unit Cost $", "Total Cost $",
               "U. Price $", "T. Price $", "U. Price SAR", "T. Price SAR"]
 # Numeric inputs that affect computed prices - a change triggers one auto-rerun
 # so the recomputed columns refresh immediately (no st.data_editor 1-step lag).
-NUM_DRIVERS = ["Qty", "Ex Unit Cost $", "Shipping %", "Unit Cost $", "Margin x", "U. Price $"]
+NUM_DRIVERS = ["Qty", "Ex Unit Cost $", "Shipping %", "Unit Cost $", "Markup x", "U. Price $"]
 # Reviewing a loaded offer shows selling prices only - all cost columns hidden.
 PRICE_VIEW_COLS = ["Area", "System", "Description", "Brand", "Model", "Qty",
                    "U. Price $", "T. Price $", "U. Price SAR", "T. Price SAR"]
@@ -370,6 +374,15 @@ def _ps_enabled() -> bool:
     if "cached_ps_enabled" not in st.session_state:
         st.session_state.cached_ps_enabled = repo.get_setting("project_sheet_enabled") != "0"
     return st.session_state.cached_ps_enabled
+
+
+def _inclusion_enabled() -> bool:
+    """Installation Included pricing mode is off unless explicitly enabled in Settings."""
+    if "cached_inclusion_enabled" not in st.session_state:
+        st.session_state.cached_inclusion_enabled = (
+            repo.get_setting("installation_inclusion_enabled") == "1"
+        )
+    return st.session_state.cached_inclusion_enabled
 
 
 @st.fragment
@@ -709,15 +722,21 @@ def _ctr(col, text, header: bool = False):
     col.markdown(f"<div style='{style}'>{text}</div>", unsafe_allow_html=True)
 
 
-def _builder_column_order(editor_key: str, host=st, width="content"):
+def _builder_column_order(editor_key: str, host=st, width="content", show_include: bool = False):
     # The app owns this preference so hidden columns stay hidden after editor reruns.
     with host.popover("⚙ Columns", help="Show / hide columns - your choice sticks across edits.",
                       width=width):
         st.markdown("<div style='min-width:320px'></div>", unsafe_allow_html=True)
         cc = st.columns(2)
-        visible = [col for i, col in enumerate(BUILDER_COLS)
-                   if cc[i % 2].checkbox(col, value=True, key=f"{editor_key}_show_{col}")]
-    return tuple(c for c in BUILDER_COLS if c in visible) or tuple(BUILDER_COLS)
+        all_cols = (["_IncludedInItems"] if show_include else []) + list(BUILDER_COLS)
+        labels = {"_IncludedInItems": "Include"}
+        visible = [col for i, col in enumerate(all_cols)
+                   if cc[i % 2].checkbox(labels.get(col, col), value=True,
+                                         key=f"{editor_key}_show_{col}")]
+    base = tuple(c for c in BUILDER_COLS if c in visible) or tuple(BUILDER_COLS)
+    if show_include and "_IncludedInItems" in visible:
+        return ("_IncludedInItems",) + base
+    return base
 
 
 def _editor_full_height(row_count: int) -> int:
@@ -739,6 +758,8 @@ EDIT_WIDGET_KEYS = (
     "ed_ps_job_reference", "ed_ps_sheet_date", "ed_ps_lead_source", "ed_ps_commission",
     "ed_ps_shipment_by", "ed_ps_downpayment_date", "ed_ps_invoice_to",
     "ed_ps_delivery_instructions", "ed_ps_gm_signature",
+    "ed_inclusion_mode", "ed_inclusion_markup",
+    "_edit_just_saved",
 )
 
 
@@ -759,7 +780,7 @@ def _grid_snapshot(grid: pd.DataFrame) -> list[dict]:
     if grid is None:
         return []
     df = calc.recompute(grid).reset_index(drop=True).copy()
-    cols = [c for c in BUILDER_COLS + ["LineType", "_ItemID"] if c in df.columns]
+    cols = [c for c in BUILDER_COLS + ["LineType", "_ItemID", "_IncludedInItems"] if c in df.columns]
     return [
         {col: _snapshot_value(row.get(col)) for col in cols}
         for row in df[cols].to_dict("records")
@@ -783,6 +804,8 @@ def _edit_snapshot() -> dict:
         "commission_percent": _snapshot_value(st.session_state.get("ed_commission_percent")),
         "commission_mode": _snapshot_value(st.session_state.get("ed_commission_mode")),
         "option": _snapshot_value(st.session_state.get("ed_option")),
+        "inclusion_mode": _snapshot_value(st.session_state.get("ed_inclusion_mode")),
+        "inclusion_markup": _snapshot_value(st.session_state.get("ed_inclusion_markup")),
     }
 
 
@@ -918,7 +941,7 @@ def _copy_edit_system_widget():
 def _clear_offer_data_caches():
     """Ensure a just-saved offer is re-read when the editor closes or the page reruns."""
     for name in ("_cached_project_index", "_cached_project_grid", "_cached_offers_df",
-                 "_cached_finance_df", "_cached_report_dataset"):
+                 "_cached_finance_df", "_cached_report_dataset", "_cached_project_bundle"):
         cached = globals().get(name)
         if cached is not None and hasattr(cached, "clear"):
             cached.clear()
@@ -935,12 +958,81 @@ def _mark_edit_clean():
     st.session_state.edit_dirty_snapshot = _edit_snapshot()
     st.session_state.edit_show_cancel_dialog = False
     st.session_state.edit_close_after_save = False
+    st.session_state["_edit_just_saved"] = True
 
 
 def _clear_edit_widget_state():
     """Remove every per-offer edit value so it cannot leak into another edit."""
     for key in EDIT_WIDGET_KEYS:
         st.session_state.pop(key, None)
+
+
+def _init_edit_state(pid: int, meta: dict, grid, sheet):
+    """Populate all session-state keys needed to open the edit panel for a project."""
+    _clear_edit_widget_state()
+    st.session_state.edit_grid = calc.recompute(grid.copy())
+    st.session_state.edit_key = f"{pid}::{sheet}"
+    st.session_state.edit_pid = pid
+    _loaded_system = (repo.base_name(sheet or "").replace("BOQ", "").strip() or _default_system())
+    st.session_state.edit_system = repo.system_name(_loaded_system)
+    st.session_state.edit_discount = abs(float(meta.get("DiscountAmount") or 0))
+    st.session_state.edit_commission = abs(float(meta.get("CommissionAmount") or 0))
+    st.session_state.ed_commission_percent = abs(float(meta.get("CommissionPercent") or 0))
+    st.session_state.ed_commission_mode = (
+        meta.get("CommissionMode") if meta.get("CommissionMode") in COMMISSION_MODES
+        else "Deduct from profit"
+    )
+    st.session_state.ed_commission_applied_percent = (
+        st.session_state.ed_commission_percent
+        if st.session_state.ed_commission_mode == "Protect profit" else 0.0
+    )
+    st.session_state.edit_terms = {**DEFAULT_TERMS, **repo.load_terms(meta)}
+    st.session_state.edit_terms["system_note"] = st.session_state.edit_system
+    st.session_state.edit_header = {
+        "client": _text(meta.get("ClientName")), "project": _text(meta.get("ProjectName")),
+        "contact": _text(meta.get("ContactName")), "phone": _text(meta.get("ContactPhone")),
+        "contractor": _text(meta.get("Contractor")), "region": _text(meta.get("Region")),
+        "sales": _text(meta.get("SalesPerson")),
+        "presales": _text(meta.get("PresalesEngineer")),
+        "pm": _text(meta.get("ProjectManager")),
+    }
+    for field, widget_key in {
+        "client": "eh_client", "project": "eh_project", "contact": "eh_contact",
+        "phone": "eh_phone", "contractor": "eh_contractor", "region": "eh_region",
+        "sales": "eh_sales", "presales": "eh_presales", "pm": "eh_pm",
+    }.items():
+        value = st.session_state.edit_header.get(field, "")
+        st.session_state[widget_key] = value if value else (
+            "-" if field in ("sales", "presales", "pm") else ""
+        )
+    st.session_state["eh_system"] = st.session_state.edit_system
+    st.session_state.edit_project_sheet = {
+        **DEFAULT_PROJECT_SHEET_INFO, **repo.load_project_sheet_info(meta)
+    }
+    for src, key in {
+        "job_reference": "ed_ps_job_reference", "sheet_date": "ed_ps_sheet_date",
+        "lead_source": "ed_ps_lead_source", "commission": "ed_ps_commission",
+        "shipment_by": "ed_ps_shipment_by", "downpayment_date": "ed_ps_downpayment_date",
+        "invoice_to": "ed_ps_invoice_to",
+        "delivery_instructions": "ed_ps_delivery_instructions",
+        "gm_signature": "ed_ps_gm_signature",
+    }.items():
+        st.session_state[key] = st.session_state.edit_project_sheet.get(
+            src, DEFAULT_PROJECT_SHEET_INFO.get(src, ""))
+    st.session_state["ed_option"] = meta.get("OptionLabel") or ""
+    # Read inclusion fields directly from DB to bypass any stale cache in meta
+    _incl_meta = repo.project_meta(pid)
+    st.session_state["ed_inclusion_mode"] = _incl_meta.get("InclusionMode") or "excluded"
+    st.session_state["ed_inclusion_markup"] = float(_incl_meta.get("InclusionMarkup") or 1.6)
+    for k in ("ed_discount_percent", "ed_discount_driver", "ed_discount_subtotal"):
+        st.session_state.pop(k, None)
+    st.session_state.edit_dirty_snapshot = _edit_snapshot()
+    st.session_state.edit_show_cancel_dialog = False
+    st.session_state.edit_close_after_save = False
+    st.session_state.edit_mode = True
+    for k in ("pdf_bytes", "project_sheet_bytes", "saved_rev",
+              "saved_export_header", "saved_export_grid", "saved_export_summary"):
+        st.session_state.pop(k, None)
 
 
 def _close_edit_mode():
@@ -1003,7 +1095,7 @@ def _approve_offer_dialog(project_id: int, offer_label: str):
 
 
 def render_editable_grid(state_key: str, editor_key: str, in_fragment: bool = False,
-                         column_order=None):
+                         column_order=None, show_included_col: bool = False):
     """Full editable grid (all columns) with live recompute.
 
     Pre-applies the pending delta before rendering so computed columns are correct in
@@ -1024,10 +1116,14 @@ def render_editable_grid(state_key: str, editor_key: str, in_fragment: bool = Fa
     colcfg["Shipping %"] = st.column_config.NumberColumn(
         "Shipping %", format="%.2f", min_value=0.0, step=5.0,
         help="Added to Ex Unit Cost. Unit Cost = Ex Unit Cost x (1 + Shipping % / 100), in USD.")
-    colcfg["Margin x"] = st.column_config.NumberColumn(
-        "Margin x", format="plain", min_value=0.0, step=None,
+    colcfg["Markup x"] = st.column_config.NumberColumn(
+        "Markup x", format="plain", min_value=0.0, step=None,
         help="Multiplier on landed Unit Cost. U.Price $ = ⌈Unit Cost x Margin⌉. "
              "Set 0 to type U.Price $ manually.")
+    if show_included_col:
+        colcfg["_IncludedInItems"] = st.column_config.CheckboxColumn(
+            "Include", default=False,
+            help="When checked, this row's cost is distributed proportionally to other item prices.")
     order = column_order if column_order is not None else _builder_column_order(editor_key)
 
     # Read the delta BEFORE data_editor processes it.
@@ -1070,14 +1166,19 @@ def render_editable_grid(state_key: str, editor_key: str, in_fragment: bool = Fa
                            for d in working.get("Description", pd.Series([""] * n))]
     working["_ItemID"] = [original_base["_ItemID"].iloc[i] if (i < n_base and "_ItemID" in original_base.columns)
                           else None for i in range(n)]
+    if "_IncludedInItems" not in working.columns:
+        working["_IncludedInItems"] = False
+    else:
+        working["_IncludedInItems"] = working["_IncludedInItems"].fillna(False).astype(bool)
     working = calc.recompute(working)
     # Store now so the Totals section rendered after this call sees the updated values.
     st.session_state[state_key] = working
 
-    display_grid = working[BUILDER_COLS] if not working.empty else working
+    display_cols = BUILDER_COLS + (["_IncludedInItems"] if show_included_col else [])
+    display_grid = working[display_cols] if not working.empty else working
     edited = st.data_editor(
         display_grid,
-        column_config=colcfg, disabled=[c for c in COMPUTED if c in BUILDER_COLS],
+        column_config=colcfg, disabled=[c for c in COMPUTED if c in display_cols],
         column_order=order,
         num_rows="dynamic", width="stretch", height=_editor_full_height(len(display_grid)),
         row_height=35, key=editor_key, hide_index=True,
@@ -1090,6 +1191,13 @@ def render_editable_grid(state_key: str, editor_key: str, in_fragment: bool = Fa
                           for d in edited.get("Description", pd.Series([""] * n))]
     edited["_ItemID"] = [original_base["_ItemID"].iloc[i] if (i < n_base and "_ItemID" in original_base.columns)
                          else None for i in range(n)]
+    # Restore _IncludedInItems when it wasn't part of the displayed columns.
+    if "_IncludedInItems" not in edited.columns:
+        m = len(working)
+        edited["_IncludedInItems"] = [
+            bool(working["_IncludedInItems"].iloc[i]) if i < m else False
+            for i in range(n)
+        ]
     final_grid = calc.recompute(edited)
     st.session_state[state_key] = final_grid
     return final_grid
@@ -1141,7 +1249,10 @@ def _edit_panel(meta):
         help="Needs an Option label.",
     )
     if ea4.button("X", key="ed_cancel", width="stretch", help="Close editor"):
-        st.session_state.pending_close_edit = True
+        if st.session_state.pop("_edit_just_saved", False):
+            _close_edit_mode()
+        else:
+            st.session_state.pending_close_edit = True
         st.rerun()
     if st.session_state.get("edit_show_cancel_dialog"):
         _cancel_edit_dialog()
@@ -1197,7 +1308,7 @@ def _edit_panel(meta):
         "client": eh.get("client"), "project": eh.get("project"),
         "contact": eh.get("contact"), "phone": eh.get("phone"),
         "contractor": eh.get("contractor"), "region": eh.get("region"),
-        "sales": eh.get("sales"), "date": meta.get("CreationDate"),
+        "sales": eh.get("sales"), "date": meta.get("UpdatedDate") or meta.get("CreationDate"),
         "project_sheet": st.session_state.edit_project_sheet,
     }
     if _ps_enabled():
@@ -1207,20 +1318,54 @@ def _edit_panel(meta):
         st.session_state.cached_default_margin = float(repo.get_setting("default_margin") or 1.6)
     catalogue_add("edit_grid", st.session_state.cached_default_margin, "ed",
                   st.session_state.get("edit_system", ""))
-    col_pick, option_col, _ = st.columns([0.9, 2.0, 3.1], vertical_alignment="bottom")
-    edit_column_order = _builder_column_order("edit_editor", host=col_pick, width="stretch")
+    col_pick, option_col, inc_c1, inc_c2 = st.columns([0.9, 1.8, 1.8, 0.8], vertical_alignment="bottom")
+    _show_incl = _inclusion_enabled() and st.session_state.get("ed_inclusion_mode") == "included"
+    edit_column_order = _builder_column_order("edit_editor", host=col_pick, width="stretch",
+                                              show_include=_show_incl)
     opt_label = option_col.text_input(
         "Option label",
         key="ed_option",
         placeholder="e.g. Dynalite, KNX",
         help="Names this alternative. Required for 'Save as new option'.",
     )
+
+    if "ed_inclusion_mode" not in st.session_state:
+        st.session_state["ed_inclusion_mode"] = "excluded"
+    if "ed_inclusion_markup" not in st.session_state:
+        st.session_state["ed_inclusion_markup"] = 1.6
+    if _inclusion_enabled():
+        inc_mode = inc_c1.selectbox(
+            "Installation pricing",
+            options=["excluded", "included"],
+            format_func=lambda x: "Installation Excluded (standard)" if x == "excluded"
+                                  else "Installation Included in item prices",
+            key="ed_inclusion_mode",
+        )
+        if inc_mode == "included":
+            inc_markup = inc_c2.number_input(
+                "Markup ×", min_value=0.01, step=0.1, format="%.2f",
+                key="ed_inclusion_markup",
+                help="Included rows' selling price = Total Cost × this markup, then distributed to items.",
+            )
+        else:
+            inc_markup = float(st.session_state.get("ed_inclusion_markup") or 1.6)
+    else:
+        inc_mode = "excluded"
+        inc_markup = float(st.session_state.get("ed_inclusion_markup") or 1.6)
+
+
+
     grid = render_editable_grid("edit_grid", "edit_editor", in_fragment=True,
-                                column_order=edit_column_order)
+                                column_order=edit_column_order,
+                                show_included_col=(inc_mode == "included"))
 
     st.markdown("##### Totals")
     edit_calc_grid = calc.recompute(st.session_state.edit_grid)
-    edit_base_summary = calc.summarize(edit_calc_grid, 0)
+    if inc_mode == "included":
+        edit_totals_grid = calc.apply_inclusion(edit_calc_grid, inc_markup)
+    else:
+        edit_totals_grid = edit_calc_grid
+    edit_base_summary = calc.summarize(edit_totals_grid, 0)
     tcol, pcol, cmcol, ccol, cpcol = st.columns(5)
     edit_discount = _discount_inputs(
         "ed", "edit_discount", edit_base_summary["subtotal_sar"], tcol, pcol)
@@ -1228,7 +1373,7 @@ def _edit_panel(meta):
     edit_commission, edit_commission_percent, edit_commission_mode = _commission_inputs(
         "ed", "edit_commission", commission_base,
         "edit_grid", "edit_editor", "edit_discount", cmcol, ccol, cpcol)
-    s = calc.summarize(edit_calc_grid, edit_discount, edit_commission)
+    s = calc.summarize(edit_totals_grid, edit_discount, edit_commission)
     m1, m2, m3 = st.columns(3)
     _subtotal_metric(m1, s)
     m2.metric(f"VAT {calc.VAT_RATE * 100:g}% (SAR)", f"{s['vat_amount_sar']:,.2f}")
@@ -1240,7 +1385,8 @@ def _edit_panel(meta):
     edit_header = st.session_state.get("edit_header", {})
 
     def _post_save(npid, nname, nrev):
-        offer_rev = repo.project_meta(npid).get("OfferNo") or nname   # actual saved offer #
+        _saved_meta = repo.project_meta(npid)
+        offer_rev = _saved_meta.get("OfferNo") or nname   # actual saved offer #
         h = {**edit_terms,
              "client": edit_header.get("client"), "project": edit_header.get("project") or nname,
              "contact": edit_header.get("contact"), "phone": edit_header.get("phone", ""),
@@ -1248,9 +1394,14 @@ def _edit_panel(meta):
              "sales": edit_header.get("sales"), "presales": edit_header.get("presales"),
              "pm": edit_header.get("pm"), "system": st.session_state.get("edit_system", ""),
              "offer": offer_rev, "date": dt.date.today().isoformat(),
+             "option_label": _saved_meta.get("OptionLabel") or "",
              "project_sheet": edit_project_sheet}
         st.session_state.saved_export_header = h
-        st.session_state.saved_export_grid = calc.recompute(st.session_state.edit_grid)
+        raw_grid = calc.recompute(st.session_state.edit_grid)
+        if inc_mode == "included":
+            st.session_state.saved_export_grid = calc.apply_inclusion(raw_grid, inc_markup)
+        else:
+            st.session_state.saved_export_grid = raw_grid
         st.session_state.saved_export_summary = dict(s)
         st.session_state.saved_rev = (npid, nname, nrev)
 
@@ -1277,7 +1428,8 @@ def _edit_panel(meta):
             factors=(s["markup_factor"], None, None),
             system_suffix=st.session_state.get("edit_system") or _default_system(), terms=edit_terms,
             project_sheet_info=edit_project_sheet, header=edit_header,
-            option_label=pending_option_label)
+            option_label=pending_option_label,
+            inclusion_mode=inc_mode, inclusion_markup=inc_markup)
         _clear_offer_data_caches()
         saved_option_label = _text(
             repo.project_meta(st.session_state.edit_pid).get("OptionLabel")
@@ -1285,7 +1437,7 @@ def _edit_panel(meta):
         _post_save(st.session_state.edit_pid,
                    edit_header.get("project") or meta.get("ProjectName"), _cur_rev)
         _name = edit_header.get("project") or meta.get("ProjectName")
-        st.toast(f"Updated {_name} in place.", icon="✅")
+        st.toast(f"Updated {_name}", icon="✅")
         st.success(
             f"Updated **{_name}** in place. Option label saved as "
             f"**{saved_option_label or 'Main'}**."
@@ -1304,7 +1456,8 @@ def _edit_panel(meta):
             factors=(s["markup_factor"], None, None),
             system_suffix=st.session_state.get("edit_system") or _default_system(),
             terms=edit_terms, option_label=pending_option_label,
-            project_sheet_info=edit_project_sheet, header=edit_header)
+            project_sheet_info=edit_project_sheet, header=edit_header,
+            inclusion_mode=inc_mode, inclusion_markup=inc_markup)
         _clear_offer_data_caches()
         saved_option_label = _text(repo.project_meta(npid).get("OptionLabel"))
         _post_save(npid, nname, nrev)
@@ -1328,7 +1481,8 @@ def _edit_panel(meta):
                 commission_mode=edit_commission_mode,
                 factors=(s["markup_factor"], None, None),
                 system_suffix=st.session_state.get("edit_system") or _default_system(), terms=edit_terms,
-                project_sheet_info=edit_project_sheet, header=edit_header)
+                project_sheet_info=edit_project_sheet, header=edit_header,
+                inclusion_mode=inc_mode, inclusion_markup=inc_markup)
             _clear_offer_data_caches()
             saved_option_label = _text(repo.project_meta(npid).get("OptionLabel"))
             _post_save(npid, nname, nrev)
@@ -1436,15 +1590,18 @@ def _new_offer_actions():
                 contractor=h.get("contractor"),
                 region=h.get("region"),
             )
-            saved_option_label = _text(repo.project_meta(pid).get("OptionLabel"))
-            st.session_state.no_offer_lock = h["offer"]
-            st.session_state.setdefault("no_saved_options", []).append(
-                saved_option_label or "Main"
-            )
-            st.success(
-                f"Saved {('option ' + saved_option_label) if saved_option_label else 'offer'} "
-                f"(ProjectID {pid}). Option label: **{saved_option_label or 'Main'}**."
-            )
+            # Load the saved offer and open it directly in edit mode.
+            _sys, _meta, _grid, _ = _cached_project_bundle(pid, (pid,), _db_cache_stamp())
+            _sheet = _sys[0] if _sys else None
+            _init_edit_state(pid, _meta, _grid, _sheet)
+            _prime_new_offer_form()
+            _clear_offer_data_caches()
+            st.session_state["project_workspace_view"] = "load"
+            st.session_state["load_fam"] = repo.family_key(
+                _meta.get("OfferNo") or "", _meta.get("ProjectName") or "")
+            st.session_state["view_pid"] = pid
+            _request_scroll_top()
+            st.rerun()
 
     if ac2.button(
         "➕ Add another option",
@@ -1465,7 +1622,7 @@ def _new_offer_actions():
         st.rerun()
 
     if ac4.button("📄 Generate Offer PDF", width="stretch"):
-        _make_pdf_download(h, st.session_state.grid, s)
+        _make_pdf_download({**h, "option_label": _optname}, st.session_state.grid, s)
 
     _pdf_name = f"Quotation_{h['offer']}{(' ' + _optname) if _optname else ''}.pdf"
     if "pdf_bytes" in st.session_state:
@@ -1529,7 +1686,7 @@ def _new_project_editor():
     catalogue_add("grid", _dm, "no", st.session_state.header["system"], show_clear=True)
 
     # ---- Editable grid (builder always shows costs) ----
-    st.caption("Edit **Qty · Ex Unit Cost · Shipping % · Margin x** → prices recalc automatically. "
+    st.caption("Edit **Qty · Ex Unit Cost · Shipping % · Markup x** → prices recalc automatically. "
                "Locked columns are computed.")
     grid = render_editable_grid("grid", "editor", in_fragment=True)
 
@@ -1590,23 +1747,31 @@ def catalogue_add(state_key: str, default_margin: float, kp: str, default_system
 
 def terms_form(store: dict, kp: str):
     """Editable Quotation terms/notes (subject, greeting, scope, payment, ...)."""
+    # Pre-populate widget keys from store only when absent — avoids the Streamlit
+    # warning that fires when both an explicit value and a session-state key are
+    # provided to the same widget after the key already exists in session state.
+    _wkeys = {
+        f"{kp}_subject": "subject", f"{kp}_greet": "greeting",
+        f"{kp}_scope": "scope", f"{kp}_excl": "exclusions",
+        f"{kp}_prereq": "prerequisites", f"{kp}_deliv": "delivery",
+        f"{kp}_valid": "validity", f"{kp}_pay": "payment",
+        f"{kp}_notes": "notes",
+    }
+    for wkey, field in _wkeys.items():
+        if wkey not in st.session_state:
+            st.session_state[wkey] = store.get(field, "")
     with st.expander("📋 Terms, scope & notes (appear on the quotation)", expanded=False):
-        store["subject"] = st.text_input("Subject (offer title)", store.get("subject", ""),
+        store["subject"] = st.text_input("Subject (offer title)",
             key=f"{kp}_subject", placeholder="e.g. Low Current Systems Offer")
-        store["greeting"] = st.text_area("Greeting", store.get("greeting", ""),
-            key=f"{kp}_greet", height=80)
-        store["scope"] = st.text_input("Scope", store.get("scope", ""), key=f"{kp}_scope")
-        store["exclusions"] = st.text_area("Exclusions", store.get("exclusions", ""),
-            key=f"{kp}_excl", height=70)
-        store["prerequisites"] = st.text_area("Pre-requirements", store.get("prerequisites", ""),
-            key=f"{kp}_prereq", height=70)
+        store["greeting"] = st.text_area("Greeting", key=f"{kp}_greet", height=80)
+        store["scope"] = st.text_input("Scope", key=f"{kp}_scope")
+        store["exclusions"] = st.text_area("Exclusions", key=f"{kp}_excl", height=70)
+        store["prerequisites"] = st.text_area("Pre-requirements", key=f"{kp}_prereq", height=70)
         c3, c4 = st.columns(2)
-        store["delivery"] = c3.text_input("Delivery", store.get("delivery", ""), key=f"{kp}_deliv")
-        store["validity"] = c4.text_input("Validity", store.get("validity", ""), key=f"{kp}_valid")
-        store["payment"] = st.text_area("Payment Terms", store.get("payment", ""),
-            key=f"{kp}_pay", height=70)
-        store["notes"] = st.text_area("Special notes & instructions", store.get("notes", ""),
-            key=f"{kp}_notes", height=70)
+        store["delivery"] = c3.text_input("Delivery", key=f"{kp}_deliv")
+        store["validity"] = c4.text_input("Validity", key=f"{kp}_valid")
+        store["payment"] = st.text_area("Payment Terms", key=f"{kp}_pay", height=70)
+        store["notes"] = st.text_area("Special notes & instructions", key=f"{kp}_notes", height=70)
 
 
 def _project_sheet_info(info: dict | None = None, h: dict | None = None) -> dict:
@@ -1716,7 +1881,8 @@ def _make_pdf_download(h, grid, summary, options=None):
     else:
         pdf_export.generate_quotation_pdf(tmp, header, grid, summary, notes=notes,
                                           company=company, show_costs=False,
-                                          template=pdf_body_template)
+                                          template=pdf_body_template,
+                                          option_label=h.get("option_label") or "")
     with open(tmp, "rb") as f:
         st.session_state.pdf_bytes = f.read()
     n = len(options) if options else 1
@@ -1907,6 +2073,8 @@ def revision_options(base_pid):
         for col in MONEY_COLS:
             if col in g.columns:
                 g[col] = g[col].map(lambda v: calc.roundup(v, 0))
+        if m.get("InclusionMode") == "included":
+            g = calc.apply_inclusion(g, float(m.get("InclusionMarkup") or 1.6))
         out.append({"label": m.get("OptionLabel") or "",
                     "grid": g, "summary": calc.summarize(
                         g, m.get("DiscountAmount") or 0, m.get("CommissionAmount") or 0)})
@@ -2303,7 +2471,8 @@ def _set_tracking_qty(value_key: str, stamp_key: str, qty_key: str,
 
 
 def _open_tracking_qty_prompt(value_key: str, stamp_key: str, qty_key: str,
-                              action: str, description: str, full_qty: float):
+                              action: str, description: str, full_qty: float,
+                              region_key: str = ""):
     st.session_state.tracking_qty_prompt = {
         "value_key": value_key,
         "stamp_key": stamp_key,
@@ -2311,6 +2480,7 @@ def _open_tracking_qty_prompt(value_key: str, stamp_key: str, qty_key: str,
         "action": action,
         "description": description,
         "full_qty": _bounded_tracking_qty(full_qty, full_qty),
+        "region_key": region_key,
     }
     st.session_state["tracking_prompt_qty"] = _bounded_tracking_qty(full_qty, full_qty)
 
@@ -2328,12 +2498,18 @@ def _render_tracking_qty_prompt():
     desc = _text(prompt.get("description"), "this item")
     full_qty = _bounded_tracking_qty(prompt.get("full_qty"), prompt.get("full_qty") or 0.0)
 
+    region_key = _text(prompt.get("region_key"))
+    _regions = repo.regions() if (action.lower() == "received" and region_key) else []
+
     def prompt_body():
         st.write(f"**{desc}**")
         st.write(
             f"Is the total quantity ({full_qty:g}) {action.lower()}, "
             "or only part of it?"
         )
+        if _regions:
+            st.selectbox("Receiving region", ["", *_regions],
+                         key=region_key, label_visibility="visible")
         if st.button(f"Full quantity ({full_qty:g})", key="tracking_prompt_full",
                      type="primary", width="stretch"):
             _set_tracking_qty(prompt["value_key"], prompt["stamp_key"], prompt["qty_key"],
@@ -2385,12 +2561,13 @@ def _handle_tracking_status_click(value_key: str, stamp_key: str,
                                   qty_key: str | None = None,
                                   full_qty: float = 0.0,
                                   action: str = "",
-                                  description: str = ""):
+                                  description: str = "",
+                                  region_key: str = ""):
     if qty_key and not bool(st.session_state.get(value_key)):
         current_qty = _bounded_tracking_qty(st.session_state.get(qty_key), full_qty)
         if current_qty <= 0:
             _open_tracking_qty_prompt(value_key, stamp_key, qty_key,
-                                      action, description, full_qty)
+                                      action, description, full_qty, region_key)
             return
     _toggle_tracking_status(value_key, stamp_key, qty_key, full_qty)
 
@@ -2402,7 +2579,7 @@ def _sync_tracking_qty_status(qty_key: str, value_key: str, stamp_key: str, max_
 
 def _tracking_status_cell(col, lid: int, key_name: str, current: bool, stamp_value,
                           full_qty: float | None = None, current_qty=0.0,
-                          description: str = ""):
+                          description: str = "", region_key: str = ""):
     value_key, stamp_key, qty_key = _tracking_keys(lid, key_name)
     if value_key not in st.session_state:
         st.session_state[value_key] = bool(current)
@@ -2438,7 +2615,7 @@ def _tracking_status_cell(col, lid: int, key_name: str, current: bool, stamp_val
                args=(value_key, stamp_key,
                      qty_key if full_qty is not None else None,
                      _bounded_tracking_qty(full_qty or 0.0, full_qty or 0.0),
-                     key_name, description))
+                     key_name, description, region_key))
     stamp_text = html.escape(_fmt_tracking_stamp(stamp)) if stamp else "&nbsp;"
     col.markdown(f"<div class='tracking-stamp'>{stamp_text}</div>", unsafe_allow_html=True)
     return checked, stamp
@@ -3146,7 +3323,7 @@ def _render_tracking_tab(project_id: int, sheet_name: str | None):
     _render_tracking_qty_prompt()
 
     cols_meta = [("Description", 2.75), ("Brand", 1.0), ("Model", 1.05), ("Qty", 0.5),
-                 ("PO Number", 1.25), ("Paid", 0.9), ("Received", 0.9), ("Rec. Qty", 0.75),
+                 ("PO Number", 1.25), ("Paid/Available", 1.1), ("Received", 0.9), ("Rec. Qty", 0.75),
                  ("Delivery Note", 1.25), ("Delivered", 0.9), ("Deliv. Qty", 0.75)]
     widths = [w for _, w in cols_meta]
     hdr = st.columns(widths)
@@ -3161,8 +3338,8 @@ def _render_tracking_tab(project_id: int, sheet_name: str | None):
         rc = st.columns(widths, vertical_alignment="center")
         j = 0
         rc[j].write(row["Description"] or ""); j += 1
-        rc[j].write(row["Brand"] or ""); j += 1
-        rc[j].write(row["Model"] or ""); j += 1
+        rc[j].markdown(f"<div style='text-align:center'>{html.escape(_text(row['Brand']))}</div>", unsafe_allow_html=True); j += 1
+        rc[j].markdown(f"<div style='text-align:center'>{html.escape(_text(row['Model']))}</div>", unsafe_allow_html=True); j += 1
         line_qty = max(_safe_float(row.get("Qty")), 0.0)
         qty_text = f"{int(line_qty)}" if float(line_qty).is_integer() else f"{line_qty:.2f}"
         _tracking_center_text(rc[j], qty_text if pd.notna(row["Qty"]) else ""); j += 1
@@ -3171,10 +3348,15 @@ def _render_tracking_tab(project_id: int, sheet_name: str | None):
         paid, paid_at = _tracking_status_cell(rc[j], lid, "paid", bool(row["Paid"]), row.get("PaidAt")); j += 1
         rec_current_qty = _bounded_tracking_qty(row.get("ReceivedQty"), line_qty)
         rec_current = bool(row["Received"]) or rec_current_qty > 0
-        rec, rec_at = _tracking_status_cell(rc[j], lid, "received", rec_current,
+        region_key = f"trk_received_region_{lid}"
+        if region_key not in st.session_state:
+            st.session_state[region_key] = _text(row.get("ReceivedRegion") or "")
+        rec_col = rc[j]
+        rec, rec_at = _tracking_status_cell(rec_col, lid, "received", rec_current,
                                             row.get("ReceivedAt"), full_qty=line_qty,
                                             current_qty=rec_current_qty,
-                                            description=_text(row["Description"])); j += 1
+                                            description=_text(row["Description"]),
+                                            region_key=region_key); j += 1
         rec_qty = _tracking_qty_cell(rc[j], lid, "received", rec_current_qty, line_qty); j += 1
         delivery_note = rc[j].text_input("delivery note", value=str(row.get("DeliveryNote") or ""),
                                          key=f"dn_{lid}", label_visibility="collapsed"); j += 1
@@ -3191,8 +3373,21 @@ def _render_tracking_tab(project_id: int, sheet_name: str | None):
         _, deliv_stamp_key, _ = _tracking_keys(lid, "delivered")
         rec_at = _text(st.session_state.get(rec_stamp_key))
         deliv_at = _text(st.session_state.get(deliv_stamp_key))
+        # Region shown below the timestamp when item is received; editable at any time
+        _all_regions = repo.regions()
+        if _all_regions:
+            if rec:
+                rec_col.selectbox(
+                    "Region", ["", *_all_regions],
+                    key=region_key,
+                    label_visibility="collapsed",
+                    disabled=not can("tracking"),
+                )
+            elif st.session_state.get(region_key):
+                st.session_state[region_key] = ""
+        rec_region = _text(st.session_state.get(region_key))
         collected.append((lid, paid, rec, deliv, po, delivery_note, paid_at, rec_at, deliv_at,
-                          rec_qty, deliv_qty))
+                          rec_qty, deliv_qty, rec_region))
         if row_idx < len(track) - 1:
             st.markdown("<div class='tracking-row-separator'></div>", unsafe_allow_html=True)
 
@@ -3202,7 +3397,7 @@ def _render_tracking_tab(project_id: int, sheet_name: str | None):
     deliv_total = sum(c[10] for c in collected)
     st.markdown("<div style='height:1.75rem'></div>", unsafe_allow_html=True)  # gap before totals
     pc1, pc2, pc3 = st.columns(3)
-    pc1.metric("Paid", f"{sum(1 for c in collected if c[1])}/{tot}")
+    pc1.metric("Paid/Available", f"{sum(1 for c in collected if c[1])}/{tot}")
     pc2.metric("Received Qty", f"{rec_total:g}/{total_qty:g}")
     pc3.metric("Delivered Qty", f"{deliv_total:g}/{total_qty:g}")
     if can("tracking"):
@@ -3352,11 +3547,11 @@ def _render_login():
 
 
 # ----------------------------- UI -----------------------------
-if "db_init" not in st.session_state:
+if "db_init_v2" not in st.session_state:
     _init_conn = db.init_db()          # create tables + apply backend migrations
     _init_conn.close()
     auth.ensure_roles_seeded()         # seed default roles/permissions on first run
-    st.session_state.db_init = True
+    st.session_state.db_init_v2 = True
 
 if "auth_user" not in st.session_state:
     _render_login()
@@ -3759,6 +3954,8 @@ elif mode == PROJECT_WORKSPACE_LABEL:
             for col in MONEY_COLS:
                 if col in disp.columns:
                     disp[col] = disp[col].map(lambda v: calc.roundup(v, 0))
+            if meta.get("InclusionMode") == "included":
+                disp = calc.apply_inclusion(disp, float(meta.get("InclusionMarkup") or 1.6))
             s = calc.summarize(
                 disp, meta.get("DiscountAmount") or 0, meta.get("CommissionAmount") or 0)
 
@@ -3810,7 +4007,10 @@ elif mode == PROJECT_WORKSPACE_LABEL:
                 cfg = {c: st.column_config.NumberColumn(c, format="accounting") for c in MONEY_COLS}
                 cfg["Qty"] = st.column_config.NumberColumn("Qty", format="%d")
                 cfg["Shipping %"] = st.column_config.NumberColumn("Shipping %", format="%.2f")
-                view_grid = disp[[c for c in BUILDER_COLS if c in disp.columns]]
+                view_grid = disp[[c for c in BUILDER_COLS if c in disp.columns]].copy()
+                if meta.get("InclusionMode") == "included" and "_IncludedInItems" in disp.columns:
+                    view_grid.insert(0, "Include", disp["_IncludedInItems"].fillna(False).astype(bool))
+                    cfg["Include"] = st.column_config.CheckboxColumn("Include", disabled=True)
                 st.dataframe(view_grid, width="stretch", hide_index=True, column_config=cfg,
                              height=_editor_full_height(len(view_grid)), row_height=35)
             elif active_tab == "Tracking":
@@ -3824,79 +4024,7 @@ elif mode == PROJECT_WORKSPACE_LABEL:
                 )
             if can("edit") and b1.button("✏️ Edit / new revision or option", type="primary",
                                           width="stretch"):
-                # Always initialize from this selected database record. Stale widget
-                # keys from a previous edit must never override its System/Region.
-                _clear_edit_widget_state()
-                eg = grid.copy()
-                st.session_state.edit_grid = calc.recompute(eg)
-                st.session_state.edit_key = cur_key
-                st.session_state.edit_pid = pid
-                _loaded_system = (repo.base_name(sheet or "").replace("BOQ", "").strip()
-                                  or _default_system())
-                st.session_state.edit_system = repo.system_name(_loaded_system)
-                st.session_state.edit_discount = abs(float(meta.get("DiscountAmount") or 0))
-                st.session_state.edit_commission = abs(float(meta.get("CommissionAmount") or 0))
-                st.session_state.ed_commission_percent = abs(
-                    float(meta.get("CommissionPercent") or 0)
-                )
-                st.session_state.ed_commission_mode = (
-                    meta.get("CommissionMode")
-                    if meta.get("CommissionMode") in COMMISSION_MODES
-                    else "Deduct from profit"
-                )
-                st.session_state.ed_commission_applied_percent = (
-                    st.session_state.ed_commission_percent
-                    if st.session_state.ed_commission_mode == "Protect profit" else 0.0
-                )
-                st.session_state.edit_terms = {**DEFAULT_TERMS, **repo.load_terms(meta)}
-                st.session_state.edit_terms["system_note"] = st.session_state.edit_system
-                st.session_state.edit_header = {
-                    "client": _text(meta.get("ClientName")), "project": _text(meta.get("ProjectName")),
-                    "contact": _text(meta.get("ContactName")), "phone": _text(meta.get("ContactPhone")),
-                    "contractor": _text(meta.get("Contractor")), "region": _text(meta.get("Region")),
-                    "sales": _text(meta.get("SalesPerson")),
-                    "presales": _text(meta.get("PresalesEngineer")),
-                    "pm": _text(meta.get("ProjectManager")),
-                }
-                for field, widget_key in {
-                    "client": "eh_client", "project": "eh_project", "contact": "eh_contact",
-                    "phone": "eh_phone", "contractor": "eh_contractor", "region": "eh_region",
-                    "sales": "eh_sales", "presales": "eh_presales", "pm": "eh_pm",
-                }.items():
-                    value = st.session_state.edit_header.get(field, "")
-                    st.session_state[widget_key] = value if value else (
-                        "-" if field in ("sales", "presales", "pm") else ""
-                    )
-                st.session_state["eh_system"] = st.session_state.edit_system
-                st.session_state.edit_project_sheet = {
-                    **DEFAULT_PROJECT_SHEET_INFO, **repo.load_project_sheet_info(meta)
-                }
-                for src, key in {
-                    "job_reference": "ed_ps_job_reference",
-                    "sheet_date": "ed_ps_sheet_date",
-                    "lead_source": "ed_ps_lead_source",
-                    "commission": "ed_ps_commission",
-                    "shipment_by": "ed_ps_shipment_by",
-                    "downpayment_date": "ed_ps_downpayment_date",
-                    "invoice_to": "ed_ps_invoice_to",
-                    "delivery_instructions": "ed_ps_delivery_instructions",
-                    "gm_signature": "ed_ps_gm_signature",
-                }.items():
-                    st.session_state[key] = st.session_state.edit_project_sheet.get(
-                        src, DEFAULT_PROJECT_SHEET_INFO.get(src, ""))
-                st.session_state["ed_option"] = meta.get("OptionLabel") or ""
-                for k in ("ed_discount_percent", "ed_discount_driver", "ed_discount_subtotal"):
-                    st.session_state.pop(k, None)
-                st.session_state.edit_dirty_snapshot = _edit_snapshot()
-                st.session_state.edit_show_cancel_dialog = False
-                st.session_state.edit_close_after_save = False
-                st.session_state.edit_mode = True
-                st.session_state.pop("pdf_bytes", None)
-                st.session_state.pop("project_sheet_bytes", None)
-                st.session_state.pop("saved_rev", None)
-                st.session_state.pop("saved_export_header", None)
-                st.session_state.pop("saved_export_grid", None)
-                st.session_state.pop("saved_export_summary", None)
+                _init_edit_state(pid, meta, grid, sheet)
                 _request_scroll_top()
                 st.rerun()
             if can("new_offer") and b2.button("📋 Duplicate", width="stretch"):
@@ -3952,7 +4080,7 @@ elif mode == PROJECT_WORKSPACE_LABEL:
                         "pm": meta.get("ProjectManager"),
                         "system": repo.system_name(
                             repo.base_name(sheet or "").replace("BOQ", "").strip()),
-                        "offer": meta.get("OfferNo"), "date": meta.get("CreationDate"),
+                        "offer": meta.get("OfferNo"), "date": meta.get("UpdatedDate") or meta.get("CreationDate"),
                         "project_sheet": repo.load_project_sheet_info(meta)}
 
             if b3.button(f"📄 Generate Offer PDF{f' ({_pdf_opt_count} options)' if _pdf_opt_count > 1 else ''}",
@@ -3964,7 +4092,7 @@ elif mode == PROJECT_WORKSPACE_LABEL:
                 st.session_state.pop("saved_export_grid", None)
                 st.session_state.pop("saved_export_summary", None)
                 opts = revision_options(pid)
-                _make_pdf_download(_export_header(), disp, s, options=opts if len(opts) > 1 else None)
+                _make_pdf_download(_export_header(), disp, s, options=opts)
             _pdf_name = f"Quotation_{meta.get('OfferNo') or meta.get('ProjectName')}.pdf"
             if st.session_state.get("pdf_bytes"):
                 b4.download_button(
@@ -4419,6 +4547,11 @@ elif mode == "Settings":
                 value=repo.get_setting("project_sheet_enabled") != "0",
                 help="When off, the Project Sheet info form and its Excel export are hidden "
                      "everywhere (New Project, Edit and the offer view).")
+            inclusion_enabled = st.checkbox(
+                "Enable Installation Included pricing mode",
+                value=repo.get_setting("installation_inclusion_enabled") == "1",
+                help="When on, a dropdown appears above the BoQ table in Edit mode letting you "
+                     "distribute installation/accessory costs into item prices.")
             saved_company = st.form_submit_button("Save company settings", type="primary")
             if saved_company:
                 repo.set_setting("company_name", company_name.strip() or "Company Name")
@@ -4428,7 +4561,9 @@ elif mode == "Settings":
                 repo.set_setting("company_cr_number", company_cr_number.strip())
                 repo.set_setting("company_brand_color", brand_color)
                 repo.set_setting("project_sheet_enabled", "1" if ps_enabled else "0")
+                repo.set_setting("installation_inclusion_enabled", "1" if inclusion_enabled else "0")
                 st.session_state.pop("cached_ps_enabled", None)
+                st.session_state.pop("cached_inclusion_enabled", None)
                 st.success("Company settings saved. (Page title updates on next reload.)")
 
         st.divider()
@@ -5140,7 +5275,7 @@ elif mode == "Settings":
                         f"Restored profile backup {restore_file.name}",
                         new_values={"backup_file": restore_file.name},
                     )
-                    st.session_state.db_init = True
+                    st.session_state.db_init_v2 = True
                     st.success("Backup restored. The app will reload now.")
                     if safety_backup:
                         st.info(f"Safety backup created: {os.path.basename(safety_backup)}")
@@ -5187,6 +5322,83 @@ elif mode == "Settings":
                     st.rerun()
                 except Exception as e:
                     st.error(f"Restore failed: {e}")
+
+            if db.is_postgres():
+                st.divider()
+                st.markdown("##### Migrate from SQLite")
+                st.caption(
+                    "Import a ProQuote SQLite profile backup (`.zip` containing `proquote.db`) "
+                    "into this PostgreSQL database. All existing PostgreSQL data will be replaced. "
+                    "A safety backup of the current PostgreSQL data is created first."
+                )
+                _mig_file = st.file_uploader(
+                    "SQLite profile backup (.zip)",
+                    type=["zip"],
+                    key="migrate_sqlite_upload",
+                )
+                _mig_ok = st.checkbox(
+                    "I understand this replaces ALL data in the PostgreSQL database with the "
+                    "contents of the uploaded SQLite backup.",
+                    key="migrate_sqlite_confirm",
+                )
+                if st.button(
+                    "⬆️ Migrate SQLite → PostgreSQL",
+                    type="primary",
+                    disabled=not (_mig_file and _mig_ok),
+                    width="stretch",
+                    key="migrate_sqlite_btn",
+                ):
+                    import tempfile as _tempfile
+                    import db_transfer as _db_transfer
+                    try:
+                        with _tempfile.TemporaryDirectory(
+                            prefix="proquote-migrate-", dir=db.DATA_DIR
+                        ) as _tmp:
+                            _zip_path = os.path.join(_tmp, "upload.zip")
+                            with open(_zip_path, "wb") as _f:
+                                _f.write(_mig_file.getvalue())
+                            _vok, _vmsg = db_backup.validate_profile_backup(_zip_path)
+                            if not _vok:
+                                st.error(f"Invalid backup: {_vmsg}")
+                            else:
+                                with zipfile.ZipFile(_zip_path) as _zf:
+                                    if "proquote.db" not in _zf.namelist():
+                                        st.error(
+                                            "This ZIP does not contain `proquote.db`. "
+                                            "Upload a SQLite profile backup, not a portable PostgreSQL backup."
+                                        )
+                                    else:
+                                        _zf.extract("proquote.db", _tmp)
+                                        _sqlite_path = os.path.join(_tmp, "proquote.db")
+                                        with st.spinner("Creating safety backup of current PostgreSQL data…"):
+                                            _safety = db_backup.create_profile_backup("before-sqlite-migration")
+                                        st.info(f"Safety backup: {os.path.basename(_safety)}")
+                                        _mig_log = []
+                                        _mig_placeholder = st.empty()
+                                        def _on_mig_progress(table, count):
+                                            _mig_log.append(f"- **{table}**: {count:,} rows")
+                                            _mig_placeholder.markdown("\n".join(_mig_log))
+                                        with st.spinner("Migrating…"):
+                                            _result = _db_transfer.migrate_sqlite_to_postgres(
+                                                _sqlite_path, db.database_url(),
+                                                replace=True, progress=_on_mig_progress,
+                                            )
+                                        st.cache_data.clear()
+                                        _copied = _result.get("copied", {})
+                                        _rows = [(t, c) for t, c in _copied.items() if c > 0]
+                                        if _rows:
+                                            st.dataframe(
+                                                pd.DataFrame(_rows, columns=["Table", "Rows copied"]),
+                                                hide_index=True, use_container_width=True,
+                                            )
+                                        if _result.get("skipped_orphans"):
+                                            st.warning(f"Skipped orphan rows: {_result['skipped_orphans']}")
+                                        if _result.get("repaired_values"):
+                                            st.info(f"Repaired values: {_result['repaired_values']}")
+                                        st.success("Migration complete! Reloading…")
+                                        st.rerun()
+                    except Exception as _exc:
+                        st.error(f"Migration failed: {_exc}")
 
     with tab_updates:
         st.markdown("##### Software updates")

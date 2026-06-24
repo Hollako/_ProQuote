@@ -361,7 +361,8 @@ def _items_table(ss, grid: pd.DataFrame, show_costs: bool):
     last_system = None
     r = 0
     for _, row in grid.iterrows():
-        if str(row.get("LineType", "item")) == "discount":
+        lt = str(row.get("LineType", "item")).lower()
+        if lt == "discount":
             continue
         r += 1
         system = str(row.get("System") or "")
@@ -371,6 +372,7 @@ def _items_table(ss, grid: pd.DataFrame, show_costs: bool):
             style.append(("SPAN", (0, len(data) - 1), (-1, len(data) - 1)))
             style.append(("BACKGROUND", (0, len(data) - 1), (-1, len(data) - 1), BRAND_LIGHT))
             last_system = system
+        is_included = lt == "included"
         cells = [
             Paragraph("", ss["Cell"]),
             Paragraph(str(row.get("Description") or ""), ss["Cell"]),
@@ -383,11 +385,19 @@ def _items_table(ss, grid: pd.DataFrame, show_costs: bool):
                       Paragraph(_pct(row.get("Shipping %")), ss["CellR"]),
                       Paragraph(_sar2(row.get("Unit Cost $")), ss["CellR"]),
                       Paragraph(_sar2(row.get("Total Cost $")), ss["CellR"])]
-        cells += [Paragraph(_sar2(row.get("U. Price SAR")), ss["CellR"]),
-                  Paragraph(_sar2(row.get("T. Price SAR")), ss["CellR"])]
+        price_col = len(cells)  # index of U.Price SAR column
+        if is_included:
+            cells += [Paragraph("Included", ss["CellC"]), Paragraph("", ss["CellC"])]
+        else:
+            cells += [Paragraph(_sar2(row.get("U. Price SAR")), ss["CellR"]),
+                      Paragraph(_sar2(row.get("T. Price SAR")), ss["CellR"])]
         data.append(cells)
+        ri = len(data) - 1
+        if is_included:
+            style.append(("SPAN", (price_col, ri), (price_col + 1, ri)))
+            style.append(("ALIGN", (price_col, ri), (price_col + 1, ri), "CENTER"))
         if r % 2 == 0:
-            style.append(("BACKGROUND", (0, len(data) - 1), (-1, len(data) - 1),
+            style.append(("BACKGROUND", (0, ri), (-1, ri),
                           colors.HexColor("#F7F9FC")))
 
     t = Table(data, colWidths=widths, repeatRows=1)
@@ -482,7 +492,7 @@ def _template2_add_text(flow, text: str, style, blank_space: float = 5) -> None:
 def _template2_intro(story, ss, h, notes: dict, company: dict) -> None:
     content_w = 176 * mm
     left = [
-        Paragraph(f"Project:{_rt(h.get('project') or '')}", ss["T2MetaL"]),
+        Paragraph(f"Project: {_rt(h.get('project') or '')}", ss["T2MetaL"]),
         Spacer(1, 19),
         Paragraph(f"M/S {_rt(h.get('client') or '')}", ss["T2MetaL"]),
     ]
@@ -494,7 +504,7 @@ def _template2_intro(story, ss, h, notes: dict, company: dict) -> None:
     if h.get("offer"):
         right_lines.append(f"Reference: {h.get('offer')}")
     if h.get("date"):
-        right_lines.append(f"Date:{_display_date(h.get('date'))}")
+        right_lines.append(f"Date: {_display_date(h.get('date'))}")
     right = [Paragraph(_rt(line), ss["T2MetaR"]) for line in right_lines]
     meta = Table([[left, right]], colWidths=[content_w * 0.58, content_w * 0.42])
     meta.setStyle(TableStyle([
@@ -553,7 +563,7 @@ def _template2_intro(story, ss, h, notes: dict, company: dict) -> None:
 
 def _template2_price_cells(row, included: bool):
     if included:
-        return "", "Included"
+        return "Included", ""
     return _sar2(row.get("U. Price SAR")), _sar2(row.get("T. Price SAR"))
 
 
@@ -609,7 +619,7 @@ def _template2_items_table(ss, grid: pd.DataFrame, summary: dict, show_costs: bo
             Paragraph(_rt(row.get("Brand") or ""), ss["T2Cell"]),
             Paragraph(_rt(row.get("Model") or ""), ss["T2Cell"]),
             Paragraph(_sar(row.get("Qty")), ss["T2CellC"]),
-            Paragraph(unit_price, ss["T2CellR"]),
+            Paragraph(unit_price, ss["T2CellC"] if included else ss["T2CellR"]),
             Paragraph(total_price, ss["T2CellR"]),
         ])
         rr = len(data) - 1
@@ -620,6 +630,11 @@ def _template2_items_table(ss, grid: pd.DataFrame, summary: dict, show_costs: bo
             ("TOPPADDING", (0, rr), (-1, rr), 2),
             ("BOTTOMPADDING", (0, rr), (-1, rr), 2),
         ]
+        if included:
+            style += [
+                ("SPAN", (5, rr), (6, rr)),
+                ("ALIGN", (5, rr), (6, rr), "CENTER"),
+            ]
 
     total_rows = [
         ("Grand Total", summary.get("subtotal_sar"), True),
@@ -882,7 +897,7 @@ def _template3_items_table(ss, grid: pd.DataFrame):
                 Paragraph(_rt(row.get("Brand") or ""), ss["T3CellC"]),
                 Paragraph(_rt(row.get("Model") or ""), ss["T3CellC"]),
                 Paragraph(_sar(row.get("Qty")), ss["T3CellC"]),
-                Paragraph(unit_price, ss["T3CellR"]),
+                Paragraph(unit_price, ss["T3CellC"] if included else ss["T3CellR"]),
                 Paragraph(total_price, ss["T3CellR"]),
             ])
             row_heights.append(None)
@@ -893,6 +908,11 @@ def _template3_items_table(ss, grid: pd.DataFrame):
                 ("TOPPADDING", (0, rr), (-1, rr), 2.25),
                 ("BOTTOMPADDING", (0, rr), (-1, rr), 2.25),
             ]
+            if included:
+                style += [
+                    ("SPAN", (5, rr), (6, rr)),
+                    ("ALIGN", (5, rr), (6, rr), "CENTER"),
+                ]
 
         item_end = len(data) - 1
         if item_end >= item_start:
@@ -1073,15 +1093,15 @@ def generate_options_pdf(out_path, header: dict, options: list,
         for i, opt in enumerate(options):
             if i > 0:
                 story.append(PageBreak())
-            label = opt.get("label") or f"Option {i + 1}"
-            _template3_page(story, ss, header, notes, opt, company, label if multi else "")
+            label = opt.get("label") or (f"Option {i + 1}" if multi else "")
+            _template3_page(story, ss, header, notes, opt, company, label)
     elif is_template2:
         _template2_intro(story, ss, header, notes, company)
         multi = len(options) > 1
         for i, opt in enumerate(options):
             story.append(PageBreak())
-            label = opt.get("label") or f"Option {i + 1}"
-            _template2_boq_section(story, ss, opt, label if multi else "")
+            label = opt.get("label") or (f"Option {i + 1}" if multi else "")
+            _template2_boq_section(story, ss, opt, label)
             if i == len(options) - 1:
                 _template2_signature(story, ss, header, company)
     else:
@@ -1171,10 +1191,11 @@ def generate_options_pdf(out_path, header: dict, options: list,
 
 def generate_quotation_pdf(out_path, header: dict, grid: pd.DataFrame, summary: dict,
                            notes: dict | None = None, company: dict | None = None,
-                           show_costs: bool = False, template: str = "template1") -> str:
+                           show_costs: bool = False, template: str = "template1",
+                           option_label: str = "") -> str:
     """Single-option quotation (delegates to generate_options_pdf)."""
     return generate_options_pdf(out_path, header,
-                                [{"label": "", "grid": grid, "summary": summary}],
+                                [{"label": option_label, "grid": grid, "summary": summary}],
                                 notes=notes, company=company, show_costs=show_costs,
                                 template=template)
 

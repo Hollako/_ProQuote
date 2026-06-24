@@ -29,17 +29,17 @@ CURRENCY_COL = "Cur"
 DEFAULT_CURRENCY = "USD"
 CURRENCY_RATES = {"USD": 1.0, "EUR": 1.08, "SAR": 1.0 / SAR_PER_USD, "AED": 1.0 / AED_PER_USD}
 
-# Canonical grid columns, left-to-right. "Margin x" drives the selling price.
+# Canonical grid columns, left-to-right. "Markup x" drives the selling price.
 GRID_COLUMNS = [
     "Area", "System", "Description", "Brand", "Model", "Qty",
     "Cur", "List Price $", "Ex Unit Cost $", "Shipping %", "Unit Cost $", "Total Cost $",
-    "Margin x", "U. Price $", "T. Price $", "U. Price SAR", "T. Price SAR",
+    "Markup x", "U. Price $", "T. Price $", "U. Price SAR", "T. Price SAR",
 ]
 TEXT_COLUMNS = {"Area", "System", "Description", "Brand", "Model", "Cur"}
 
 # Columns hidden from the client-facing Quotation/PDF (internal cost metrics).
 COST_COLUMNS = ["Cur", "List Price $", "Ex Unit Cost $", "Shipping %", "Unit Cost $",
-                "Total Cost $", "Margin x"]
+                "Total Cost $", "Markup x"]
 
 
 def currency_rate(currency) -> float:
@@ -120,10 +120,10 @@ def u_price_sar_from_usd(u_price_usd) -> float:
 def recompute(df: pd.DataFrame) -> pd.DataFrame:
     """Recalculate every derived column following the exact Excel chain.
 
-    Drivers (editable):  Ex Unit Cost $, Shipping %, Margin x, and Qty.
+    Drivers (editable):  Ex Unit Cost $, Shipping %, Markup x, and Qty.
                          Unit Cost $ stays manual when no Ex Unit Cost exists.
                          A manual U. Price $ is honoured only when
-                         Margin x is blank/0 (lets you price odd items directly).
+                         Markup x is blank/0 (lets you price odd items directly).
     Discount rows (LineType == 'discount') are passed through untouched.
     """
     df = df.copy()
@@ -155,7 +155,7 @@ def recompute(df: pd.DataFrame) -> pd.DataFrame:
         # Unit Cost rounded UP to a whole dollar (landed cost, always USD).
         unit = roundup(ex_usd * (1 + ship / 100), 0) if ex > 0 else roundup(_num(r.get("Unit Cost $")), 0)
 
-        margin = round(_num(r.get("Margin x")), 4)
+        margin = round(_num(r.get("Markup x")), 4)
         if margin > 0:
             uprice = u_price_from_margin(unit, margin)        # formula-driven
         else:
@@ -181,7 +181,7 @@ def recompute(df: pd.DataFrame) -> pd.DataFrame:
     # Margin is a pricing driver with at most four decimal places. Keeping the
     # numeric values rounded lets the UI display only meaningful digits (1.6,
     # 1.25, 1.2345) instead of padding every cell with trailing zeroes.
-    df["Margin x"] = [round(_num(value), 4) for value in df["Margin x"]]
+    df["Markup x"] = [round(_num(value), 4) for value in df["Markup x"]]
     df["Unit Cost $"], df["Total Cost $"] = unit_l, tc_l
     df["U. Price $"], df["T. Price $"] = up_l, tp_l
     df["U. Price SAR"], df["T. Price SAR"] = usar_l, tpsar_l
@@ -201,16 +201,16 @@ def increase_margins(df: pd.DataFrame, percentage: float) -> tuple[pd.DataFrame,
     percentage = max(_num(percentage), -100.0)
     factor = 1 + percentage / 100
     line_types = grid.get("LineType", pd.Series("item", index=grid.index))
-    margins = grid["Margin x"].map(_num)
+    margins = grid["Markup x"].map(_num)
     mask = line_types.astype(str).str.lower().ne("discount") & margins.gt(0)
-    grid.loc[mask, "Margin x"] = (margins.loc[mask] * factor).round(4)
+    grid.loc[mask, "Markup x"] = (margins.loc[mask] * factor).round(4)
     return recompute(grid), int(mask.sum())
 
 
 def summarize(df: pd.DataFrame, discount_sar: float = 0.0,
               commission_sar: float = 0.0) -> dict:
     """Client totals plus internal commission-adjusted profit metrics."""
-    items = df[df.get("LineType", "item").astype(str) != "discount"] if "LineType" in df else df
+    items = df[~df.get("LineType", "item").astype(str).isin({"discount", "included"})] if "LineType" in df else df
     product_cost_usd = items["Total Cost $"].map(_num).sum()
     total_sell_usd = items["T. Price $"].map(_num).sum()
     subtotal_sar = items["T. Price SAR"].map(_num).sum()
@@ -258,4 +258,55 @@ def blank_row(area="", system="", line_type="item") -> dict:
     row["Cur"] = DEFAULT_CURRENCY
     row["Shipping %"] = DEFAULT_SHIPPING_PERCENT
     row["LineType"] = line_type
+    row["_IncludedInItems"] = False
     return row
+
+
+def apply_inclusion(df: pd.DataFrame, markup: float) -> pd.DataFrame:
+    """Distribute included rows' selling price proportionally across regular rows.
+
+    Included rows (where _IncludedInItems is True) have their selling price computed
+    as TotalCost$ × markup, then that total is distributed to regular item rows in
+    proportion to each regular row's T. Price $. The included rows get LineType
+    "included" and their price columns are zeroed (PDF renders them as "Included").
+    """
+    df = df.copy()
+    if "_IncludedInItems" not in df.columns:
+        return df
+
+    markup = max(_num(markup), 0.001)
+    included_mask = df["_IncludedInItems"].fillna(False).astype(bool)
+    regular_mask = ~included_mask & (df.get("LineType", "item").astype(str) != "discount")
+
+    included_df = df[included_mask]
+    regular_df = df[regular_mask]
+
+    # Mark included rows regardless of whether there's anything to distribute
+    df.loc[included_mask, "LineType"] = "included"
+    for col in ["U. Price $", "T. Price $", "U. Price SAR", "T. Price SAR"]:
+        df.loc[included_mask, col] = 0.0
+
+    if included_df.empty or regular_df.empty:
+        return df
+
+    included_selling_usd = float((included_df["Total Cost $"].map(_num) * markup).sum())
+    if included_selling_usd <= 0:
+        return df
+
+    regular_t_total = float(regular_df["T. Price $"].map(_num).sum())
+    if regular_t_total <= 0:
+        return df
+
+    for idx in regular_df.index:
+        row = df.loc[idx]
+        share = _num(row["T. Price $"]) / regular_t_total
+        qty = max(_num(row["Qty"]), 1.0)
+        additional_per_unit = (included_selling_usd * share) / qty
+        new_u = roundup(_num(row["U. Price $"]) + additional_per_unit, 0)
+        new_u_sar = roundup_to(new_u * SAR_PER_USD, SAR_ROUND_TO)
+        df.at[idx, "U. Price $"] = new_u
+        df.at[idx, "T. Price $"] = roundup(qty * new_u, 0)
+        df.at[idx, "U. Price SAR"] = new_u_sar
+        df.at[idx, "T. Price SAR"] = roundup(qty * new_u_sar, 0)
+
+    return df

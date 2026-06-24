@@ -147,8 +147,7 @@ def project_name_with_option(name, option_label="", previous_option="") -> str:
         suffix = f" ({clean_label})" if clean_label else ""
         if suffix and stem.casefold().endswith(suffix.casefold()):
             stem = stem[:-len(suffix)].rstrip()
-    clean_option = _str(option_label).strip()
-    return f"{stem} ({clean_option})" if clean_option else stem
+    return stem
 
 
 # ---------- Settings (key/value) ----------
@@ -978,7 +977,7 @@ def item_to_grid_row(item: dict, area="", system="", qty=1, default_margin=0.0) 
         "Ex Unit Cost $": ex_raw,
         "Shipping %": ship,
         "Unit Cost $": item.get("UnitCostUSD") or 0.0,
-        "Margin x": margin,
+        "Markup x": margin,
         "U. Price $": uprice,
         "U. Price SAR": item.get("DefaultUPriceSAR") or 0.0,
         "_ItemID": item.get("ItemID"),
@@ -1219,7 +1218,7 @@ def load_project_grid(project_id: int, sheet_name: str | None = None) -> pd.Data
     sql = """SELECT Area,System,Description,Brand,Model,Qty,
                     ListPriceUSD,ExUnitCostUSD,Currency,ShippingPercent,FinalUnitCostUSD,TotalCostUSD,
                     FinalUPriceUSD,TPriceUSD,FinalUPriceSAR,TPriceSAR,MarginExtra,
-                    LineType,ItemID
+                    LineType,ItemID,IFNULL(IncludedInItems,0) IncludedInItems
              FROM Project_BoQ_Lines l
              JOIN Project_Sheets s ON l.SheetID=s.SheetID
              WHERE l.ProjectID=? AND l.LineType NOT IN ('spare','discount')"""
@@ -1243,8 +1242,9 @@ def _grid_from_rows(rows) -> pd.DataFrame:
         "FinalUnitCostUSD": "Unit Cost $", "TotalCostUSD": "Total Cost $",
         "FinalUPriceUSD": "U. Price $", "TPriceUSD": "T. Price $",
         "FinalUPriceSAR": "U. Price SAR", "TPriceSAR": "T. Price SAR",
-        "MarginExtra": "Margin x",
+        "MarginExtra": "Markup x",
         "ItemID": "_ItemID",
+        "IncludedInItems": "_IncludedInItems",
     })
     df["Cur"] = df["Cur"].apply(lambda v: v if str(v) in calc.CURRENCIES else "USD")
     df["Shipping %"] = [
@@ -1254,12 +1254,16 @@ def _grid_from_rows(rows) -> pd.DataFrame:
     # MarginExtra is the persisted pricing driver and must round-trip exactly.
     # Only legacy rows that predate the stored margin fall back to the effective
     # price/cost ratio. An explicit zero is meaningful (manual selling price).
-    stored_margin = pd.to_numeric(df["Margin x"], errors="coerce")
+    stored_margin = pd.to_numeric(df["Markup x"], errors="coerce")
     uc = df["Unit Cost $"].map(calc._num)
     up = df["U. Price $"].map(calc._num)
     legacy_margin = (up / uc.where(uc > 0)).round(4)
-    df["Margin x"] = stored_margin.where(stored_margin.notna(), legacy_margin).fillna(0.0)
-    return df[[c for c in calc.GRID_COLUMNS] + ["LineType", "_ItemID"]]
+    df["Markup x"] = stored_margin.where(stored_margin.notna(), legacy_margin).fillna(0.0)
+    if "_IncludedInItems" not in df.columns:
+        df["_IncludedInItems"] = False
+    else:
+        df["_IncludedInItems"] = df["_IncludedInItems"].fillna(0).astype(bool)
+    return df[[c for c in calc.GRID_COLUMNS] + ["LineType", "_ItemID", "_IncludedInItems"]]
 
 
 def load_project_bundle(project_id: int, family_project_ids=()):
@@ -1283,7 +1287,8 @@ def load_project_bundle(project_id: int, family_project_ids=()):
             """SELECT Area,System,Description,Brand,Model,Qty,
                       ListPriceUSD,ExUnitCostUSD,Currency,ShippingPercent,
                       FinalUnitCostUSD,TotalCostUSD,FinalUPriceUSD,TPriceUSD,
-                      FinalUPriceSAR,TPriceSAR,MarginExtra,LineType,ItemID
+                      FinalUPriceSAR,TPriceSAR,MarginExtra,LineType,ItemID,
+                      IFNULL(IncludedInItems,0) IncludedInItems
                  FROM Project_BoQ_Lines l
                  JOIN Project_Sheets s ON l.SheetID=s.SheetID
                 WHERE l.ProjectID=?
@@ -1431,7 +1436,7 @@ def load_tracking(project_id: int, sheet_name: str | None = None) -> pd.DataFram
                     IFNULL(l.DeliveryNote,'') DeliveryNote,
                     IFNULL(l.Paid,0) Paid, IFNULL(l.PaidAt,'') PaidAt,
                     IFNULL(l.Received,0) Received, IFNULL(l.ReceivedAt,'') ReceivedAt,
-                    IFNULL(l.ReceivedQty,0) ReceivedQty,
+                    IFNULL(l.ReceivedQty,0) ReceivedQty, IFNULL(l.ReceivedRegion,'') ReceivedRegion,
                     IFNULL(l.Delivered,0) Delivered, IFNULL(l.DeliveredAt,'') DeliveredAt,
                     IFNULL(l.DeliveredQty,0) DeliveredQty
              FROM Project_BoQ_Lines l JOIN Project_Sheets s ON l.SheetID=s.SheetID
@@ -1454,7 +1459,8 @@ def load_tracking(project_id: int, sheet_name: str | None = None) -> pd.DataFram
 def update_tracking(rows) -> int:
     """rows: iterable of
     (line_id, paid, received, delivered[, po_number, delivery_note,
-     paid_at, received_at, delivered_at, received_qty, delivered_qty]).
+     paid_at, received_at, delivered_at, received_qty, delivered_qty,
+     received_region]).
     """
     rows = list(rows)
     with _conn() as c:
@@ -1490,17 +1496,20 @@ def update_tracking(rows) -> int:
             deliv_at = old.get("DeliveredAt") if deliv and old.get("Delivered") and old.get("DeliveredAt") else ((new_deliv_at or now) if deliv else None)
             po = (r[4] if len(r) > 4 else "") or ""
             delivery_note = (r[5] if len(r) > 5 else "") or ""
+            rec_region = (r[11] if len(r) > 11 else "") or ""
             c.execute(
                 """UPDATE Project_BoQ_Lines
                    SET Paid=?, Received=?, Delivered=?,
                        ReceivedQty=?, DeliveredQty=?,
                        PONumber=?, DeliveryNote=?,
-                       PaidAt=?, ReceivedAt=?, DeliveredAt=?
+                       PaidAt=?, ReceivedAt=?, DeliveredAt=?,
+                       ReceivedRegion=?
                    WHERE LineID=?""",
                 (int(paid), int(rec), int(deliv),
                  rec_qty, deliv_qty,
                  po.strip() or None, delivery_note.strip() or None,
-                 paid_at, rec_at, deliv_at, lid),
+                 paid_at, rec_at, deliv_at,
+                 rec_region.strip() or None, lid),
             )
         c.commit()
     return len(rows)
@@ -1520,7 +1529,8 @@ def save_offer(name, client, contact, offer_no, system_suffix, grid: pd.DataFram
                factors=(None, None, None),
                sales_person=None, presales_engineer=None, project_manager=None,
                revision_no=0, base=None, terms=None, option_label="",
-               project_sheet_info=None, phone="", contractor="", region="") -> int:
+               project_sheet_info=None, phone="", contractor="", region="",
+               inclusion_mode="excluded", inclusion_markup=1.6) -> int:
     """Persist a NEW offer (and its lines) created in the interface."""
     discount_sar = _discount_amount(discount_sar)
     commission_sar = _discount_amount(commission_sar)
@@ -1538,14 +1548,15 @@ def save_offer(name, client, contact, offer_no, system_suffix, grid: pd.DataFram
                  (ProjectName,ClientName,ContactName,ContactPhone,
                   Contractor,Region,SalesPerson,PresalesEngineer,ProjectManager,
                    OfferNo,CreationDate,UpdatedDate,DiscountAmount,CommissionAmount,CommissionPercent,CommissionMode,ConversionFactor,SourceFile,IngestedAt,
-                    RevisionNo,BaseName,OfferTerms,ProjectSheetInfo,OptionLabel)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) RETURNING ProjectID""",
+                    RevisionNo,BaseName,OfferTerms,ProjectSheetInfo,OptionLabel,InclusionMode,InclusionMarkup)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) RETURNING ProjectID""",
             (name, client, contact, _str(phone), _str(contractor), _str(region),
              sales_person, presales_engineer, project_manager, offer_no,
               today, today, discount_sar, commission_sar, commission_percent, commission_mode,
              factors[0], f"app://offer/{name}/{now}", now,
              revision_no, base,
-             terms_json, ps_json, option_label or ""),
+             terms_json, ps_json, option_label or "",
+             inclusion_mode or "excluded", float(inclusion_markup or 1.6)),
         )
         pid = cur.fetchone()["ProjectID"]
         _begin_bulk_write(c)
@@ -1576,6 +1587,7 @@ def _write_sheet_and_lines(c, pid, system_suffix, discount_sar, factors, grid) -
         cur_code = str(r.get("Cur") or "USD")
         if cur_code not in calc.CURRENCIES:
             cur_code = "USD"
+        included = 1 if bool(r.get("_IncludedInItems")) else 0
         item_rows.append(
             (pid, sid, r.get("_ItemID"), order, r.get("Area"), r.get("System"),
              r.get("Description"), r.get("Brand"), r.get("Model"), _f(r.get("Qty")),
@@ -1583,7 +1595,7 @@ def _write_sheet_and_lines(c, pid, system_suffix, discount_sar, factors, grid) -
              _f(r.get("Shipping %")), _f(r.get("Unit Cost $")), _f(r.get("Total Cost $")),
              _f(r.get("U. Price $")), _f(r.get("T. Price $")),
              _f(r.get("U. Price SAR")), _f(r.get("T. Price SAR")),
-             _f(r.get("Margin x")), lt)
+             _f(r.get("Markup x")), lt, included)
         )
     if discount_rows:
         c.executemany(
@@ -1597,8 +1609,8 @@ def _write_sheet_and_lines(c, pid, system_suffix, discount_sar, factors, grid) -
             """INSERT INTO Project_BoQ_Lines
                  (ProjectID,SheetID,ItemID,RowOrder,Area,System,Description,Brand,Model,
                   Qty,ListPriceUSD,ExUnitCostUSD,Currency,ShippingPercent,FinalUnitCostUSD,TotalCostUSD,
-                  FinalUPriceUSD,TPriceUSD,FinalUPriceSAR,TPriceSAR,MarginExtra,LineType)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                  FinalUPriceUSD,TPriceUSD,FinalUPriceSAR,TPriceSAR,MarginExtra,LineType,IncludedInItems)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             item_rows,
         )
     return sid
@@ -1608,7 +1620,8 @@ def update_offer(base_project_id: int, grid: pd.DataFrame, discount_sar=0.0,
                  commission_sar=0.0, commission_percent=0.0,
                  commission_mode="Deduct from profit",
                  factors=(None, None, None), system_suffix="LCS", terms=None,
-                 project_sheet_info=None, header=None, option_label=None) -> int:
+                 project_sheet_info=None, header=None, option_label=None,
+                 inclusion_mode=None, inclusion_markup=None) -> int:
     """Overwrite an existing revision/option IN PLACE - same ProjectID, Offer #,
     revision, option, approval. Replaces lines, discount, terms; updates the offer
     header (client/project/contact/sales/pre-sales/PM) when `header` is given."""
@@ -1624,12 +1637,16 @@ def update_offer(base_project_id: int, grid: pd.DataFrame, discount_sar=0.0,
             "SELECT ProjectName,OptionLabel,OfferNo FROM Projects_Master WHERE ProjectID=?",
             (base_project_id,),
         ).fetchone()
+        incl_mode_sql = ", InclusionMode=?" if inclusion_mode is not None else ""
+        incl_markup_sql = ", InclusionMarkup=?" if inclusion_markup is not None else ""
+        incl_params = ([inclusion_mode] if inclusion_mode is not None else []) + \
+                      ([float(inclusion_markup)] if inclusion_markup is not None else [])
         c.execute(
             "UPDATE Projects_Master SET DiscountAmount=?, CommissionAmount=?, CommissionPercent=?, CommissionMode=?, ConversionFactor=?, "
             "OfferTerms=COALESCE(?, OfferTerms), "
-            "ProjectSheetInfo=COALESCE(?, ProjectSheetInfo) WHERE ProjectID=?",
+            f"ProjectSheetInfo=COALESCE(?, ProjectSheetInfo){incl_mode_sql}{incl_markup_sql} WHERE ProjectID=?",
             (discount_sar, commission_sar, commission_percent, commission_mode,
-             factors[0], terms_json, ps_json, base_project_id))
+             factors[0], terms_json, ps_json, *incl_params, base_project_id))
         if header is not None:
             current_name = current["ProjectName"] if current else ""
             current_option = current["OptionLabel"] if current else ""
@@ -1690,7 +1707,7 @@ def save_revision(base_project_id: int, grid: pd.DataFrame, discount_sar=0.0,
                   commission_mode="Deduct from profit",
                   factors=(None, None, None), system_suffix="LCS",
                   terms=None, option_label=None, project_sheet_info=None,
-                  header=None) -> tuple[int, str, int]:
+                  header=None, inclusion_mode="excluded", inclusion_markup=1.6) -> tuple[int, str, int]:
     """Save `grid` as the next revision of an existing offer.
 
     Returns (new_project_id, new_name, revision_no). The new offer is named
@@ -1718,7 +1735,8 @@ def save_revision(base_project_id: int, grid: pd.DataFrame, discount_sar=0.0,
         revision_no=rev, base=base, terms=terms if terms is not None else load_terms(meta),
         project_sheet_info=(project_sheet_info if project_sheet_info is not None
                             else load_project_sheet_info(meta)),
-        option_label=opt, phone=phone, contractor=contractor, region=region)
+        option_label=opt, phone=phone, contractor=contractor, region=region,
+        inclusion_mode=inclusion_mode, inclusion_markup=inclusion_markup)
     return pid, name, rev
 
 
@@ -1726,7 +1744,8 @@ def save_option(base_project_id: int, grid: pd.DataFrame, option_label: str,
                 discount_sar=0.0, commission_sar=0.0, commission_percent=0.0,
                 commission_mode="Deduct from profit",
                 factors=(None, None, None), system_suffix="LCS",
-                terms=None, project_sheet_info=None, header=None) -> tuple[int, str, int]:
+                terms=None, project_sheet_info=None, header=None,
+                inclusion_mode="excluded", inclusion_markup=1.6) -> tuple[int, str, int]:
     """Save `grid` as another OPTION of the SAME revision (e.g. Dynalite vs KNX).
 
     Keeps the source revision number and Offer #; only the option label differs.
@@ -1750,7 +1769,8 @@ def save_option(base_project_id: int, grid: pd.DataFrame, option_label: str,
         revision_no=rev, base=base, terms=terms if terms is not None else load_terms(meta),
         project_sheet_info=(project_sheet_info if project_sheet_info is not None
                             else load_project_sheet_info(meta)),
-        option_label=opt, phone=phone, contractor=contractor, region=region)
+        option_label=opt, phone=phone, contractor=contractor, region=region,
+        inclusion_mode=inclusion_mode, inclusion_markup=inclusion_markup)
     return pid, name, rev
 
 

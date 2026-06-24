@@ -263,7 +263,7 @@ CREATE TABLE IF NOT EXISTS Project_BoQ_Lines (
     TPriceUSD        REAL,
     FinalUPriceSAR   REAL,
     TPriceSAR        REAL,
-    MarginExtra      REAL,            -- persisted per-line pricing multiplier (Margin x)
+    MarginExtra      REAL,            -- persisted per-line pricing multiplier (Markup x)
     LineType         TEXT DEFAULT 'item',  -- 'item' | 'discount' | 'service'
     Paid             INTEGER DEFAULT 0,   -- supplier paid (procurement tracking)
     Received         INTEGER DEFAULT 0,   -- received from supplier
@@ -400,6 +400,8 @@ MIGRATIONS = {
         "Archived": "INTEGER DEFAULT 0",
         "ArchivedBy": "INTEGER",
         "UpdatedDate": "TEXT",
+        "InclusionMode": "TEXT",
+        "InclusionMarkup": "REAL",
     },
     "Project_BoQ_Lines": {
         "ShippingPercent": "REAL",
@@ -414,6 +416,8 @@ MIGRATIONS = {
         "PaidAt": "TEXT",
         "ReceivedAt": "TEXT",
         "DeliveredAt": "TEXT",
+        "ReceivedRegion": "TEXT",
+        "IncludedInItems": "INTEGER DEFAULT 0",
     },
     "Items_Catalog": {
         "ShippingPercent": "REAL",
